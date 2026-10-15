@@ -5,6 +5,10 @@ description: "Check for Beacon CLI updates and upgrade safely"
 
 ## Check for updates
 
+Running bare `beacon` in an interactive terminal shows a cached update notice when a
+newer release is available. It does not wait on a network request: when the cache is
+more than a day old, Beacon refreshes it in the background for the next run.
+
 Use `beacon version check` before upgrading to confirm whether a newer release is available:
 
 ```bash title="Check for updates"
@@ -12,6 +16,10 @@ beacon version check
 ```
 
 When an update is available, Beacon prints the latest version, the installed version, Homebrew upgrade guidance, and a release download URL.
+
+The automatic notice is skipped for scripts, pipes, redirects, other commands, CI,
+and development builds. Set `BEACON_UPDATE_CHECK=0` to disable it without disabling
+the explicit `beacon version check` command.
 
 ## Upgrade with Homebrew
 
@@ -37,7 +45,9 @@ the package artifact for the local architecture, downloads it into the endpoint
 update staging directory, verifies the manifest checksum, Developer ID Installer
 signature, and Gatekeeper install assessment, then runs Apple's `installer`. The
 package postinstall restarts the local collector, restores configured Vector
-forwarders, reconciles the updater LaunchDaemon, and the updater health-checks
+forwarders, re-renders a connected endpoint's Beacon Cloud forwarder config from
+the new version's pack (see [Keeping the forwarder config current](/cli/endpoint-connect#keeping-the-forwarder-config-current)),
+reconciles the updater LaunchDaemon, and the updater health-checks
 the new install. If the new install is unhealthy, Beacon restores the previous
 `/opt/beacon` tree.
 
@@ -158,7 +168,7 @@ beacon endpoint repair
 beacon endpoint status
 ```
 
-`beacon endpoint repair` preserves runtime logs while reapplying service files, collector configuration, harness telemetry settings, and forwarding destinations.
+`beacon endpoint repair` preserves runtime logs while reapplying service files, collector configuration, harness telemetry settings, and forwarding destinations. On an endpoint connected to Beacon Cloud it keeps the forwarder, its device key and its Vector checkpoints, and re-renders `vector.toml` from the upgraded version's pack with the recorded privacy mode, so a Homebrew or archive upgrade picks up forwarder fixes without a re-connect. See [Keeping the forwarder config current](/cli/endpoint-connect#keeping-the-forwarder-config-current).
 
 <Note>
   On v0.0.43 or newer, use `beacon endpoint doctor --fix` when you only need supported health-check drift remediated without a full repair.

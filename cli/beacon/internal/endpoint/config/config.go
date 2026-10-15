@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/atomicfile"
 )
 
 const (
@@ -100,15 +102,18 @@ const (
 )
 
 type Config struct {
-	UserMode        bool           `json:"user_mode"`
-	LogPath         string         `json:"log_path"`
-	Collector       Collector      `json:"collector"`
-	Harnesses       []string       `json:"harnesses"`
-	EventCategories []string       `json:"event_categories,omitempty"`
-	Inventory       *Inventory     `json:"inventory_heartbeat,omitempty"`
-	Destinations    *Destinations  `json:"destinations,omitempty"`
-	ManagedIngest   *ManagedIngest `json:"managed_ingest,omitempty"`
-	AutoUpdate      *AutoUpdate    `json:"auto_update,omitempty"`
+	UserMode        bool      `json:"user_mode"`
+	LogPath         string    `json:"log_path"`
+	Collector       Collector `json:"collector"`
+	Harnesses       []string  `json:"harnesses"`
+	EventCategories []string  `json:"event_categories,omitempty"`
+	// ClaudeCaptureModelContext is the --claude-capture-model-context opt-in, recorded so the per-user
+	// config repair writes Claude Code's settings the way the install did.
+	ClaudeCaptureModelContext bool           `json:"claude_capture_model_context,omitempty"`
+	Inventory                 *Inventory     `json:"inventory_heartbeat,omitempty"`
+	Destinations              *Destinations  `json:"destinations,omitempty"`
+	ManagedIngest             *ManagedIngest `json:"managed_ingest,omitempty"`
+	AutoUpdate                *AutoUpdate    `json:"auto_update,omitempty"`
 }
 
 // ManagedIngest records that this endpoint forwards to Asymptote managed ingest. It holds
@@ -366,11 +371,8 @@ func Save(cfg Config) (string, error) {
 	if HasSecretDestinations(cfg) {
 		perm = 0600
 	}
-	if err := os.WriteFile(path, data, perm); err != nil {
+	if err := atomicfile.Write(path, data, perm); err != nil {
 		return "", err
-	}
-	if HasSecretDestinations(cfg) {
-		return path, os.Chmod(path, perm)
 	}
 	return path, nil
 }

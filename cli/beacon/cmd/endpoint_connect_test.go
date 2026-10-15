@@ -113,7 +113,7 @@ func TestConnectUsesSignedInAccountAndSelectedPrivacy(t *testing.T) {
 	command := &cobra.Command{}
 	command.SetOut(&out)
 	command.SetErr(&out)
-	if err := connectEndpoint(command, true, "/tmp/runtime.jsonl"); err != nil {
+	if err := connectEndpoint(command, true, "/tmp/runtime.jsonl", false); err != nil {
 		t.Fatalf("connectEndpoint returned error: %v", err)
 	}
 	if captured.AccountEnroll == nil || captured.AccountEnroll.AccessToken != "bcn_cli_secret" {
@@ -177,7 +177,7 @@ func TestConnectRequiresSignedInAccountInUserMode(t *testing.T) {
 		return nil, errors.New("must not run")
 	}
 	command := &cobra.Command{}
-	err := connectEndpoint(command, true, "/tmp/runtime.jsonl")
+	err := connectEndpoint(command, true, "/tmp/runtime.jsonl", false)
 	if err == nil || !strings.Contains(err.Error(), "beacon login") {
 		t.Fatalf("error = %v", err)
 	}
@@ -220,5 +220,37 @@ func TestHumanBytes(t *testing.T) {
 		if got := humanBytes(in); got != want {
 			t.Errorf("humanBytes(%d) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestCloudStatusLineOnlyWhereBeaconCloudApplies(t *testing.T) {
+	notConnected := asymptote.ManagedIngestStatus{}
+	if line := cloudStatusLine(notConnected, false, false); line != "" {
+		t.Errorf("system install, not connected: line = %q, want none (MDM rollouts should not be told to connect)", line)
+	}
+	if line := cloudStatusLine(notConnected, true, true); line != "" {
+		t.Errorf("own forwarder, not connected: line = %q, want none", line)
+	}
+	if line := cloudStatusLine(notConnected, true, false); !strings.Contains(line, "beacon endpoint connect") {
+		t.Errorf("per-user install, not connected: line = %q, want the connect hint", line)
+	}
+	connected := asymptote.ManagedIngestStatus{Enabled: true, DeviceID: "dev-1"}
+	if line := cloudStatusLine(connected, false, true); !strings.Contains(line, "Beacon Cloud: connected") {
+		t.Errorf("system install, connected: line = %q, want the connected line", line)
+	}
+	pending := asymptote.ManagedIngestStatus{Message: "connect did not finish"}
+	if line := cloudStatusLine(pending, false, false); !strings.Contains(line, "connect did not finish") {
+		t.Errorf("system install, incomplete connect: line = %q, want its message", line)
+	}
+}
+
+func TestScriptForwarderStatusLine(t *testing.T) {
+	running := scriptForwarderStatusLine(service.Status{Label: "com.beacon.endpoint.s3-forwarder", Loaded: true, Running: true})
+	if running != "S3 forwarder: loaded=true running=true" {
+		t.Errorf("running line = %q", running)
+	}
+	missing := scriptForwarderStatusLine(service.Status{Label: "com.beacon.endpoint.gcs-forwarder", Message: "Could not find service"})
+	if missing != "GCS forwarder: loaded=false running=false (Could not find service)" {
+		t.Errorf("not loaded line = %q", missing)
 	}
 }

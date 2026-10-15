@@ -2,6 +2,7 @@ package dashboard
 
 import (
 	"encoding/json"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/diagnostics"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/lifecycle"
@@ -266,6 +268,16 @@ func TestTokensEndpointAggregatesUsage(t *testing.T) {
 	}
 	if report.Totals.InputTokens != 160 || report.Totals.OutputTokens != 60 || report.Totals.CostUSD != 0.5 {
 		t.Fatalf("totals = %#v", report.Totals)
+	}
+	// The list-price estimate rides beside the reported cost: claude-sonnet-4-5 100 x $3 + 40 x
+	// $15 per MTok, plus gpt-4o-mini 60 x $0.15 + 20 x $0.60 = $0.000921. The Claude session
+	// reported its cost, so its effective cost is that; the cloud session's is its estimate.
+	if report.Totals.EstimatedCostUSD != 0.000921 || report.Totals.CostSource != tokens.CostSourceMixed ||
+		math.Abs(report.Totals.EffectiveCostUSD-0.500021) > 1e-12 {
+		t.Fatalf("cost fields = %#v", report.Totals)
+	}
+	if report.Pricing == nil || report.Pricing.Catalog.Commit == "" || len(report.Pricing.Models) != 2 {
+		t.Fatalf("pricing = %#v", report.Pricing)
 	}
 	if len(report.ByModel) != 2 || report.ByModel[0].Key != "claude-sonnet-4-5" {
 		t.Fatalf("by_model = %#v", report.ByModel)
@@ -525,8 +537,8 @@ func TestRunScanRejectsEmptyRuleSet(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected empty rule set to be rejected")
 	}
-	if !strings.Contains(err.Error(), "no rules to run") {
-		t.Fatalf("error = %q, want no rules to run", err)
+	if err.Error() != "no rules to run (store is empty and baseline missing)" {
+		t.Fatalf("error = %q, want the unchanged empty-store message", err)
 	}
 }
 
@@ -632,15 +644,15 @@ func TestStaticDashboardPagesServe(t *testing.T) {
 		path string
 		want string
 	}{
-		{path: "/", want: "Beacon Endpoint Agent Activity"},
-		{path: "/session.html", want: "Beacon Endpoint Session Events"},
-		{path: "/overview.html", want: "Beacon Endpoint Agent Activity"},
-		{path: "/tokens.html", want: "Beacon Endpoint Token Usage"},
-		{path: "/memory.html", want: "Beacon Memory"},
-		{path: "/detections.html", want: "Beacon Endpoint Detections"},
-		{path: "/findings.html", want: "Beacon Endpoint Findings"},
-		{path: "/inventory.html", want: "Beacon Endpoint Agent Inventory"},
-		{path: "/inventory-hooks.html", want: "Beacon Endpoint Agent Inventory"},
+		{path: "/", want: "Beacon | Self‑improving memory for coding agents"},
+		{path: "/session.html", want: "Beacon | Self‑improving memory for coding agents"},
+		{path: "/overview.html", want: "Beacon | Self‑improving memory for coding agents"},
+		{path: "/tokens.html", want: "Beacon | Self‑improving memory for coding agents"},
+		{path: "/memory.html", want: "Beacon | Self‑improving memory for coding agents"},
+		{path: "/detections.html", want: "Beacon | Self‑improving memory for coding agents"},
+		{path: "/findings.html", want: "Beacon | Self‑improving memory for coding agents"},
+		{path: "/inventory.html", want: "Beacon | Self‑improving memory for coding agents"},
+		{path: "/inventory-hooks.html", want: "Beacon | Self‑improving memory for coding agents"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.path, func(t *testing.T) {
@@ -652,6 +664,9 @@ func TestStaticDashboardPagesServe(t *testing.T) {
 			}
 			if !strings.Contains(rec.Body.String(), tc.want) {
 				t.Fatalf("body did not contain %q", tc.want)
+			}
+			if !strings.Contains(rec.Body.String(), `href="/favicon.svg"`) {
+				t.Fatal("body did not reference the Beacon favicon")
 			}
 			if count := strings.Count(rec.Body.String(), `href="/memory.html"`); count != 1 {
 				t.Fatalf("memory nav link count = %d, want 1", count)
@@ -684,4 +699,74 @@ func TestRequireLoopbackHostRejectsRebindingHosts(t *testing.T) {
 			t.Errorf("Host %q: status = %d, want %d", host, rec.Code, want)
 		}
 	}
+}
+
+// TestTokensEndpointCountsALiveAndBackfilledRequestOnce reads a Claude Code session the way the
+// production readers hand it to the token report: matched events plus a reduced context set. The
+// live OTLP channel's first event is the user_prompt log; the transcript stamps the request as it
+// streamed, before the api_request log that reports the same usage lands. The cutover has to come
+// from that first live event, which is neither a session.context row nor a usage record, or the
+// backfilled copy of the session's first request is counted beside the live one.
+func TestTokensEndpointCountsALiveAndBackfilledRequestOnce(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "runtime.jsonl")
+	line := func(ts, method, action, usage string) string {
+		genAI := ""
+		if usage != "" {
+			genAI = `,"gen_ai":{"usage":` + usage + `}`
+		}
+		return `{"timestamp":"` + ts + `","vendor":"beacon","product":"endpoint-agent","schema_version":"1.0","event":{"kind":"agent_runtime","action":"` + action + `","category":"session"},"severity":"info","endpoint":{"os":"linux","hostname":"devbox"},"harness":{"name":"claude_code","collection_method":"` + method + `"},"session":{"id":"sess-live-poll"},"model":"claude-opus-4-6"` + genAI + `,"message":"` + action + `"}`
+	}
+	lines := []string{
+		line("2026-06-11T10:00:00Z", "otlp", "prompt.submitted", ""),
+		line("2026-06-11T10:00:02Z", "poll", "token.usage", `{"input_tokens":6,"output_tokens":120,"cache_read":{"input_tokens":40000}}`),
+		line("2026-06-11T10:00:06Z", "otlp", "token.usage", `{"input_tokens":6,"output_tokens":120,"cache_read":{"input_tokens":40000}}`),
+	}
+	if err := os.WriteFile(logPath, []byte(strings.Join(lines, "\n")+"\n"), 0644); err != nil {
+		t.Fatalf("write fixture log: %v", err)
+	}
+
+	events, contexts, err := ReadTokenEventsAppendOrder(logPath, EventQuery{NoLimit: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := tokens.AggregateScopedWithContexts(events, contexts, "", tokens.Options{})
+	if report.Totals.OutputTokens != 120 || report.Totals.CacheReadInputTokens != 40000 || report.SuppressedPollEvents != 1 {
+		t.Fatalf("totals = %+v suppressed = %d, want one request (output 120, cache read 40000) and the backfill copy suppressed", report.Totals, report.SuppressedPollEvents)
+	}
+
+	// A window that starts after the live channel's first event must not move the cutover.
+	windowed, windowContexts, err := ReadTokenEventsAppendOrder(logPath, EventQuery{NoLimit: true, Since: mustParseTime(t, "2026-06-11T10:00:01Z")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	report = tokens.AggregateScopedWithContexts(windowed, windowContexts, "", tokens.Options{})
+	if report.Totals.OutputTokens != 120 || report.SuppressedPollEvents != 1 {
+		t.Fatalf("windowed totals = %+v suppressed = %d, want one request", report.Totals, report.SuppressedPollEvents)
+	}
+
+	handler, err := Handler(Options{UserMode: true, LogPath: logPath})
+	if err != nil {
+		t.Fatalf("Handler returned error: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/tokens", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status code = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var served tokens.Report
+	if err := json.Unmarshal(rec.Body.Bytes(), &served); err != nil {
+		t.Fatalf("unmarshal tokens report: %v", err)
+	}
+	if served.Totals.OutputTokens != 120 {
+		t.Fatalf("/api/tokens output = %d, want 120 (the backfill copy counted twice gives 240)", served.Totals.OutputTokens)
+	}
+}
+
+func mustParseTime(t *testing.T, value string) time.Time {
+	t.Helper()
+	parsed, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return parsed
 }

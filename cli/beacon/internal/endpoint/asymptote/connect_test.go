@@ -24,10 +24,12 @@ type fakeForwarder struct {
 	unitPath  string
 	written   []string
 	loads     int
+	stopped   bool // registered (enabled) but not running, as after `systemctl stop`
 	unloads   int
 	removed   int
 	loadErr   error
 	writeErr  error
+	onLoad    func()
 }
 
 func (f *fakeForwarder) Supported() bool           { return f.supported }
@@ -46,7 +48,13 @@ func (f *fakeForwarder) WriteUnit(vectorBin, configPath string) (string, error) 
 	}
 	return f.unitPath, nil
 }
-func (f *fakeForwarder) Load() error   { f.loads++; return f.loadErr }
+func (f *fakeForwarder) Load() error {
+	f.loads++
+	if f.onLoad != nil {
+		f.onLoad()
+	}
+	return f.loadErr
+}
 func (f *fakeForwarder) Unload() error { f.unloads++; return nil }
 func (f *fakeForwarder) RemoveUnits() {
 	f.removed++
@@ -55,7 +63,7 @@ func (f *fakeForwarder) RemoveUnits() {
 	}
 }
 func (f *fakeForwarder) Status() service.Status {
-	return service.Status{Label: "fake.forwarder", Loaded: f.loads > 0, Running: f.loads > 0}
+	return service.Status{Label: "fake.forwarder", Loaded: f.loads > 0, Running: f.loads > 0 && !f.stopped}
 }
 
 // fakeVector writes an executable that answers --version and validate like Vector 0.56.

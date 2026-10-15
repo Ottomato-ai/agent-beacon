@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/schema"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/tokens"
 	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve"
 )
 
@@ -71,7 +72,7 @@ func ReadEvents(path string, query EventQuery) (EventResult, error) {
 	limit := normalizeLimit(query.Limit)
 	state := normalizeSessionState(query.SessionState)
 	query.SessionState = state
-	if state != "" {
+	if state != "" && query.sessionStateIDs == nil {
 		ids, err := sessionIDsForState(path, query, state)
 		if err != nil {
 			return EventResult{}, err
@@ -85,10 +86,7 @@ func ReadEvents(path string, query EventQuery) (EventResult, error) {
 		}
 	}
 	sort.SliceStable(result.Events, func(i, j int) bool {
-		if result.Events[i].Parsed.Equal(result.Events[j].Parsed) {
-			return result.Events[i].ID > result.Events[j].ID
-		}
-		return result.Events[i].Parsed.After(result.Events[j].Parsed)
+		return recordBefore(result.Events[j], result.Events[i])
 	})
 	result.Returned = len(result.Events)
 	result.Truncated = result.TotalMatched > len(result.Events)
@@ -100,8 +98,8 @@ func ReadEvents(path string, query EventQuery) (EventResult, error) {
 // order because runtime timestamps are second-resolution, so a batch of
 // cumulative datapoints from one export commonly shares a timestamp; the
 // cumulative dedup then relies on append order to recover the emission sequence.
-// The newest-first ReadEvents sort breaks such ties on lexicographic line IDs,
-// which mis-orders line-9 vs line-10 within a second.
+// Restore oldest-first emission order after the newest-first ReadEvents sort
+// before aggregating cumulative counters.
 func ReadEventsAppendOrder(path string, query EventQuery) ([]schema.Event, error) {
 	query.NoLimit = true
 	result, err := ReadEvents(path, query)
@@ -116,10 +114,16 @@ func ReadEventsAppendOrder(path string, query EventQuery) ([]schema.Event, error
 	return events, nil
 }
 
-// ReadTokenEventsAppendOrder returns query-matched events plus every
-// session.context event in one pass over the log. Session context is kept
-// separate so token totals and TotalEvents still describe only the requested
-// time/model/session slice while user attribution can reach back to SessionStart.
+// ReadTokenEventsAppendOrder returns query-matched events plus the session context
+// the token report reads outside the query, in one pass over the log. Context is
+// kept separate so token totals and TotalEvents still describe only the requested
+// time/model/session slice while session-level facts can reach back past it:
+//
+//   - every session.context event, so user attribution reaches back to SessionStart;
+//   - for each session and live collection method, the earliest event that arrived
+//     over that method (tokens.LiveCaptureKey), so the live/poll cutover is where the
+//     live channel started capturing the session rather than where the window starts
+//     or where its first usage record landed.
 func ReadTokenEventsAppendOrder(path string, query EventQuery) ([]schema.Event, []schema.Event, error) {
 	result, err := ReadEvents(path, EventQuery{NoLimit: true})
 	if err != nil {
@@ -128,13 +132,29 @@ func ReadTokenEventsAppendOrder(path string, query EventQuery) ([]schema.Event, 
 	SortRecordsAppendOrder(result.Events)
 	events := make([]schema.Event, 0, len(result.Events))
 	contexts := make([]schema.Event, 0)
+	type liveStart struct {
+		ts    time.Time
+		event schema.Event
+	}
+	liveStarts := map[string]liveStart{}
+	var liveOrder []string
 	for _, record := range result.Events {
 		if record.Event.Event.Action == "session.context" {
 			contexts = append(contexts, record.Event)
+		} else if key, ts, ok := tokens.LiveCaptureKey(record.Event); ok {
+			if current, seen := liveStarts[key]; !seen {
+				liveStarts[key] = liveStart{ts: ts, event: record.Event}
+				liveOrder = append(liveOrder, key)
+			} else if ts.Before(current.ts) {
+				liveStarts[key] = liveStart{ts: ts, event: record.Event}
+			}
 		}
 		if matchesQuery(record, query) {
 			events = append(events, record.Event)
 		}
+	}
+	for _, key := range liveOrder {
+		contexts = append(contexts, liveStarts[key].event)
 	}
 	return events, contexts, nil
 }
@@ -193,38 +213,160 @@ func streamSource(source eventSource, fn func(schema.Event) error) error {
 }
 
 type sessionStateStats struct {
-	lifecycleEvents    int
-	nonLifecycleEvents int
-	capturedPrompts    int
+	hasVisibleActivity bool
+	prompt             string
+	promptAt           time.Time
+	harness            string
+	harnessAt          time.Time
+	repository         string
+	repositoryAt       time.Time
+	user               string
+	userAt             time.Time
+}
+
+type sessionClassification struct {
+	state           string
+	recurrenceCount int
 }
 
 func sessionIDsForState(path string, query EventQuery, state string) (map[string]bool, error) {
-	// Session state is a property of the whole session, not the filtered slice.
-	// Use only time bounds and session/harness scope so content filters
-	// (category, action, search, etc.) do not affect the classification.
-	stateQuery := EventQuery{
-		Since:   query.Since,
-		Until:   query.Until,
-		Harness: query.Harness,
-		Session: query.Session,
-	}
-	stats := map[string]*sessionStateStats{}
-	for _, source := range eventSources(path) {
-		if err := collectSessionStateStats(source, stateQuery, stats); err != nil {
-			return nil, err
-		}
+	classifications, _, err := classifySessions(path, query, false)
+	if err != nil {
+		return nil, err
 	}
 	ids := map[string]bool{}
-	for id, stat := range stats {
-		empty := isEmptySession(stat)
-		if (state == "empty" && empty) || (state == "captured" && !empty) {
+	for id, classification := range classifications {
+		if classification.state == state {
 			ids[id] = true
 		}
 	}
 	return ids, nil
 }
 
-func collectSessionStateStats(source eventSource, query EventQuery, stats map[string]*sessionStateStats) error {
+// classifySessions assigns one mutually exclusive category to every session active
+// in the selected time window. Recurrence is computed over that complete set before
+// any event or session result limit is applied.
+//
+// It also returns each shared session's sharing state, worked out from every event of the session
+// whatever the filters are: a session.shared record outside the selected window or filters still
+// marks the session shared, and activity outside them still makes the share stale.
+//
+// withSharing false skips the sharing work (sessionIDsForState needs only the states). With it,
+// only sessions that have a session.shared record are buffered: a cheap first pass, which parses
+// only the lines that mention session.shared, names them.
+func classifySessions(path string, query EventQuery, withSharing bool) (map[string]sessionClassification, map[string]*SessionSharing, error) {
+	// Session state is a property of the whole session, not the filtered slice.
+	// Only the selected time window scopes recurrence. The owner is part of the
+	// recurrence key; content, harness and individual-session filters must not
+	// change a group's classification or count.
+	stateQuery := EventQuery{
+		Since: query.Since,
+		Until: query.Until,
+	}
+	stats := map[string]*sessionStateStats{}
+	sessionRecords := map[string][]EventRecord{}
+	shared := map[string]bool{}
+	if withSharing {
+		var err error
+		if shared, err = sharedSessionIDs(path); err != nil {
+			return nil, nil, err
+		}
+	}
+	for _, source := range eventSources(path) {
+		if err := collectSessionStateStats(source, stateQuery, stats, sessionRecords, shared); err != nil {
+			return nil, nil, err
+		}
+	}
+	// Sharing state depends on the order of a session's events, so fold them in append order
+	// (across rotated archives), as ReadSessionDetail and the trace history do.
+	sharing := map[string]*SessionSharing{}
+	for id := range shared {
+		records := sessionRecords[id]
+		SortRecordsAppendOrder(records)
+		acc := &sessionAccumulator{record: SessionRecord{ID: id}}
+		for _, record := range records {
+			if acc.record.Harness == "" {
+				acc.record.Harness = record.Event.Harness.Name
+			}
+			acc.noteSharing(record)
+		}
+		if acc.record.Sharing == nil {
+			continue
+		}
+		acc.finish()
+		sharing[id] = acc.record.Sharing
+	}
+	groupCounts := map[string]int{}
+	groupKeys := map[string]string{}
+	for id, stat := range stats {
+		if stat.prompt == "" || !stat.hasVisibleActivity {
+			continue
+		}
+		key := recurrenceGroupKey(stat)
+		groupKeys[id] = key
+		groupCounts[key]++
+	}
+	classifications := make(map[string]sessionClassification, len(stats))
+	for id, stat := range stats {
+		classification := sessionClassification{state: "captured"}
+		if !stat.hasVisibleActivity {
+			classification.state = "empty"
+		} else if key := groupKeys[id]; key != "" && groupCounts[key] >= 2 {
+			classification.state = "recurring"
+			classification.recurrenceCount = groupCounts[key]
+		}
+		classifications[id] = classification
+	}
+	return classifications, sharing, nil
+}
+
+// sharingRecordBuffered is called once per record classifySessions buffers for the sharing state;
+// tests replace it to count.
+var sharingRecordBuffered = func() {}
+
+var sessionSharedMarker = []byte(`"session.shared"`)
+
+// sharedSessionIDs names the sessions that have a session.shared record. It parses only the lines
+// that mention session.shared, so a log with no shares costs one read and no decoding.
+func sharedSessionIDs(path string) (map[string]bool, error) {
+	ids := map[string]bool{}
+	for _, source := range eventSources(path) {
+		file, err := os.Open(source.path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, err
+		}
+		scanner := bufio.NewScanner(file)
+		scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+		for scanner.Scan() {
+			line := scanner.Bytes()
+			if !bytes.Contains(line, sessionSharedMarker) {
+				continue
+			}
+			var probe struct {
+				Event struct {
+					Action string `json:"action"`
+				} `json:"event"`
+				Session *struct {
+					ID string `json:"id"`
+				} `json:"session"`
+			}
+			if json.Unmarshal(line, &probe) == nil && probe.Event.Action == "session.shared" && probe.Session != nil && probe.Session.ID != "" {
+				ids[probe.Session.ID] = true
+			}
+		}
+		err = scanner.Err()
+		file.Close()
+		if err != nil {
+			return nil, err
+		}
+	}
+	return ids, nil
+}
+
+func collectSessionStateStats(source eventSource, query EventQuery, stats map[string]*sessionStateStats, sessionRecords map[string][]EventRecord, shared map[string]bool) error {
 	file, err := os.Open(source.path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -257,7 +399,16 @@ func collectSessionStateStats(source eventSource, query EventQuery, stats map[st
 			Parsed:     parsed,
 			WazuhLevel: WazuhLevel(event.Event.Action),
 		}
-		if !matchesQuery(record, query) || event.Session == nil || event.Session.ID == "" {
+		if event.Session == nil || event.Session.ID == "" {
+			continue
+		}
+		// A shared session's records, slimmed to what the sharing state reads, whatever the
+		// filters. Sessions never shared are not buffered.
+		if shared[event.Session.ID] {
+			sessionRecords[event.Session.ID] = append(sessionRecords[event.Session.ID], shareRelevantRecord(record))
+			sharingRecordBuffered()
+		}
+		if !matchesQuery(record, query) {
 			continue
 		}
 		stat := stats[event.Session.ID]
@@ -265,35 +416,62 @@ func collectSessionStateStats(source eventSource, query EventQuery, stats map[st
 			stat = &sessionStateStats{}
 			stats[event.Session.ID] = stat
 		}
-		if hasCapturedPromptText(event) {
-			stat.capturedPrompts++
+		if prompt := strings.TrimSpace(promptText(event)); prompt != "" && (stat.prompt == "" || eventComesBefore(parsed, stat.promptAt)) {
+			stat.prompt = prompt
+			stat.promptAt = parsed
 		}
-		if isLifecycleSessionEvent(event) {
-			stat.lifecycleEvents++
-		} else {
-			stat.nonLifecycleEvents++
+		if harness := strings.TrimSpace(event.Harness.Name); harness != "" && (stat.harness == "" || eventComesBefore(parsed, stat.harnessAt)) {
+			stat.harness = harness
+			stat.harnessAt = parsed
+		}
+		if repository := strings.TrimSpace(event.Repository); repository != "" && (stat.repository == "" || eventComesBefore(parsed, stat.repositoryAt)) {
+			stat.repository = repository
+			stat.repositoryAt = parsed
+		}
+		if user := normalizedSessionUser(event); user != "" && (stat.user == "" || eventComesBefore(parsed, stat.userAt)) {
+			stat.user = user
+			stat.userAt = parsed
+		}
+		if !isInternalSessionEvent(event) {
+			stat.hasVisibleActivity = true
 		}
 	}
 	return scanner.Err()
 }
 
-func isEmptySession(stat *sessionStateStats) bool {
-	return stat != nil && stat.capturedPrompts == 0 && stat.lifecycleEvents > 0 && stat.nonLifecycleEvents == 0
+func eventComesBefore(candidate, current time.Time) bool {
+	return !candidate.IsZero() && (current.IsZero() || candidate.Before(current))
 }
 
-func hasCapturedPromptText(event schema.Event) bool {
-	if !isPromptEvent(event) {
-		return false
+func recurrenceGroupKey(stat *sessionStateStats) string {
+	return strings.Join([]string{
+		normalizeComparisonValue(stat.user),
+		normalizeComparisonValue(stat.prompt),
+		normalizeComparisonValue(asymptoteobserve.NormalizeHarnessName(stat.harness)),
+		normalizeComparisonValue(stat.repository),
+	}, "\x00")
+}
+
+func normalizeComparisonValue(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func normalizedSessionUser(event schema.Event) string {
+	if uid := normalizeComparisonValue(event.User.UID); uid != "" {
+		return "uid:" + uid
 	}
-	if event.Prompt != nil && strings.TrimSpace(event.Prompt.Text) != "" {
-		return true
+	if name := normalizeComparisonValue(event.User.Name); name != "" {
+		return "name:" + name
 	}
-	return strings.TrimSpace(rawString(event.Raw, "first_prompt")) != ""
+	// Empty is the consistent identity for events without an owner in this local scope.
+	return ""
 }
 
 func isPromptEvent(event schema.Event) bool {
 	action := normalizedLifecycleValue(event.Event.Action)
-	return strings.EqualFold(event.Event.Category, "prompt") || strings.Contains(action, "prompt") || event.Prompt != nil
+	// Prompt text, not the prompt object: every event of a turn carries prompt.id, and a tool call
+	// is not a prompt because it names the prompt it belongs to.
+	return strings.EqualFold(event.Event.Category, "prompt") || strings.Contains(action, "prompt") || (event.Prompt != nil && event.Prompt.Text != "")
 }
 
 func isLifecycleSessionEvent(event schema.Event) bool {
@@ -304,6 +482,24 @@ func isLifecycleSessionEvent(event schema.Event) bool {
 	switch normalizedLifecycleValue(event.Message) {
 	case "session started", "agent session started", "session ended", "agent session ended":
 		return true
+	}
+	return false
+}
+
+func isInternalSessionEvent(event schema.Event) bool {
+	if isLifecycleSessionEvent(event) {
+		return true
+	}
+	category := strings.ToLower(strings.TrimSpace(event.Event.Category))
+	switch category {
+	case "inventory", "validation", "metric":
+		return true
+	}
+	action := strings.ToLower(strings.TrimSpace(event.Event.Action))
+	for _, prefix := range []string{"inventory.", "validation.", "metric.", "endpoint.", "telemetry."} {
+		if strings.HasPrefix(action, prefix) {
+			return true
+		}
 	}
 	return false
 }
@@ -319,6 +515,8 @@ func normalizeSessionState(value string) string {
 		return "empty"
 	case "captured":
 		return "captured"
+	case "recurring":
+		return "recurring"
 	default:
 		return ""
 	}
@@ -349,30 +547,34 @@ func rawString(raw map[string]interface{}, key string) string {
 // tie on the timestamp however precise it is, and the cumulative dedup needs
 // their emission order back. Sequence recovers it directly; the archive-and-line
 // tiebreak below is the fallback for events written before sequence stamping,
-// and is still needed because the newest-first ReadEvents sort breaks ties on
-// lexicographic line IDs, which mis-orders line-9 against line-10.
+// and is also used in reverse by the newest-first ReadEvents sort so limiting
+// a result cannot discard newer events on lexicographic line-ID ties.
 func SortRecordsAppendOrder(records []EventRecord) {
 	sort.SliceStable(records, func(i, j int) bool {
-		if !records[i].Parsed.Equal(records[j].Parsed) {
-			return records[i].Parsed.Before(records[j].Parsed)
-		}
-		si, sj := records[i].Event.Sequence, records[j].Event.Sequence
-		iHasSeq := si != 0
-		jHasSeq := sj != 0
-		if iHasSeq != jHasSeq {
-			return !iHasSeq // unsequenced before sequenced
-		}
-		if iHasSeq && si != sj {
-			return si < sj
-		}
-		ai, li, _ := parseRecordID(records[i].ID)
-		aj, lj, _ := parseRecordID(records[j].ID)
-		if ai != aj {
-			// Higher archive index is an older rotation, so it comes first.
-			return ai > aj
-		}
-		return li < lj
+		return recordBefore(records[i], records[j])
 	})
+}
+
+func recordBefore(a, b EventRecord) bool {
+	if !a.Parsed.Equal(b.Parsed) {
+		return a.Parsed.Before(b.Parsed)
+	}
+	si, sj := a.Event.Sequence, b.Event.Sequence
+	iHasSeq := si != 0
+	jHasSeq := sj != 0
+	if iHasSeq != jHasSeq {
+		return !iHasSeq // unsequenced before sequenced
+	}
+	if iHasSeq && si != sj {
+		return si < sj
+	}
+	ai, li, _ := parseRecordID(a.ID)
+	aj, lj, _ := parseRecordID(b.ID)
+	if ai != aj {
+		// Higher archive index is an older rotation, so it comes first.
+		return ai > aj
+	}
+	return li < lj
 }
 
 func readEventsFromSource(source eventSource, query EventQuery, result *EventResult, limit int) error {
@@ -417,10 +619,7 @@ func readEventsFromSource(source eventSource, query EventQuery, result *EventRes
 		result.Events = append(result.Events, record)
 		if !query.NoLimit {
 			sort.SliceStable(result.Events, func(i, j int) bool {
-				if result.Events[i].Parsed.Equal(result.Events[j].Parsed) {
-					return result.Events[i].ID > result.Events[j].ID
-				}
-				return result.Events[i].Parsed.After(result.Events[j].Parsed)
+				return recordBefore(result.Events[j], result.Events[i])
 			})
 			if len(result.Events) > limit {
 				result.Events = result.Events[:limit]
@@ -534,35 +733,7 @@ func findSource(sources []eventSource, archive int) (eventSource, bool) {
 }
 
 func normalizeDashboardEvent(event *schema.Event) {
-	metricName := metricEventName(event)
-	if event.Event.Category == "" && metricName != "" {
-		event.Event.Category = "metric"
-	}
-	if event.Event.Category == "" {
-		event.Event.Category = inferEventCategory(event.Event.Action)
-	}
-	metricName = metricEventName(event)
-	if event.Event.Category == "metric" && (event.Event.Action == "" || event.Event.Action == "metric.observed") {
-		event.Event.Action = metricName
-		if event.Event.Action == "" {
-			event.Event.Action = "metric.observed"
-		}
-	}
-}
-
-func metricEventName(event *schema.Event) string {
-	if event == nil {
-		return ""
-	}
-	if event.Raw != nil {
-		if value, ok := event.Raw["metric_name"].(string); ok {
-			return strings.TrimSpace(value)
-		}
-	}
-	if event.Event.Category == "metric" {
-		return strings.TrimSpace(event.Message)
-	}
-	return ""
+	asymptoteobserve.NormalizeTraceEvent(event)
 }
 
 func normalizeLimit(limit int) int {
@@ -682,27 +853,6 @@ func matchesCommand(event schema.Event, command string) bool {
 		return true
 	}
 	return false
-}
-
-func inferEventCategory(action string) string {
-	switch {
-	case strings.HasPrefix(action, "prompt."):
-		return "prompt"
-	case strings.HasPrefix(action, "command."):
-		return "command"
-	case strings.HasPrefix(action, "file."):
-		return "file"
-	case strings.HasPrefix(action, "mcp."):
-		return "mcp"
-	case strings.HasPrefix(action, "approval.") || strings.HasPrefix(action, "policy."):
-		return "approval"
-	case strings.HasPrefix(action, "metric."):
-		return "metric"
-	case strings.HasPrefix(action, "tool."):
-		return "tool"
-	default:
-		return ""
-	}
 }
 
 func matchesFreeText(record EventRecord, query string) bool {

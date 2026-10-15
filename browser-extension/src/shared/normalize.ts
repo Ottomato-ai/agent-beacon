@@ -107,6 +107,7 @@ export function normalizeTurn(
     str('beacon.content.retention', retention),
     str('beacon.record.id', recordId(tid, action, index)),
     str('beacon.capture.mode', turn.captureMode),
+    ...promptIdAttr(turn),
   ];
 
   // ---- prompt.submitted ----
@@ -144,17 +145,39 @@ export function normalizeTurn(
   const respAttrs = base(respAction);
   if (turn.requestModel) respAttrs.push(str('gen_ai.request.model', turn.requestModel));
   if (turn.responseModel) respAttrs.push(str('gen_ai.response.model', turn.responseModel));
+  // The turn's inputTokens is uncached input (Anthropic's usage.input_tokens),
+  // but the OTel GenAI semconv input_tokens "SHOULD include all types of input
+  // tokens, including cached tokens", and the collector reads it that way:
+  // GenAIUsageFromAttrs subtracts the cache counts below to store uncached input.
+  // So the semconv count is emitted here, cache reads and writes folded in.
   if (turn.usage?.inputTokens != null)
-    respAttrs.push(int('gen_ai.usage.input_tokens', turn.usage.inputTokens));
+    respAttrs.push(
+      int(
+        'gen_ai.usage.input_tokens',
+        turn.usage.inputTokens +
+          (turn.usage.cacheReadInputTokens ?? 0) +
+          (turn.usage.cacheCreationInputTokens ?? 0),
+      ),
+    );
   if (turn.usage?.outputTokens != null)
     respAttrs.push(int('gen_ai.usage.output_tokens', turn.usage.outputTokens));
   // Cache counts use the dotted spelling the collector reads first
-  // (GenAIUsageFromAttrs), and are disjoint from input_tokens, so a total is
-  // input + output + cache_read + cache_creation with nothing double-counted.
-  if (turn.usage?.cacheCreationInputTokens != null)
-    respAttrs.push(
-      int('gen_ai.usage.cache_creation.input_tokens', turn.usage.cacheCreationInputTokens),
-    );
+  // (GenAIUsageFromAttrs). They are subsets of input_tokens above, and the
+  // collector stores them disjoint from the uncached remainder.
+  if (turn.usage?.cacheCreationInputTokens != null) {
+    const writes = turn.usage.cacheCreationInputTokens;
+    respAttrs.push(int('gen_ai.usage.cache_creation.input_tokens', writes));
+    // The one-hour subset is a breakdown of the writes, not a fourth count, and
+    // can never exceed them.
+    const oneHour = turn.usage.cacheCreation1hInputTokens;
+    if (oneHour != null)
+      respAttrs.push(
+        int(
+          'gen_ai.usage.cache_creation.ephemeral_1h_input_tokens',
+          Math.min(Math.max(oneHour, 0), Math.max(writes, 0)),
+        ),
+      );
+  }
   if (turn.usage?.cacheReadInputTokens != null)
     respAttrs.push(int('gen_ai.usage.cache_read.input_tokens', turn.usage.cacheReadInputTokens));
 
@@ -185,6 +208,16 @@ export function normalizeTurn(
   return { resourceAttributes, logRecords };
 }
 
+/**
+ * The turn's id as beacon.prompt.id, which the collector promotes to the
+ * event's prompt.id: one chat request is one prompt and everything the reply
+ * did for it. Only an id the adapter derived from the request is used; the
+ * session-level fallback in tid would put every unidentified turn under one id.
+ */
+function promptIdAttr(turn: ChatTurn): KeyValue[] {
+  return turn.turnId ? [str('beacon.prompt.id', turn.turnId)] : [];
+}
+
 function toolRecord(
   turn: ChatTurn,
   tool: ToolCall,
@@ -201,6 +234,7 @@ function toolRecord(
     str('gen_ai.conversation.id', turn.sessionId),
     str('beacon.content.retention', retention),
     str('beacon.record.id', recordId(tid, action, index)),
+    ...promptIdAttr(turn),
     str('tool.name', tool.name),
     str('gen_ai.tool.call.id', tool.id),
     str('gen_ai.tool.call.name', tool.name),

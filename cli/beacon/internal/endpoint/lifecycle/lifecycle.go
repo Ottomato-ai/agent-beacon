@@ -8,7 +8,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/atomicfile"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/brewpath"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/codexsession"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/asymptote"
 	endpointcollector "github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/collector"
 	endpointconfig "github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/config"
@@ -18,6 +20,7 @@ import (
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/schema"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/selfupdate"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/service"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/sysacl"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/writer"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/version"
 )
@@ -41,7 +44,7 @@ var (
 	// newInventoryJob and removeInventoryJob are the seams tests replace so Install, Uninstall
 	// and Repair can be exercised without touching launchd or systemd.
 	newInventoryJob = func(userMode bool, kind service.Kind) inventoryJobController {
-		return service.InventoryManager{UserMode: userMode, Kind: kind}
+		return service.InventoryManager{UserMode: userMode, Kind: kind, Env: inventoryJobEnv(userMode)}
 	}
 	removeInventoryJob = func(userMode bool) {
 		job := newInventoryJob(userMode, service.KindAuto)
@@ -52,6 +55,13 @@ var (
 	// helpers install, so tests can see whether an uninstall reaches them without touching
 	// /Library.
 	removeScriptForwarders = service.RemoveScriptForwarders
+	// scriptForwarderStatuses is the seam for reading those forwarders' state in GetStatus.
+	scriptForwarderStatuses = service.ScriptForwarderStatuses
+	// reconcileManagedForwarder is the seam for the Beacon Cloud forwarder reconcile, so tests can
+	// see whether Install reaches it without a connected endpoint or a service manager.
+	reconcileManagedForwarder = func(userMode bool, logPath string) (asymptote.ReconcileResult, error) {
+		return asymptote.ReconcileForwarder(asymptote.ReconcileOptions{UserMode: userMode, LogPath: logPath})
+	}
 )
 
 // inventoryJobController is what lifecycle needs from service.InventoryManager.
@@ -121,6 +131,25 @@ func reconcileInventoryJobWith(job inventoryJobController, opts InventoryJobOpti
 		result.Loaded = true
 	}
 	return result, nil
+}
+
+// inventoryJobEnv is the environment written into a per-user inventory job. launchd and systemd
+// start the job without the user's shell environment, so a CODEX_HOME exported in a shell profile
+// would not reach it and the scheduled scan would inventory ~/.codex while Codex reads
+// $CODEX_HOME. The value is resolved now, from the install's shell, as Codex resolves it: an
+// absolute path, so a relative CODEX_HOME still means the directory it named at install time. An
+// unset or invalid CODEX_HOME records nothing, and the job falls back to ~/.codex as before.
+//
+// System mode records nothing: this process's environment is root's, not the console user's.
+func inventoryJobEnv(userMode bool) map[string]string {
+	if !userMode || os.Getenv("CODEX_HOME") == "" {
+		return nil
+	}
+	dir, err := codexsession.HomeDir("")
+	if err != nil {
+		return nil
+	}
+	return map[string]string{"CODEX_HOME": dir}
 }
 
 // inventoryEnabledFromConfigFile reads only the inventory_heartbeat.enabled key. A missing or
@@ -193,13 +222,14 @@ type InstallOptions struct {
 	HTTPPort  int
 	// HealthPort is the collector health_check port. Zero derives it from the OTLP ports
 	// (endpointconfig.DeriveHealthCheckPort), which keeps 13133 for the default ports.
-	HealthPort            int
-	CollectorPath         string
-	StartService          bool
-	IncludeRuntimeMetrics bool
-	IncludeCodexSpans     bool
-	SplunkHEC             *endpointconfig.SplunkHEC
-	FalconHEC             *endpointconfig.FalconHEC
+	HealthPort                int
+	CollectorPath             string
+	StartService              bool
+	IncludeRuntimeMetrics     bool
+	IncludeCodexSpans         bool
+	ClaudeCaptureModelContext bool
+	SplunkHEC                 *endpointconfig.SplunkHEC
+	FalconHEC                 *endpointconfig.FalconHEC
 	// ServiceKind selects the service manager. Empty auto-detects: launchd on macOS,
 	// systemd when it is PID 1, otherwise a supervised child process.
 	ServiceKind service.Kind
@@ -215,6 +245,10 @@ type UninstallOptions struct {
 	// sets it: it uninstalls and reinstalls the endpoint, and nothing in Install puts those
 	// forwarders back.
 	KeepForwarders bool
+	// KeepManagedIngest leaves the Beacon Cloud forwarder, its config, its Vector checkpoints and
+	// its credentials in place. Repair sets it: Install re-renders that config in place instead,
+	// and nothing short of a re-connect, which rotates the device key, could bring it back.
+	KeepManagedIngest bool
 }
 
 type InstallResult struct {
@@ -235,10 +269,15 @@ type InstallResult struct {
 	// reports why in InventoryJobDetail and the install still succeeds.
 	InventoryJobPath   string `json:"inventory_job_path,omitempty"`
 	InventoryJobDetail string `json:"inventory_job_detail,omitempty"`
+	// ManagedForwarder reports the Beacon Cloud forwarder reconcile. It never fails the install:
+	// a config Vector rejects leaves the running forwarder on its old one and is reported here.
+	ManagedForwarder *asymptote.ReconcileResult `json:"managed_forwarder,omitempty"`
 }
 
 type Status struct {
-	Version       string                        `json:"version"`
+	Version string `json:"version"`
+	// Edition is set only for a build that is not the default edition (see version.Edition).
+	Edition       string                        `json:"edition,omitempty"`
 	ConfigPath    string                        `json:"config_path"`
 	LogPath       string                        `json:"log_path"`
 	RuntimeLog    RuntimeLogSource              `json:"runtime_log"`
@@ -251,6 +290,9 @@ type Status struct {
 	ManagedIngest asymptote.ManagedIngestStatus `json:"managed_ingest"`
 	// InventoryHeartbeat follows the requested mode, like ManagedIngest: each mode has its own job.
 	InventoryHeartbeat InventoryHeartbeatStatus `json:"inventory_heartbeat"`
+	// ScriptForwarders are the S3, GCS and Falcon forwarders the package helpers install, one entry
+	// per forwarder that is set up on this machine.
+	ScriptForwarders []service.Status `json:"script_forwarders,omitempty"`
 }
 
 type DestinationStatus struct {
@@ -405,6 +447,9 @@ func Install(opts InstallOptions) (InstallResult, error) {
 	if err != nil {
 		return InstallResult{}, err
 	}
+	if err := endpointcollector.CheckComponents(collectorBinary); err != nil {
+		return InstallResult{}, err
+	}
 
 	manifest := Manifest{
 		CreatedAt:    time.Now().UTC().Format(time.RFC3339),
@@ -425,8 +470,19 @@ func Install(opts InstallOptions) (InstallResult, error) {
 	// Only for system mode: a user-mode log lives in that user's own profile, which they can
 	// already write, and widening its ACL would hand their prompt text to every interactive
 	// account on the machine.
+	//
+	// Before that, the machine-wide directory itself. On Windows %ProgramData%\Beacon is created --
+	// or, when it already exists, reset -- with Administrators as owner and a protected ACL that
+	// gives ordinary users read and execute only. It holds the config the SYSTEM collector reads and
+	// the hooks binary every user's agent runs, and %ProgramData% lets any user create a
+	// subdirectory, so a directory found here may have been made by someone else before Beacon was
+	// installed. A no-op elsewhere, where root ownership carries the same guarantee.
 	if !cfg.UserMode {
-		if err := writer.EnsureSystemLogWritable(filepath.Dir(cfg.LogPath)); err != nil {
+		root := sysacl.SystemRoot(endpointconfig.SystemBaseDir())
+		if err := sysacl.SecureSystemTree(root, filepath.Dir(cfg.LogPath)); err != nil {
+			return InstallResult{}, fmt.Errorf("secure %s: %w", root, err)
+		}
+		if err := writer.EnsureSystemLogWritable(cfg.LogPath); err != nil {
 			return InstallResult{}, fmt.Errorf("prepare the log directory: %w", err)
 		}
 	}
@@ -565,7 +621,21 @@ func Install(opts InstallOptions) (InstallResult, error) {
 		tx.Rollback(manifest)
 		return InstallResult{}, err
 	}
+	// Bring a connected endpoint's Beacon Cloud forwarder config up to this version's pack, in
+	// place and without re-enrolling. After everything else, so it can never be the reason an
+	// install rolls back; and only when services are started, since it may restart the forwarder
+	// (the macOS package installs with --no-start and runs `beacon endpoint asymptote reconcile`
+	// itself once the collector is back).
+	var managedForwarder *asymptote.ReconcileResult
+	if opts.StartService {
+		reconciled, err := reconcileManagedForwarder(cfg.UserMode, cfg.LogPath)
+		if err != nil && reconciled.Warning == "" {
+			reconciled.Warning = err.Error()
+		}
+		managedForwarder = &reconciled
+	}
 	return InstallResult{
+		ManagedForwarder:    managedForwarder,
 		ConfigPath:          configPath,
 		CollectorConfigPath: cfg.Collector.ConfigPath,
 		PlistPath:           plistPath,
@@ -626,17 +696,27 @@ func Uninstall(opts UninstallOptions) error {
 		fail("remove package forwarders", removeScriptForwarders(opts.KeepConfig))
 	}
 	// The managed-ingest forwarder and its credentials go with the endpoint; server-side the
-	// device stays registered until it is revoked from the dashboard.
-	fail("disconnect managed ingest", asymptote.Disconnect(asymptote.DisconnectOptions{
-		UserMode:        cfg.UserMode,
-		LogPath:         cfg.LogPath,
-		KeepCredentials: opts.KeepConfig,
-	}))
+	// device stays registered until it is revoked from the dashboard. Repair keeps all of it.
+	if !opts.KeepManagedIngest {
+		fail("disconnect managed ingest", asymptote.Disconnect(asymptote.DisconnectOptions{
+			UserMode:        cfg.UserMode,
+			LogPath:         cfg.LogPath,
+			KeepCredentials: opts.KeepConfig,
+		}))
+	}
 	manifest, _ := ReadManifest(cfg.UserMode)
 	if !opts.KeepConfig {
 		restoreBackups(manifest.Backups)
 	}
+	// Repair (KeepManagedIngest) keeps config.json so the reinstall carries over what connect,
+	// disconnect and the operator own in it (managed_ingest, inventory, auto_update); without it
+	// a repaired endpoint that kept forwarding read as unconnected on disk. `uninstall
+	// --keep-config` keeps harness settings only, so it still removes Beacon's own config.
+	endpointConfigPath := endpointconfig.ConfigPath(cfg.UserMode)
 	for _, path := range manifest.Files {
+		if opts.KeepManagedIngest && path == endpointConfigPath {
+			continue
+		}
 		fail("remove "+path, os.Remove(path))
 	}
 	if len(manifest.Files) == 0 {
@@ -644,7 +724,9 @@ func Uninstall(opts UninstallOptions) error {
 			fail("remove "+path, os.Remove(path))
 		}
 		fail("remove "+cfg.Collector.ConfigPath, os.Remove(cfg.Collector.ConfigPath))
-		fail("remove endpoint config", os.Remove(endpointconfig.ConfigPath(cfg.UserMode)))
+		if !opts.KeepManagedIngest {
+			fail("remove endpoint config", os.Remove(endpointConfigPath))
+		}
 	}
 	if !opts.KeepLogs {
 		for _, path := range runtimeLogFiles(cfg.LogPath) {
@@ -692,12 +774,13 @@ func runtimeLogFiles(logPath string) []string {
 // and everything it does not recreate stays.
 func repairUninstallOptions(opts InstallOptions) UninstallOptions {
 	return UninstallOptions{
-		UserMode:       opts.UserMode,
-		LogPath:        opts.LogPath,
-		KeepLogs:       true,
-		KeepConfig:     true,
-		KeepUpdater:    true,
-		KeepForwarders: true,
+		UserMode:          opts.UserMode,
+		LogPath:           opts.LogPath,
+		KeepLogs:          true,
+		KeepConfig:        true,
+		KeepUpdater:       true,
+		KeepForwarders:    true,
+		KeepManagedIngest: true,
 	}
 }
 
@@ -789,7 +872,7 @@ func setAutoUpdateModeInConfigFile(path, mode string) error {
 	if info, err := os.Stat(path); err == nil {
 		perm = info.Mode().Perm()
 	}
-	return os.WriteFile(path, out, perm)
+	return atomicfile.Write(path, out, perm)
 }
 
 func GetStatus(userMode bool, logPath string) Status {
@@ -823,6 +906,7 @@ func buildStatus(requestedUserMode bool, effectiveCfg endpointconfig.Config, run
 	}
 	return Status{
 		Version:            version.GetVersion(),
+		Edition:            version.ReportedEdition(),
 		ConfigPath:         endpointconfig.ConfigPath(effectiveCfg.UserMode),
 		LogPath:            effectiveCfg.LogPath,
 		RuntimeLog:         runtimeLog,
@@ -834,6 +918,7 @@ func buildStatus(requestedUserMode bool, effectiveCfg endpointconfig.Config, run
 		Destinations:       destinationStatus(effectiveCfg),
 		ManagedIngest:      asymptote.Status(requestedUserMode, managedOpts),
 		InventoryHeartbeat: inventoryHeartbeatStatus(requestedUserMode, runtimeLog.RequestedLogPath),
+		ScriptForwarders:   scriptForwarderStatuses(),
 	}
 }
 
@@ -915,6 +1000,7 @@ func buildConfig(opts InstallOptions) endpointconfig.Config {
 	cfg.Collector.BinaryPath = opts.CollectorPath
 	cfg.Collector.IncludeRuntimeMetrics = opts.IncludeRuntimeMetrics
 	cfg.Collector.IncludeCodexSpans = opts.IncludeCodexSpans
+	cfg.ClaudeCaptureModelContext = opts.ClaudeCaptureModelContext
 	if opts.SplunkHEC != nil {
 		if cfg.Destinations == nil {
 			cfg.Destinations = &endpointconfig.Destinations{}
@@ -1028,7 +1114,7 @@ func restoreFile(path string, snapshot fileSnapshot) {
 	if mode == 0 {
 		mode = 0600
 	}
-	_ = os.WriteFile(path, snapshot.Data, mode)
+	_ = atomicfile.Write(path, snapshot.Data, mode)
 }
 
 func preflight(cfg endpointconfig.Config, startService bool, kind service.Kind) error {
@@ -1119,7 +1205,7 @@ func configureHarnesses(cfg endpointconfig.Config) ([]string, error) {
 	for _, name := range cfg.Harnesses {
 		switch name {
 		case "claude", "claude_code":
-			path, err := harness.ConfigureClaude(harness.ConfigureOptions{Endpoint: grpcEndpoint, UserMode: cfg.UserMode})
+			path, err := harness.ConfigureClaude(harness.ConfigureOptions{Endpoint: grpcEndpoint, UserMode: cfg.UserMode, CaptureModelContext: cfg.ClaudeCaptureModelContext})
 			if err != nil {
 				return paths, err
 			}

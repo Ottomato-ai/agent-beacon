@@ -46,8 +46,8 @@ var claudeLogEventClassifications = map[string]eventClassification{
 	ClaudeAPIRequest:                      {action: "session.activity", category: "session"},
 	"claude_code.api_error":               {action: "session.error", category: "session"},
 	"claude_code.api_refusal":             {action: "session.status", category: "session"},
-	"claude_code.api_request_body":        {action: "session.activity", category: "session"},
-	"claude_code.api_response_body":       {action: "session.activity", category: "session"},
+	ClaudeAPIRequestBody:                  {action: "session.activity", category: "session"},
+	ClaudeAPIResponseBody:                 {action: "session.activity", category: "session"},
 	ClaudeToolDecision:                    {},
 	"claude_code.permission_mode_changed": {action: "session.status", category: "session"},
 	"claude_code.auth":                    {action: "session.activity", category: "session"},
@@ -89,6 +89,9 @@ var noisyCodexLogMessages = []string{
 type Options struct {
 	IncludeRuntimeMetrics bool
 	IncludeCodexSpans     bool
+	// CaptureModelContext keeps what Beacon records from Claude Code's API bodies. Off, every body
+	// event is dropped; see takeClaudeAPIBody.
+	CaptureModelContext bool
 }
 
 type Converter struct {
@@ -111,7 +114,11 @@ func (c Converter) EventsFromLogs(logs plog.Logs) []Event {
 				if ShouldDropLog(resourceAttrs, record) {
 					continue
 				}
-				events = append(events, c.EventFromLog(resourceAttrs, record))
+				event, keep, listings := c.eventFromLog(resourceAttrs, record)
+				events = append(events, listings...)
+				if keep {
+					events = append(events, event)
+				}
 			}
 		}
 	}
@@ -158,6 +165,11 @@ func (c Converter) EventsFromMetrics(metrics pmetric.Metrics) []Event {
 
 func ShouldDropLog(resourceAttrs map[string]interface{}, record plog.LogRecord) bool {
 	attrs := MergeMaps(resourceAttrs, AttrsToMap(record.Attributes()))
+	if name := ClaudeLogEventName(attrs, record.Body().AsString()); isClaudeAPIBody(name) {
+		// A request body is decided once it is parsed, in eventFromLog: it is kept for a WebFetch
+		// page or for the MCP tools it advertised. Nothing is kept from a response body.
+		return name != ClaudeAPIRequestBody
+	}
 	harness := HarnessName(attrs, record.Body().AsString())
 	if isCodexHarness(harness) {
 		return isNoisyCodexLog(attrs, record.Body().AsString())
@@ -302,8 +314,18 @@ func shouldDropCopilotMetric(resourceAttrs map[string]interface{}, name string, 
 }
 
 func (c Converter) EventFromLog(resourceAttrs map[string]interface{}, record plog.LogRecord) Event {
+	event, _, _ := c.eventFromLog(resourceAttrs, record)
+	return event
+}
+
+// eventFromLog converts a log record, and reports whether the event is worth keeping: it is not
+// for a Claude Code API body event that leaves no page text behind once its body is removed.
+// listings are the mcp.tool_listed events for the MCP tools a Claude Code request body advertised,
+// which are kept in its place.
+func (c Converter) eventFromLog(resourceAttrs map[string]interface{}, record plog.LogRecord) (event Event, keep bool, listings []Event) {
 	attrs := MergeMaps(resourceAttrs, AttrsToMap(record.Attributes()))
 	body := record.Body().AsString()
+	kept, isAPIBody := takeClaudeAPIBody(attrs, ClaudeLogEventName(attrs, body), c.opts.CaptureModelContext)
 	ts := Timestamp(record.Timestamp().AsTime())
 	// An action the record states outright is observed by definition; only the fallback has to
 	// account for how it got there.
@@ -313,7 +335,7 @@ func (c Converter) EventFromLog(resourceAttrs map[string]interface{}, record plo
 		action, fidelity = InferActionWithFidelity(attrs, body)
 	}
 	message := FirstNonEmpty(body, FirstString(attrs, "message", "log.message", "event.name"))
-	event := NewEvent(action, EventCategory(action, FirstString(attrs, "beacon.event.category", "event.category", "category")), Severity(record.SeverityText(), record.SeverityNumber().String()), HarnessName(attrs, message), ts)
+	event = NewEvent(action, EventCategory(action, FirstString(attrs, "beacon.event.category", "event.category", "category")), Severity(record.SeverityText(), record.SeverityNumber().String()), HarnessName(attrs, message), ts)
 	event.Event.Fidelity = fidelity
 	event.Message = message
 	c.PopulateCommon(&event, attrs)
@@ -329,10 +351,12 @@ func (c Converter) EventFromLog(resourceAttrs map[string]interface{}, record plo
 	})
 	c.NormalizeCodexLogEvent(&event, attrs)
 	c.NormalizeClaudeLogEvent(&event, attrs, body)
+	NormalizeGeminiLogEvent(&event, attrs)
+	normalizeClaudeWebFetchInput(&event, kept.webFetch)
 	// Last, so it sees the action and category the normalizers settled on rather
 	// than the ones InferAction guessed.
 	c.PromoteRetainedContent(&event, attrs, body)
-	return event
+	return event, !isAPIBody || kept.webFetch.text != "", c.claudeMCPToolListings(attrs, record, kept.mcpTools)
 }
 
 func (c Converter) EventFromSpan(resourceAttrs map[string]interface{}, span ptrace.Span) Event {
@@ -645,10 +669,14 @@ func (c Converter) NormalizeClaudeLogEvent(event *Event, attrs map[string]interf
 }
 
 func ClaudeLogEventName(attrs map[string]interface{}, body string) string {
+	return claudeLogEventName(FirstString(attrs, "event.name"), body)
+}
+
+func claudeLogEventName(eventName, body string) string {
 	if normalized := strings.ToLower(strings.TrimSpace(body)); strings.HasPrefix(normalized, "claude_code.") {
 		return normalized
 	}
-	normalized := strings.ToLower(strings.TrimSpace(FirstString(attrs, "event.name")))
+	normalized := strings.ToLower(strings.TrimSpace(eventName))
 	if strings.HasPrefix(normalized, "claude_code.") {
 		return normalized
 	}
@@ -927,16 +955,16 @@ func (c Converter) eventsFromUsageMetric(resourceAttrs map[string]interface{}, m
 	var events []Event
 	// Codex reports input tokens inclusive of both cached_input and
 	// cache_write_input. Beacon's gen_ai.usage keeps uncached input, cache read,
-	// and cache creation disjoint, so reduce input by both per-turn subsets;
-	// otherwise totals double-count cached prompt tokens. Returns nil (no-op)
-	// for every other usage metric.
-	inputSubsetsByTurn := codexInputSubsetsByTimestamp(metric)
+	// and cache creation disjoint, so reduce input by both subsets of the same
+	// series; otherwise totals double-count cached prompt tokens. Returns nil
+	// (no-op) for every other usage metric.
+	inputSubsetsBySeries := codexInputSubsetsBySeries(metric)
 	adjustValue := func(dpAttrs pcommon.Map, ts pcommon.Timestamp, value float64) float64 {
-		if inputSubsetsByTurn == nil {
+		if inputSubsetsBySeries == nil {
 			return value
 		}
-		if tt := FirstString(AttrsToMap(dpAttrs), "token_type"); strings.EqualFold(tt, "input") {
-			subsets := inputSubsetsByTurn[ts.AsTime().UnixNano()]
+		if scope, tokenType := tokenSeriesScope(dpAttrs, ts, codexTokenTypeAttribute); tokenType == "input" {
+			subsets := inputSubsetsBySeries[scope]
 			if value -= subsets.cached + subsets.cacheWrite; value < 0 {
 				value = 0
 			}
@@ -951,9 +979,16 @@ func (c Converter) eventsFromUsageMetric(resourceAttrs map[string]interface{}, m
 			"metric_temporality": sum.AggregationTemporality().String(),
 			"metric_monotonic":   sum.IsMonotonic(),
 		}
+		// Gemini CLI's input series includes its cache series and its output series
+		// leaves out its thought series; see gemini_usage.go. Nil for every other metric.
+		geminiSeries := geminiTokenSeriesByScope(metric)
 		for i := 0; i < sum.DataPoints().Len(); i++ {
 			dp := sum.DataPoints().At(i)
-			events = append(events, c.usageEventFromDataPoint(resourceAttrs, metric, dp.Attributes(), dp.Timestamp(), adjustValue(dp.Attributes(), dp.Timestamp(), numberDataPointValue(dp)), extra))
+			event := c.usageEventFromDataPoint(resourceAttrs, metric, dp.Attributes(), dp.Timestamp(), adjustValue(dp.Attributes(), dp.Timestamp(), numberDataPointValue(dp)), extra)
+			if geminiSeries != nil {
+				geminiSeries.apply(&event, dp.Attributes(), dp.Timestamp(), numberDataPointValue(dp))
+			}
+			events = append(events, event)
 		}
 	case pmetric.MetricTypeGauge:
 		gauge := metric.Gauge()
@@ -985,26 +1020,28 @@ type codexInputSubsets struct {
 	cacheWrite float64
 }
 
-// codexInputSubsetsByTimestamp collects each turn's cached and cache-write
+const codexTokenTypeAttribute = "token_type"
+
+// codexInputSubsetsBySeries collects each series' cached and cache-write
 // datapoints so Codex's inclusive input count can be reduced to the canonical
 // uncached remainder. Returns nil for every other metric.
-func codexInputSubsetsByTimestamp(metric pmetric.Metric) map[int64]codexInputSubsets {
+func codexInputSubsetsBySeries(metric pmetric.Metric) map[string]codexInputSubsets {
 	if !strings.EqualFold(strings.TrimSpace(metric.Name()), "codex.turn.token_usage") {
 		return nil
 	}
 	if metric.Type() != pmetric.MetricTypeHistogram {
 		return nil
 	}
-	out := map[int64]codexInputSubsets{}
+	out := map[string]codexInputSubsets{}
 	dps := metric.Histogram().DataPoints()
-	for i := 0; i < dps.Len(); i++ {
+	for i := range dps.Len() {
 		dp := dps.At(i)
 		if !dp.HasSum() {
 			continue
 		}
-		key := dp.Timestamp().AsTime().UnixNano()
-		subsets := out[key]
-		switch strings.ToLower(FirstString(AttrsToMap(dp.Attributes()), "token_type")) {
+		scope, tokenType := tokenSeriesScope(dp.Attributes(), dp.Timestamp(), codexTokenTypeAttribute)
+		subsets := out[scope]
+		switch tokenType {
 		case "cached_input":
 			subsets.cached += dp.Sum()
 		case "cache_write_input":
@@ -1012,9 +1049,31 @@ func codexInputSubsetsByTimestamp(metric pmetric.Metric) map[int64]codexInputSub
 		default:
 			continue
 		}
-		out[key] = subsets
+		out[scope] = subsets
 	}
 	return out
+}
+
+// tokenSeriesScope returns a token-usage datapoint's series identity without its token type,
+// plus the type (lowercased). Every other attribute and the timestamp are part of the identity,
+// so sibling datapoints of one series share a scope while two sessions or two models in one
+// export never do.
+func tokenSeriesScope(attrs pcommon.Map, ts pcommon.Timestamp, typeAttribute string) (string, string) {
+	values := AttrsToMap(attrs)
+	tokenType := strings.ToLower(strings.TrimSpace(FirstString(values, typeAttribute)))
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		if key != typeAttribute {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d", ts.AsTime().UnixNano())
+	for _, key := range keys {
+		fmt.Fprintf(&b, "\x00%s=%v", key, values[key])
+	}
+	return b.String(), tokenType
 }
 
 func numberDataPointValue(dp pmetric.NumberDataPoint) float64 {
@@ -1177,8 +1236,17 @@ func (c Converter) PopulateCommon(event *Event, attrs map[string]interface{}) {
 	}
 	if event.Event.Category == "prompt" {
 		if text := FirstNonEmpty(FirstTextAttr(attrs, PromptTextKeys...), FirstMessageText(event.GenAI)); text != "" {
-			event.Prompt = &PromptInfo{Text: text}
+			SetPromptText(event, text)
 		}
+	}
+	// The prompt this event belongs to. Claude Code writes it as prompt.id on every event of a
+	// turn, Gemini CLI as prompt_id, Codex as turn.id; the alias list is shared with the hook path
+	// so both capture paths put one turn under one value.
+	if id := asymptoteobserve.PromptIDFrom(attrs); id != "" {
+		if event.Prompt == nil {
+			event.Prompt = &PromptInfo{}
+		}
+		event.Prompt.ID = id
 	}
 }
 
@@ -1250,7 +1318,7 @@ func GenAIFromAttrs(attrs map[string]interface{}) *GenAIInfo {
 		genai.Retrieval = &GenAIRetrievalInfo{QueryText: query}
 	}
 	if instructions, ok := AnyAttr(attrs, "gen_ai.system_instructions"); ok {
-		genai.SystemInstructions = instructions
+		genai.SystemInstructions = SystemInstructionParts(instructions)
 	}
 	if tokenType := FirstString(attrs, "gen_ai.token.type"); tokenType != "" {
 		genai.Token = &GenAITokenInfo{Type: tokenType}
@@ -1354,20 +1422,59 @@ func GenAIToolFromAttrs(attrs map[string]interface{}) *GenAIToolInfo {
 	return tool
 }
 
+// inclusiveInputTokenKeys are the input-count names whose value includes cached
+// prompt tokens. The OTel GenAI semconv says of gen_ai.usage.input_tokens "This
+// value SHOULD include all types of input tokens, including cached tokens", and
+// of each cache count "The value SHOULD be included in gen_ai.usage.input_tokens".
+// The deprecated prompt_tokens spellings it replaced carry OpenAI's prompt_tokens,
+// which counts prompt_tokens_details.cached_tokens too. Claude Code's bare
+// input_tokens is deliberately absent: it is Anthropic's usage.input_tokens,
+// which already excludes cache reads and writes.
+var inclusiveInputTokenKeys = []string{"gen_ai.usage.input_tokens", "llm.usage.prompt_tokens", "gen_ai.usage.prompt_tokens"}
+
 // GenAIUsageFromAttrs normalizes runtime token usage into the canonical
 // gen_ai.usage struct. Alongside the OTel GenAI and legacy llm.usage.* semconv
 // names it accepts Claude Code's bare claude_code.llm_request span attribute
 // names (input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens)
 // so span-level usage and the per-step session drilldown carry real counts.
+//
+// Beacon keeps input, cache read and cache creation disjoint, so an inclusive
+// input count (see inclusiveInputTokenKeys) is reduced by the cache counts
+// reported beside it, the same reduction the Codex turn span gets. The raw
+// attributes keep the value as reported.
 func GenAIUsageFromAttrs(attrs map[string]interface{}) *GenAIUsageInfo {
 	usage := &GenAIUsageInfo{}
-	if value, ok := Int64Attr(attrs, "gen_ai.usage.cache_creation.input_tokens", "gen_ai.usage.cache_creation_input_tokens", "cache_creation_tokens"); ok {
-		usage.CacheCreation = &GenAIUsageCacheCreationInfo{InputTokens: &value}
+	var cached int64
+	if value, ok := Int64Attr(attrs, "gen_ai.usage.cache_creation.input_tokens", "gen_ai.usage.cache_write.input_tokens", "gen_ai.usage.cache_creation_input_tokens", "cache_creation_tokens"); ok {
+		// The one-hour subset of the writes, from the browser extension's Claude adapter.
+		// Claude Code's own api_request log reports only the cache_creation_tokens total.
+		var oneHour *int64
+		if h, ok := Int64Attr(attrs, "gen_ai.usage.cache_creation.ephemeral_1h_input_tokens"); ok {
+			oneHour = &h
+		}
+		usage.CacheCreation = asymptoteobserve.NewCacheCreationUsage(value, oneHour)
+		if value > 0 {
+			cached += value
+		}
 	}
 	if value, ok := Int64Attr(attrs, "gen_ai.usage.cache_read.input_tokens", "gen_ai.usage.cache_read_input_tokens", "cache_read_tokens"); ok {
 		usage.CacheRead = &GenAIUsageCacheReadInfo{InputTokens: &value}
+		if value > 0 {
+			cached += value
+		}
 	}
-	if value, ok := Int64Attr(attrs, "gen_ai.usage.input_tokens", "llm.usage.prompt_tokens", "gen_ai.usage.prompt_tokens", "input_tokens"); ok {
+	if value, ok := Int64Attr(attrs, inclusiveInputTokenKeys...); ok {
+		// Guard: an input smaller than its own cache counts cannot contain
+		// them, so that source already reports uncached input (Anthropic's
+		// shape under semconv names) and is stored as reported rather than
+		// having real tokens erased. The semconv names both cache reads and
+		// cache writes as part of input, so both are removed; an emitter that
+		// folds in only one of them undercounts input by the other.
+		if cached > 0 && value >= cached {
+			value -= cached
+		}
+		usage.InputTokens = &value
+	} else if value, ok := Int64Attr(attrs, "input_tokens"); ok {
 		usage.InputTokens = &value
 	}
 	if value, ok := Int64Attr(attrs, "gen_ai.usage.output_tokens", "llm.usage.completion_tokens", "gen_ai.usage.completion_tokens", "output_tokens"); ok {
@@ -1870,30 +1977,30 @@ func FirstMessageText(genai *GenAIInfo) string {
 	return firstTextFromAny(genai.Input.Messages)
 }
 
+// firstTextFromAny is the first meaningful text part in a messages, parts or prompt value, read the
+// way every Beacon reader reads one.
 func firstTextFromAny(value interface{}) string {
-	switch typed := value.(type) {
-	case string:
-		return meaningfulText(typed)
-	case []interface{}:
-		for _, item := range typed {
-			if text := firstTextFromAny(item); text != "" {
-				return text
-			}
-		}
-	case map[string]interface{}:
-		if content, ok := typed["content"]; ok {
-			if text := firstTextFromAny(content); text != "" {
-				return text
-			}
-		}
-		if parts, ok := typed["parts"]; ok {
-			return firstTextFromAny(parts)
-		}
-		if messages, ok := typed["messages"]; ok {
-			return firstTextFromAny(messages)
+	for _, text := range asymptoteobserve.GenAIText(value, "", asymptoteobserve.GenAIPartTypeText) {
+		if text = meaningfulText(text); text != "" {
+			return text
 		}
 	}
 	return ""
+}
+
+// SystemInstructionParts puts a gen_ai.system_instructions value in the semconv shape, a list of
+// parts. Producers that predate the convention send the instructions as one string, and AnyAttr
+// keeps a value that is not JSON as that string. Stored as is, the field would hold a string on
+// some events and a list on others, and a typed log index such as Elasticsearch's rejects every
+// event whose shape differs from the first it saw. A single part object becomes a one-part list.
+func SystemInstructionParts(value interface{}) interface{} {
+	switch typed := value.(type) {
+	case string:
+		return asymptoteobserve.SystemInstructionParts(typed)
+	case map[string]interface{}:
+		return []interface{}{typed}
+	}
+	return value
 }
 
 func meaningfulText(value string) string {
@@ -2060,6 +2167,14 @@ func HasToolCall(attrs map[string]interface{}) bool {
 		return true
 	}
 	return IsMeaningfulValue(attrs["gen_ai.tool.call.arguments"])
+}
+
+// SetPromptText records an event's prompt text, keeping the prompt id already on it.
+func SetPromptText(event *Event, text string) {
+	if event.Prompt == nil {
+		event.Prompt = &PromptInfo{}
+	}
+	event.Prompt.Text = text
 }
 
 // ToolCallID reads the runtime's own identifier for one tool invocation.

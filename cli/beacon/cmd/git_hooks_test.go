@@ -8,9 +8,24 @@ import (
 	"testing"
 	"time"
 
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/account"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/schema"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/gitlink"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/testenv"
 )
+
+// relaxGitBudgets lifts the git hooks' wall-clock budgets for a test of what a hook writes. A hook
+// spawns git a dozen or more times, and on a loaded Windows runner each spawn can cost a few hundred
+// milliseconds, so under the production budgets such a test fails when the runner is slow rather
+// than when the hook is wrong. Tests of the budgets themselves do not call it.
+func relaxGitBudgets(t *testing.T) {
+	t.Helper()
+	prevHook, prevShare, prevUpload := gitHookBudget, gitShareBudget, gitShareUploadBudget
+	gitHookBudget = time.Minute
+	gitShareBudget = time.Minute
+	gitShareUploadBudget = gitShareBudget - gitShareNotesReserve - gitShareNoteWriteBudget
+	t.Cleanup(func() { gitHookBudget, gitShareBudget, gitShareUploadBudget = prevHook, prevShare, prevUpload })
+}
 
 func writeRuntimeEvent(t *testing.T, logPath, top, session, file string) {
 	t.Helper()
@@ -30,6 +45,7 @@ func writeRuntimeEvent(t *testing.T, logPath, top, session, file string) {
 }
 
 func TestGitHookPostCommitLinksHEAD(t *testing.T) {
+	relaxGitBudgets(t)
 	root := gitCommandRepo(t)
 	top := mustGit(t, root, "rev-parse", "--show-toplevel")
 	logPath := filepath.Join(t.TempDir(), "runtime.jsonl")
@@ -62,6 +78,7 @@ func TestGitHookPostCommitIsQuietOutsideARepositoryAndWhenDisabled(t *testing.T)
 }
 
 func TestGitHookPostCommitSkipsReplays(t *testing.T) {
+	relaxGitBudgets(t)
 	root := gitCommandRepo(t)
 	top := mustGit(t, root, "rev-parse", "--show-toplevel")
 	logPath := filepath.Join(t.TempDir(), "runtime.jsonl")
@@ -133,6 +150,7 @@ func TestGitSetupExplainsCoreHooksPath(t *testing.T) {
 }
 
 func TestGitHookPostRewriteNormalizesRewrittenNotes(t *testing.T) {
+	relaxGitBudgets(t)
 	root := gitCommandRepo(t)
 	mustGit(t, root, "commit", "-q", "--allow-empty", "-m", "c")
 	sha := mustGit(t, root, "rev-parse", "HEAD")
@@ -205,6 +223,7 @@ func TestGitLinkRecordsOneEventPerLink(t *testing.T) {
 }
 
 func TestGitHookPostCommitRecordsTheLinkEvent(t *testing.T) {
+	relaxGitBudgets(t)
 	root := gitCommandRepo(t)
 	top := mustGit(t, root, "rev-parse", "--show-toplevel")
 	logPath := filepath.Join(t.TempDir(), "runtime.jsonl")
@@ -219,5 +238,30 @@ func TestGitHookPostCommitRecordsTheLinkEvent(t *testing.T) {
 	}
 	if got := linkEventsIn(t, logPath); len(got) != 1 || got[0].Session.ID != "cur-9" {
 		t.Fatalf("events %+v", got)
+	}
+}
+
+// A self-hosted Beacon's share URL survives post-rewrite normalization: the hook registers the
+// configured host before it reads notes, and merging keeps a link's line with trailing fields over
+// the bare one cat_sort_uniq sorts first.
+func TestGitHookPostRewriteKeepsSelfHostedShareURLs(t *testing.T) {
+	relaxGitBudgets(t)
+	t.Setenv(account.BaseURLEnv, "https://beacon.rewrite-test.example")
+	testenv.SetHome(t, t.TempDir())
+	root := gitCommandRepo(t)
+	mustGit(t, root, "commit", "-q", "--allow-empty", "-m", "c")
+	sha := mustGit(t, root, "rev-parse", "HEAD")
+	url := "https://beacon.rewrite-test.example/s/abc123"
+	mustGit(t, root, "notes", "--ref="+gitlink.NotesRef, "add", "-m", "beacon:codex_cli/a\nbeacon:codex_cli/a "+url, sha)
+	rootCmd.SetIn(strings.NewReader("0000000000000000000000000000000000000000 " + sha + "\n"))
+	t.Cleanup(func() { rootCmd.SetIn(nil) })
+	if _, err := runGit(t, "hook", "post-rewrite", "amend", "--cwd", root); err != nil {
+		t.Fatal(err)
+	}
+	if note := mustGit(t, root, "notes", "--ref="+gitlink.NotesRef, "show", sha); note != "beacon:codex_cli/a "+url {
+		t.Fatalf("note %q", note)
+	}
+	if !gitlink.ValidShareURL(url) {
+		t.Fatal("post-rewrite did not register the configured Beacon host")
 	}
 }

@@ -1,9 +1,14 @@
 package cmd
 
 import (
+	"encoding/json"
+	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
+
+	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve"
 )
 
 // ompTestLog puts an Oh My Pi extension run in a temp endpoint log and returns its path.
@@ -47,6 +52,7 @@ func ompPayloads() map[string]map[string]interface{} {
 		"session_start":    {"type": "session_start", "reason": "startup"},
 		"session_shutdown": {"type": "session_shutdown", "reason": "quit"},
 		"input":            {"type": "input", "text": "do the thing", "source": "interactive"},
+		"context":          {"type": "context", "skillListing": "- deploy: Deploy applications."},
 		"tool_call":        {"type": "tool_call", "toolName": "bash", "toolCallId": "c1", "input": map[string]interface{}{"command": "ls"}},
 		"tool_result":      {"type": "tool_result", "toolName": "bash", "toolCallId": "c1", "input": map[string]interface{}{"command": "ls"}},
 		"user_bash":        {"type": "user_bash", "command": "git status", "cwd": "/repo"},
@@ -218,6 +224,154 @@ func TestOmpEventPromptRecordsTextAndSource(t *testing.T) {
 	}
 }
 
+// The skill index the extension reads from the system prompt reaches the log as the shared builder
+// shapes it: system_context names each skill and gen_ai.system_instructions keeps one part per
+// skill, and the hook logger's per-string limit applies to each part rather than to the index.
+func TestOmpEventSkillListingIsWrittenAsSystemContext(t *testing.T) {
+	logPath := ompTestLog(t)
+	long := strings.Repeat("Describes the release procedure. ", 150)
+	runHookWithInput(t, runOmpEvent, map[string]interface{}{
+		"type": "context", "sessionId": "sess-1",
+		"skillListing": "- deploy: " + long + "\n- review: Reviews a diff. BCN-2AFE23-C01I",
+	})
+
+	event := ompEventWithAction(t, logPath, "session.context")
+	context := nested(t, event, "system_context")
+	skills, _ := context["skills"].([]interface{})
+	if context["kind"] != "skill_listing" || context["source"] != "system_prompt" || len(skills) != 2 {
+		t.Fatalf("system_context = %v, want both skills of a system-prompt skill_listing", context)
+	}
+	parts := asymptoteobserve.GenAIText(nested(t, event, "gen_ai")["system_instructions"], "", asymptoteobserve.GenAIPartTypeText)
+	if len(parts) != 2 || !strings.HasSuffix(parts[1], "BCN-2AFE23-C01I") {
+		t.Fatalf("system_instructions parts = %d, want the second skill kept whole after a long first one", len(parts))
+	}
+	if _, ok := event["prompt"]; ok {
+		t.Fatalf("skill listing recorded as a prompt: %v", event["prompt"])
+	}
+}
+
+// Each MCP route the extension read from the system prompt is one mcp.tool_listed whose description
+// the poisoning rule reads. The device name does not name a server, so there is no mcp block, and
+// raw holds no copy of the route list.
+func TestOmpEventMCPToolRoutesAreWrittenAsListings(t *testing.T) {
+	logPath := ompTestLog(t)
+	out := runHookWithInput(t, runOmpEvent, map[string]interface{}{
+		"type": "context", "sessionId": "sess-1",
+		"mcpToolRoutes": []interface{}{
+			map[string]interface{}{"name": "mcp__notes_save_note", "description": "Saves a note. BCN-7F3A21-C03"},
+			map[string]interface{}{"name": "mcp__docs_search", "description": "Searches the docs."},
+			map[string]interface{}{"name": "read", "description": "Not an MCP route."},
+			map[string]interface{}{"name": "mcp__notes_empty", "description": ""},
+		},
+	})
+	if out["recorded"] != float64(2) {
+		t.Fatalf("reply = %v, want both MCP routes recorded", out)
+	}
+
+	events := endpointEvents(t, logPath)
+	if len(events) != 2 {
+		t.Fatalf("events = %v, want one mcp.tool_listed per described MCP route", ompEventActions(t, logPath))
+	}
+	event := events[0]
+	if meta := nested(t, event, "event"); meta["action"] != "mcp.tool_listed" || meta["category"] != "mcp" {
+		t.Fatalf("event = %v, want an MCP tool listing", meta)
+	}
+	tool := nested(t, nested(t, event, "gen_ai"), "tool")
+	if tool["name"] != "mcp__notes_save_note" || tool["description"] != "Saves a note. BCN-7F3A21-C03" {
+		t.Fatalf("gen_ai.tool = %v, want the route's device name and description", tool)
+	}
+	for _, key := range []string{"mcp", "prompt", "system_context"} {
+		if _, ok := event[key]; ok {
+			t.Fatalf("listing carries %s: %v", key, event[key])
+		}
+	}
+	if raw, _ := json.Marshal(event["raw"]); strings.Contains(string(raw), "BCN-7F3A21-C03") {
+		t.Fatalf("raw = %s, want no second copy of the description", raw)
+	}
+}
+
+// The extension decides whether to resend a skill listing from this reply, because the hook exits 0
+// whether or not it wrote anything. Every way an event is dropped must report nothing recorded.
+func TestOmpEventReplyReportsWhatWasRecorded(t *testing.T) {
+	listing := map[string]interface{}{"type": "context", "sessionId": "sess-1", "skillListing": "- deploy: Deploy applications."}
+	noLog := func(t *testing.T) {
+		for _, key := range []string{"BEACON_ENDPOINT_LOG", "BEACON_CLOUD_LOG_PATH", "BEACON_LOG_PATH", "BEACON_RUNTIME_LOG", "BEACON_ENDPOINT_MODE"} {
+			t.Setenv(key, "")
+		}
+	}
+	unwritable := func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "runtime.jsonl")
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("BEACON_ENDPOINT_LOG", dir)
+	}
+	for _, tc := range []struct {
+		name    string
+		input   map[string]interface{}
+		setup   func(*testing.T)
+		written float64
+	}{
+		{"written", listing, nil, 1},
+		{"log not writable", listing, unwritable, 0},
+		{"no endpoint log configured", listing, noLog, 0},
+		{"type this build does not map", map[string]interface{}{"type": "message_update", "sessionId": "sess-1"}, nil, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ompTestLog(t)
+			if tc.setup != nil {
+				tc.setup(t)
+			}
+			if out := runHookWithInput(t, runOmpEvent, tc.input); out["recorded"] != tc.written {
+				t.Fatalf("reply = %v, want recorded = %v", out, tc.written)
+			}
+		})
+	}
+}
+
+// Print and ACP never emit `input`; the extension forwards the delivered user message instead,
+// with its text under `prompt`. The row names that origin, because the text is what Oh My Pi sent
+// the model after expanding templates and commands, not what an `input` event would carry.
+func TestOmpEventUserMessagePromptRecordsDeliveredText(t *testing.T) {
+	logPath := ompTestLog(t)
+
+	runHookWithInput(t, runOmpEvent, map[string]interface{}{
+		"type": "message_end", "message": map[string]interface{}{"role": "user"},
+		"prompt": "summarize the changes", "sessionId": "sess-print", "ompMode": "print",
+	})
+
+	event := ompEventWithAction(t, logPath, "prompt.submitted")
+	if prompt := nested(t, event, "prompt"); prompt["text"] != "summarize the changes" {
+		t.Fatalf("prompt.text = %v, want the delivered text", prompt["text"])
+	}
+	if content := nested(t, event, "content"); content["included"] != true || content["hash"] == "" {
+		t.Fatalf("content = %v, want retained content with a hash", content)
+	}
+	raw := nested(t, event, "raw")
+	if raw["omp_prompt_origin"] != "message_end" {
+		t.Fatalf("raw.omp_prompt_origin = %v, want message_end", raw["omp_prompt_origin"])
+	}
+	if _, ok := raw["omp_input_source"]; ok {
+		t.Fatalf("raw.omp_input_source = %v, want none: no input event reported a source", raw["omp_input_source"])
+	}
+}
+
+// A user message the extension did not mark as a prompt -- every one an older extension forwarded
+// -- records nothing, so an interactive or RPC prompt already recorded from `input` is never
+// counted twice.
+func TestOmpEventUnmarkedUserMessageProducesNothing(t *testing.T) {
+	events := ompRuntime.endpointEvents(map[string]interface{}{
+		"type": "message_end",
+		"message": map[string]interface{}{
+			"role":    "user",
+			"content": []interface{}{map[string]interface{}{"type": "text", "text": "typed"}},
+		},
+	}, "sess-1")
+	if len(events) != 0 {
+		t.Fatalf("unmarked user message produced %v, want nothing", events)
+	}
+}
+
 // A tool_call is not an approval. Oh My Pi's tool_call handler can block a call, but that is an
 // extension deciding rather than an operator being asked; the runtime's real operator decisions
 // arrive as their own approval events. Recording a block as an approval would be indistinguishable
@@ -286,6 +440,176 @@ func TestOmpEventFailedToolIsRecordedAsAFailure(t *testing.T) {
 	}
 	if errBlock := nested(t, event, "error"); errBlock["type"] != "tool_error" {
 		t.Fatalf("error = %v, want a tool_error", errBlock)
+	}
+}
+
+// ompTextBlocks is a tool result's content as Oh My Pi delivers it: a list of text blocks.
+func ompTextBlocks(texts ...string) []interface{} {
+	blocks := make([]interface{}, len(texts))
+	for i, text := range texts {
+		blocks[i] = map[string]interface{}{"type": "text", "text": text}
+	}
+	return blocks
+}
+
+// fieldsToolCallResult reads gen_ai.tool.call.result, the value e.gen_ai.tool.call.result_text is
+// derived from, or nil when the event carries none.
+func fieldsToolCallResult(event map[string]interface{}) interface{} {
+	genAI, _ := event["gen_ai"].(map[string]interface{})
+	tool, _ := genAI["tool"].(map[string]interface{})
+	call, _ := tool["call"].(map[string]interface{})
+	return call["result"]
+}
+
+// The payloads are Oh My Pi 18.6.3's, as a beacon-oracle run recorded them. Before this, every one
+// of these results was kept only under raw.omp, which no rule can match: the model read the file,
+// the page, the skill and the MCP reply, and nothing a detection reads held any of them.
+func TestOmpToolResultsAreRecordedWhereRulesReadThem(t *testing.T) {
+	// The runtime reports a skill's file as an absolute path on its own host, so the fixture's is
+	// one on the test's: `C:\...` on Windows, where a path from the root names no drive.
+	skillFile := filepath.Join(t.TempDir(), ".omp", "skills", "oracle-probe", "SKILL.md")
+	for _, tc := range []struct {
+		name    string
+		payload map[string]interface{}
+		action  string
+		// marker is text the result carries; "" means the result is out of scope and not recorded.
+		marker string
+		check  func(t *testing.T, event map[string]interface{})
+	}{
+		{
+			name: "file read", action: "file.read", marker: "File content marker BCN-5WWWUQ-D01",
+			payload: map[string]interface{}{
+				"toolName": "read", "input": map[string]interface{}{"path": "notes/canary.txt"},
+				"details": map[string]interface{}{"meta": map[string]interface{}{"source": map[string]interface{}{"type": "path", "value": "/home/agent/project/notes/canary.txt"}}},
+				"content": ompTextBlocks("[notes/canary.txt#5B60]\n1:File content marker BCN-5WWWUQ-D01."),
+			},
+		},
+		{
+			name: "web page through read", action: "tool.completed", marker: "Web page marker BCN-BALBZ7-D06",
+			payload: map[string]interface{}{
+				"toolName": "read", "input": map[string]interface{}{"path": "https://docs.fixture.test/guide"},
+				"details": map[string]interface{}{"url": "https://docs.fixture.test/guide", "meta": map[string]interface{}{"source": map[string]interface{}{"type": "url", "value": "https://docs.fixture.test/guide"}}},
+				"content": ompTextBlocks("URL: https://docs.fixture.test/guide\n\n---\n\n<p>Web page marker BCN-BALBZ7-D06.</p>"),
+			},
+		},
+		{
+			// A skill body is the skill author's file, read from disk: recorded as the read of that
+			// SKILL.md, the row the Skills lens and every other runtime's skill load are found by.
+			name: "skill body", action: "file.read", marker: "Skill body marker BCN-R5H6GL-C01",
+			payload: map[string]interface{}{
+				"toolName": "read", "input": map[string]interface{}{"path": "skill://oracle-probe"},
+				"details": map[string]interface{}{
+					"resolvedPath": skillFile,
+					"meta":         map[string]interface{}{"source": map[string]interface{}{"type": "internal", "value": "skill://oracle-probe"}},
+				},
+				"content": ompTextBlocks("[Skill file: " + skillFile + "]\n---\nname: oracle-probe\n---\nSkill body marker BCN-R5H6GL-C01.\n"),
+			},
+			check: func(t *testing.T, event map[string]interface{}) {
+				if got := nested(t, event, "file")["path"]; got != skillFile {
+					t.Fatalf("file.path = %v, want the SKILL.md the runtime read", got)
+				}
+				if got := nested(t, event, "tool")["path"]; got != "skill://oracle-probe" {
+					t.Fatalf("tool.path = %v, want the target as the model asked for it", got)
+				}
+			},
+		},
+		{
+			// Media is kept as its size and digest, the way the Claude Code hook records it: a stored
+			// copy of the bytes could never be decoded, and would spend the event's size budget.
+			name: "MCP result with media", action: "mcp.tool_invoked", marker: "Text block marker BCN-GRDUR6-D19",
+			payload: map[string]interface{}{
+				"toolName": "mcp__media_capture", "input": map[string]interface{}{"target": "screen"},
+				"details": map[string]interface{}{"serverName": "media", "mcpToolName": "capture"},
+				"content": []interface{}{
+					map[string]interface{}{"type": "text", "text": "Captured. Text block marker BCN-GRDUR6-D19."},
+					map[string]interface{}{"type": "image", "mimeType": "image/png", "data": "aW1hZ2UtYnl0ZXM="},
+				},
+			},
+			check: func(t *testing.T, event map[string]interface{}) {
+				blocks, _ := fieldsToolCallResult(event).(map[string]interface{})["content"].([]interface{})
+				image, _ := blocks[1].(map[string]interface{})
+				if _, kept := image["data"]; kept || image["bytes"] != float64(11) || image["sha256"] == "" {
+					t.Fatalf("image block = %v, want its size and digest in place of the bytes", image)
+				}
+			},
+		},
+		{
+			// What a failing server returned reached the model as well.
+			name: "failed MCP call", action: "tool.failed", marker: "MCP error marker",
+			payload: map[string]interface{}{
+				"toolName": "mcp__media_capture", "isError": true, "input": map[string]interface{}{"target": "screen"},
+				"details": map[string]interface{}{"serverName": "media", "mcpToolName": "capture"},
+				"content": ompTextBlocks("MCP error marker: capture device busy."),
+			},
+		},
+		{
+			// A shell's output has its own field; it is not recorded a second time as a result.
+			name: "shell output", action: "command.executed",
+			payload: map[string]interface{}{
+				"toolName": "bash", "input": map[string]interface{}{"command": "sh scripts/probe.sh"},
+				"details": map[string]interface{}{"wallTimeMs": 16.9},
+				"content": ompTextBlocks("Shell output marker BCN-MBS2GE-D03.\n\n\nWall time: 0.02 seconds"),
+			},
+			check: func(t *testing.T, event map[string]interface{}) {
+				command := nested(t, event, "command")
+				if command["output"] != "Shell output marker BCN-MBS2GE-D03.\n\n\nWall time: 0.02 seconds" || command["command"] != "sh scripts/probe.sh" {
+					t.Fatalf("command = %v, want the command and the output the model was given", command)
+				}
+			},
+		},
+		{
+			// A subagent's report is the runtime's own storage, not outside content.
+			name: "runtime resource", action: "tool.completed",
+			payload: map[string]interface{}{
+				"toolName": "read", "input": map[string]interface{}{"path": "agent://reviewer"},
+				"details": map[string]interface{}{
+					"resolvedPath": "/home/u/.omp/agent/sessions/s/agents/reviewer.md",
+					"meta":         map[string]interface{}{"source": map[string]interface{}{"type": "internal", "value": "agent://reviewer"}},
+				},
+				"content": ompTextBlocks("Subagent report."),
+			},
+		},
+		{
+			// A write's result echoes what the agent itself produced.
+			name: "file write", action: "file.created",
+			payload: map[string]interface{}{
+				"toolName": "write", "input": map[string]interface{}{"path": "/repo/out.md", "content": "notes"},
+				"details": map[string]interface{}{"resolvedPath": "/repo/out.md"},
+				"content": ompTextBlocks("Wrote /repo/out.md."),
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logPath := ompTestLog(t)
+			payload := cloneFields(tc.payload)
+			payload["type"], payload["toolCallId"], payload["sessionId"], payload["cwd"] = "tool_result", "call-1", "sess-1", "/home/agent/project"
+			if _, ok := payload["isError"]; !ok {
+				payload["isError"] = false
+			}
+			runHookWithInput(t, runOmpEvent, payload)
+
+			event := ompEventWithAction(t, logPath, tc.action)
+			result := fieldsToolCallResult(event)
+			if tc.marker == "" {
+				if result != nil {
+					t.Fatalf("gen_ai.tool.call.result = %v, want none for a result outside the scope", result)
+				}
+			} else {
+				if text := asymptoteobserve.ToolResultPlainText(result); !strings.Contains(text, tc.marker) {
+					t.Fatalf("gen_ai.tool.call.result = %v, want the content blocks the model read", result)
+				}
+				if content := nested(t, event, "content"); content["included"] != true {
+					t.Fatalf("content = %v, want the result's retention marker", content)
+				}
+			}
+			// raw keeps the payload verbatim whatever was promoted from it.
+			if !reflect.DeepEqual(nested(t, event, "raw", "omp")["content"], payload["content"]) {
+				t.Fatalf("raw.omp.content = %v, want the result as the runtime sent it", nested(t, event, "raw", "omp")["content"])
+			}
+			if tc.check != nil {
+				tc.check(t, event)
+			}
+		})
 	}
 }
 

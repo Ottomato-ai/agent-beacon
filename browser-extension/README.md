@@ -23,7 +23,7 @@ flowchart LR
         direction TB
         MAIN["interceptor.js<br/>MAIN world · tee fetch SSE"]
         ISO["content.js<br/>ISOLATED world · relay"]
-        MAIN -->|postMessage| ISO
+        MAIN -->|private MessagePort| ISO
     end
 
     subgraph SW["Extension service worker"]
@@ -81,7 +81,7 @@ npm run build         # bundle src/ → dist/ (esbuild, Chrome target)
 npm run build:watch   # rebuild on change
 npm run build:firefox # bundle src/ → dist-firefox/ with the Gecko manifest
 npm run build:safari  # bundle src/ → dist-safari/ (input to packaging/macos/safari; not loadable alone)
-npm run lint:firefox  # build:firefox, then Mozilla's web-ext lint (warnings fail)
+npm run lint:firefox  # build:firefox, then Mozilla's addons-linter (warnings fail)
 npm run check         # tsc --noEmit
 npm run test:unit     # pure adapter + normalization tests (vitest, no browser)
 npm test              # builds dist/, runs the Playwright replay e2e (THE autonomous loop)
@@ -91,6 +91,9 @@ npm run test:headed   # watch it drive a browser
 npm run record:fixtures -- --site claude|chatgpt --name <n>   # capture a fixture (headed, authed)
 npm run report        # open the last HTML report
 ```
+
+Watch mode also refreshes the manifest, popup/options HTML and icons. Reload the unpacked
+extension to apply manifest changes; reload an extension page to see its updated markup.
 
 ## Loading the extension in your own browser
 
@@ -249,7 +252,7 @@ staging one. Prefer a throwaway account where practical.
 - **Firefox smoke** — Playwright cannot load an extension into Firefox, so Firefox does **not**
   get the replay e2e. Its automated coverage is reduced, not equal: the unit tests for the
   manifest generator, the API shim and the permission flow, a real `build:firefox`, and
-  `web-ext lint --warnings-as-errors` over the output (`npm run lint:firefox`, run in CI).
+  `addons-linter --warnings-as-errors` over the output (`npm run lint:firefox`, run in CI).
   Capture on a real Firefox is a manual check, following the [Firefox](#firefox) steps.
 - **(c) collector conformance** *(planned)* — now that this lives in the agent-beacon monorepo,
   the consumer of these envelopes is in-tree at `collector-builder/exporter/beaconjsonexporter`.
@@ -291,7 +294,7 @@ dashboard), including interleaved sessions with no cross-contamination.
 - ✅ Content-script context-invalidation guard (survives extension reloads)
 - ✅ ChatGPT capture (`delta_encoding: v1` parser) + autonomous replay e2e
 - ✅ Firefox build target (`npm run build:firefox`): Gecko manifest, `browser.*` shim, host-permission
-  grant flow; covered by unit tests and `web-ext lint`, **not** by the replay e2e
+  grant flow; covered by unit tests and `addons-linter`, **not** by the replay e2e
 - ⬜ ChatGPT stream-handoff/resume case (see limitations); DOM-fallback capture, XHR transport
 - ⬜ Real-collector integration test + live-smoke/fixture-recorder as CI layers
 
@@ -302,8 +305,10 @@ dashboard), including interleaved sessions with no cross-contamination.
   stall between chunks could drop a turn. The durable delivery queue (in `chrome.storage`) protects
   everything *after* a turn is assembled, not during. Persisting partial assembler state is a
   future item.
-- **Delivery retry cadence.** Retries use `chrome.alarms`, which MV3 clamps to a ~30s minimum, so
-  the first retry lands at ~30s rather than the computed sub-second backoff. Fine for a
+- **Delivery retry cadence.** Each POST has a ten-second deadline, so a collector that accepts
+  a connection but never responds cannot hold the queue indefinitely. Timed-out batches remain
+  durable and follow the existing retry limit. Retries use `chrome.alarms`, which MV3 clamps
+  to a ~30s minimum, so the first retry lands at ~30s rather than the computed sub-second backoff. Fine for a
   local-loopback collector that is almost always reachable; the queue guarantees eventual delivery.
 - **Capture depends on `window.fetch`.** Confirmed correct for claude.ai. Sites using XHR or a page
   service worker for streaming would need additional interception (deferred).
@@ -315,12 +320,19 @@ dashboard), including interleaved sessions with no cross-contamination.
   currently missed. That resume stream is also SSE-over-fetch (no WebSocket needed for tokens; the
   `wss://ws.chatgpt.com` socket only carries control messages), so teeing the resume GET is a
   follow-up, not a rearchitecture. ChatGPT web (like Claude web) doesn't stream token usage.
-- **Telemetry integrity on the injected page.** The MAIN-world interceptor and any other page script
-  share the same JS world, so the ISOLATED content script cannot cryptographically distinguish the
-  extension's own `postMessage` events from forged ones. A malicious script already running on
-  claude.ai could therefore inject fabricated chat records into the local collector. Impact is
-  telemetry *integrity* only (no credential/code exposure). A proper fix is service-worker-driven
-  MAIN injection (`chrome.scripting`) with a per-tab nonce the page can't read; deferred for V0.
+- **Telemetry integrity on the injected page.** The MAIN-world interceptor and the ISOLATED content
+  script talk over a private `MessageChannel` whose port is handed over once, by a synchronously
+  dispatched event at `document_start`, before any page script runs (`src/shared/channel.ts`). The
+  content script never reads `window` messages, request ids are random, and the service worker
+  checks every relayed event's shape and size and bounds how many open streams it holds, so a page
+  script can no longer inject or splice into telemetry. What remains: a script in the page's own
+  world can still change what the page fetches, or wrap `window.fetch` itself, because the page is
+  the data source; and if the interceptor failed to run at all, a page script could offer the
+  content script its own port while the document is still loading.
+- **Loopback-only delivery.** The OTLP endpoint must be `http(s)` on `127.0.0.1`, `localhost` or
+  `[::1]` (any port). The service worker enforces this when settings are saved and again
+  before every send (redirects are refused), and it takes settings changes only from the
+  extension's own popup and options pages, never from a content script.
 
 > **Fixtures.** The committed `*.sse` files are **real, sanitized** captures (via
 > `npm run record:fixtures`): `fixtures/claude/simple-turn.sse` (claude.ai) and

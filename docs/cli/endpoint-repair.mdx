@@ -15,6 +15,8 @@ Repair preserves runtime logs while reinstalling managed endpoint files. By defa
 
 During repair, Beacon removes the existing managed service before reinstalling it so an unhealthy collector can release local OTLP ports. If reinstall cannot complete, Beacon restores the previous endpoint configuration so local state is not left partially rolled back.
 
+On an endpoint connected to Beacon Cloud, repair leaves the forwarder service, the device key, and Vector's checkpoints and buffer in place, and re-renders `vector.toml` from this version's forwarder pack with the recorded ingest URL and privacy mode. Vector validates the new config before it replaces the old one; the forwarder restarts only when the content changed, and a config Vector rejects is reported as a warning while the forwarder keeps running on the old one. Repair never re-enrolls the device or rotates its key, and `--no-start` leaves the forwarder untouched. See [Keeping the forwarder config current](/cli/endpoint-connect#keeping-the-forwarder-config-current).
+
 ## Flags
 
 | Flag | Description |
@@ -32,6 +34,7 @@ During repair, Beacon removes the existing managed service before reinstalling i
 | `--dry-run` | Print planned actions without changing endpoint files or services |
 | `--include-runtime-metrics` | Include generic process, runtime, and harness operational OTLP metrics in Beacon JSONL. By default, low-signal metrics such as process CPU, memory, Node.js event loop, V8 heap, GitHub Copilot CLI, and OpenClaw operational metrics are filtered out |
 | `--include-codex-spans` | Include every high-volume Codex OTLP span for troubleshooting. By default, Beacon keeps semantic logs and only the usage-bearing completed turn span |
+| `--claude-capture-model-context` | Record context Claude Code gives the model that no other event reports: the pages its WebFetch tool fetches, and the MCP tool descriptions it shows the model as `mcp.tool_listed`. Pass it on every repair that should keep capture on; a repair without it turns capture off. See [Claude Code: model context from API bodies](/runtimes/claude-code#model-context-from-api-bodies) |
 | `--splunk-hec-endpoint <url>` | Splunk HEC endpoint URL |
 | `--splunk-hec-token <token>` | Splunk HEC token |
 | `--splunk-index <index>` | Optional Splunk index |

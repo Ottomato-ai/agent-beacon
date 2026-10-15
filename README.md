@@ -23,6 +23,16 @@
   <a href="https://docs.beacon.sh/cli">Commands</a>
 </p>
 
+<p align="center">
+  <a href="https://www.star-history.com/asymptote-labs/agent-beacon">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/badge?repo=Asymptote-Labs/agent-beacon&type=trending&theme=dark">
+      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/badge?repo=Asymptote-Labs/agent-beacon&type=trending">
+      <img alt="GitHub Trending Repository of the Day" src="https://api.star-history.com/badge?repo=Asymptote-Labs/agent-beacon&type=trending">
+    </picture>
+  </a>
+</p>
+
 Beacon captures **agent session history** across Claude Code, Cursor, Codex, OpenCode, and 20+ other harnesses, then turns useful workflows, corrections, and debugging patterns into reusable knowledge for future agents.
 
 **A problem solved by one agent shouldn't need to be learned from scratch by another.**
@@ -154,7 +164,14 @@ Or inspect the raw event stream:
 > Local to keep everything on this machine, and disconnect any time with
 > `beacon endpoint disconnect`.
 
-If this endpoint forwards to Beacon Cloud, your agents can search that history over MCP:
+Whichever destination you choose, the wizard also installs the
+[Beacon Skills](https://docs.beacon.sh/concepts/beacon-skills) into `~/.agents/skills`
+and `~/.claude/skills` unless you turn them off; redo or undo that with
+`beacon skills install|uninstall`.
+
+If you choose Beacon Cloud, the wizard also registers Beacon Cloud MCP in your harnesses
+unless you turn it off, so your agents can search the forwarded history. To do it later,
+or for an endpoint connected another way:
 
 ```bash
 beacon mcp connect
@@ -255,6 +272,14 @@ beacon endpoint dashboard
 ```
 
 Use it to explore session history across harnesses and understand what your agents actually did.
+
+Each session page can also show **lenses**: purpose-built views of one trace, such as files
+changed with their diffs, an itemized token bill, a security review grouped by risk, or the
+approval timeline. A lens is a single HTML file running in a sandboxed frame with no access to
+Beacon or the dashboard and no ordinary network APIs, so you can have your coding agent write
+your own (`beacon lenses spec`, `lint`, `preview`, `add`). The sandbox cannot block every way a
+browser can send data out, so install only lenses you trust with your traces. See
+[Lenses](https://docs.beacon.sh/concepts/lenses).
 
 The underlying JSONL remains directly accessible, so you're never dependent on the UI.
 

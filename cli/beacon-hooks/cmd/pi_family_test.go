@@ -1,6 +1,11 @@
 package cmd
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+
+	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve"
+)
 
 // piFamilyRuntimes is every runtime the shared Pi-family mapper serves. Tests that assert a
 // property of the shape rather than of one product walk this, so a runtime added later inherits
@@ -49,6 +54,54 @@ func TestPiFamilyPromotesTheToolCallIDOnBothHalves(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestOmpContextEventMapsSkillListingAsSystemContext(t *testing.T) {
+	listing := "- oracle-index: Lists conventions. Canary BCN-2AFE23-C01I.\n- oracle-probe: Runs the probe."
+	events := ompRuntime.endpointEvents(map[string]interface{}{
+		"type":         "context",
+		"skillListing": listing,
+	}, "sess-1")
+	if len(events) != 1 || events[0].action != "session.context" || events[0].category != "session" {
+		t.Fatalf("events = %+v, want one session.context", events)
+	}
+	want := asymptoteobserve.ParseSkillListing(asymptoteobserve.SystemContextSourceSystemPrompt, listing, nil).Fields(asymptoteobserve.DefaultStringLimit)
+	genAI, _ := events[0].fields["gen_ai"].(map[string]interface{})
+	if !reflect.DeepEqual(genAI, want["gen_ai"]) {
+		t.Fatalf("gen_ai = %#v, want only the listing's system_instructions, one part per skill", genAI)
+	}
+	if !reflect.DeepEqual(events[0].fields["system_context"], want["system_context"]) || !reflect.DeepEqual(events[0].fields["content"], want["content"]) {
+		t.Fatalf("system_context = %#v content = %#v, want the shared builder's", events[0].fields["system_context"], events[0].fields["content"])
+	}
+	if _, ok := events[0].fields["prompt"]; ok {
+		t.Fatalf("session context was mislabeled as operator prompt: %#v", events[0].fields["prompt"])
+	}
+	raw, _ := events[0].fields["raw"].(map[string]interface{})
+	if !reflect.DeepEqual(raw, map[string]interface{}{"omp": map[string]interface{}{"type": "context"}}) {
+		t.Fatalf("raw = %#v, want event-type metadata without a copy of the listing", raw)
+	}
+}
+
+// One context payload can carry both listings. The skill index keeps its own event, and each route
+// is built from the envelope rather than from the skill event's fields.
+func TestOmpContextEventMapsSkillListingAndMCPRoutesApart(t *testing.T) {
+	events := ompRuntime.endpointEvents(map[string]interface{}{
+		"type":         "context",
+		"skillListing": "- deploy: Deploy applications.",
+		"mcpToolRoutes": []interface{}{
+			map[string]interface{}{"name": "mcp__notes_save_note", "description": "Saves a note."},
+		},
+	}, "sess-1")
+	if len(events) != 2 || events[0].action != "session.context" || events[1].action != "mcp.tool_listed" {
+		t.Fatalf("events = %+v, want session.context then mcp.tool_listed", events)
+	}
+	if _, ok := events[1].fields["system_context"]; ok {
+		t.Fatalf("route listing inherited the skill listing's system_context: %#v", events[1].fields)
+	}
+	genAI, _ := events[1].fields["gen_ai"].(map[string]interface{})
+	if _, ok := genAI["system_instructions"]; ok {
+		t.Fatalf("route listing inherited the skill listing's system_instructions: %#v", genAI)
 	}
 }
 

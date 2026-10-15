@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -39,9 +40,9 @@ func emitInferredHookEvent(logger *logging.Logger, action, category, severity, m
 //
 // These runtimes carry real signal with no endpoint-schema field of its own -- Qwen's
 // `permission_mode` on every tool event, its `source` on SessionStart and the `context_usage` /
-// `context_limit` / `input_tokens` trio on Stop; Muse Code's `turn_id`, which is the only per-turn
-// boundary anything in its payload offers. Keeping the payload preserves them without inventing
-// schema fields for one runtime. It is the whole event's own path through SanitizeMap, so raw is
+// `context_limit` / `input_tokens` trio on Stop; Muse Code's `permission_mode` and SessionStart
+// `source`. Keeping the payload preserves them without inventing schema fields for one runtime. It
+// is the whole event's own path through SanitizeMap, so raw is
 // secret-redacted and string-limited like every other field, and it is the first thing dropped when
 // an event exceeds the 64 KiB ceiling.
 //
@@ -142,6 +143,7 @@ func emitHookEventWithFidelity(logger *logging.Logger, action, category, severit
 		fields["raw"] = mergeNested(fields["raw"], map[string]interface{}{key: input})
 	}
 	applyToolCallID(fields, input)
+	applyPromptID(fields, input)
 	applyContextSize(fields, input)
 	if model := getFirstStr(input, "model"); model != "" {
 		fields["model"] = model
@@ -381,6 +383,124 @@ func toolFieldsWithResponse(toolName string, toolInput, toolResponse map[string]
 	// real tool_use_id. One wrong join key, and the right one shut out.
 	// Reported by Cursor Bugbot.
 	return fields
+}
+
+// applyIngestedToolResult records the result of a tool that brought outside content into the
+// agent's context -- a file read, a web fetch -- as gen_ai.tool.call.result, with the retention
+// marker that describes it.
+//
+// toolFieldsWithResponse writes gen_ai.tool.call.result for MCP calls only, so before this the live
+// hook path dropped the response of every other tool (#743). A Read or WebFetch was recorded with
+// its path and nothing it returned, and the threat-rules field derived from the result,
+// gen_ai.tool.call.result_text, was empty on every event a live install wrote: indirect prompt
+// injection was visible to `beacon scan` after `claude sync` and invisible in real time.
+//
+// The scope is the shared one in pkg/asymptoteobserve, the same predicate the rules engine reads,
+// so a capture path cannot drop a result the engine would match or record one it ignores. It is
+// deliberately not every tool: a shell command's output already has command.output, a write echoes
+// what the agent itself produced, and recording either again would only grow the log.
+//
+// Called once the action is known, because the action is half of the scope. An MCP call already
+// carries its result from toolFieldsWithResponse and is left exactly as it was. The value goes out
+// through the logger's sanitizer like every other field -- secret redaction, the per-string limit
+// and the 64 KiB event ceiling, which drops the result and marks content not included -- and the
+// marker is computed over the text before that, so its hash and byte count describe what the tool
+// returned, not the stored copy.
+func applyIngestedToolResult(fields map[string]interface{}, action, toolName string, toolResponse map[string]interface{}) {
+	if len(toolResponse) == 0 {
+		return
+	}
+	// The target is read from the event's own tool.path, the field the engine reads it from.
+	target, _ := mutableChild(fields["tool"])["path"].(string)
+	if !asymptoteobserve.IngestedContentAction(action) && !asymptoteobserve.IngestedContentToolName(toolName) &&
+		!asymptoteobserve.IngestedContentTarget(target) {
+		return
+	}
+	genAI := mutableChild(fields["gen_ai"])
+	tool := mutableChild(genAI["tool"])
+	call := mutableChild(tool["call"])
+	if _, exists := call["result"]; exists {
+		return
+	}
+	call["result"] = toolResponse
+	tool["call"] = call
+	if _, exists := tool["name"]; !exists && toolName != "" {
+		tool["name"] = toolName
+	}
+	genAI["tool"] = tool
+	if _, exists := genAI["operation"]; !exists {
+		genAI["operation"] = map[string]interface{}{"name": "execute_tool"}
+	}
+	fields["gen_ai"] = genAI
+	// The marker describes this result only when nothing more specific was already retained.
+	if _, exists := fields["content"]; !exists {
+		if marker := retainedContentFields(asymptoteobserve.ToolResultPlainText(toolResponse)); marker != nil {
+			fields["content"] = marker
+		}
+	}
+}
+
+// claudeBashExitLine is the first line Claude Code writes into a failed Bash call's `error` when
+// the command ran and exited. Its absence means the shell itself could not be started.
+var claudeBashExitLine = regexp.MustCompile(`^Exit code (-?\d+)$`)
+
+// applyClaudeBashResult maps the result of Claude Code's Bash tool onto the command field, and
+// reports whether the payload is a failure of a command that ran and exited.
+//
+// The two outcomes arrive in different shapes. A success (`PostToolUse`) carries `tool_response`
+// with `stdout` and `stderr` as separate strings and no exit code. They are stored stdout first,
+// then stderr, so the order in which the command interleaved them is lost. A failure
+// (`PostToolUseFailure`) carries no tool response, only a top-level `error`: a first line
+// `Exit code N`, then the output with both streams interleaved as Claude saw it. That line is
+// the only exit code Claude reports, so it is parsed rather than synthesized. An `error` without
+// it is a shell that never started; that is a message, not command output, and is not recorded.
+//
+// Claude reports an interrupted command as a success with `interrupted` set, or as a failure with
+// `is_interrupt`, and its output is partial either way, so that is recorded beside it.
+func applyClaudeBashResult(fields, input map[string]interface{}, toolName string, toolResponse map[string]interface{}) bool {
+	if !strings.EqualFold(strings.TrimSpace(toolName), "bash") {
+		return false
+	}
+	var output string
+	var exitCode int
+	exited := false
+	if errText := getFirstStr(input, "error"); errText != "" {
+		firstLine, rest, _ := strings.Cut(errText, "\n")
+		match := claudeBashExitLine.FindStringSubmatch(strings.TrimSpace(firstLine))
+		if match == nil {
+			return false
+		}
+		code, err := strconv.Atoi(match[1])
+		if err != nil {
+			return false
+		}
+		output, exitCode, exited = rest, code, true
+	} else if toolResponse != nil {
+		output = getFirstStr(toolResponse, "stdout")
+		if stderr := getFirstStr(toolResponse, "stderr"); stderr != "" {
+			if output != "" && !strings.HasSuffix(output, "\n") {
+				output += "\n"
+			}
+			output += stderr
+		}
+	}
+	command := mutableChild(fields["command"])
+	if exited {
+		command["exit_code"] = exitCode
+	}
+	if output != "" {
+		command["output"] = output
+		if _, exists := fields["content"]; !exists {
+			fields["content"] = retainedContentFields(output)
+		}
+	}
+	if len(command) > 0 {
+		fields["command"] = command
+	}
+	if interrupted, _ := toolResponse["interrupted"].(bool); interrupted || input["is_interrupt"] == true {
+		fields["raw"] = mergeNested(fields["raw"], map[string]interface{}{"claude_interrupted": true})
+	}
+	return exited
 }
 
 // toolCallIDFromEnvelope reads the runtime's own identifier for one tool

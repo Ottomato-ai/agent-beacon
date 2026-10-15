@@ -75,11 +75,14 @@ Regenerate with `beacon rules fields --markdown > spec/threat-rules/FIELDS.md`.
 | `e.gen_ai.response.model` | string |
 | `e.gen_ai.response.time_to_first_chunk` | double |
 | `e.gen_ai.retrieval.query_text` | string |
+| `e.gen_ai.system_instructions_text` | string |
 | `e.gen_ai.token.type` | string |
 | `e.gen_ai.tool.call.id` | string |
+| `e.gen_ai.tool.call.result_text` | string |
 | `e.gen_ai.tool.description` | string |
 | `e.gen_ai.tool.name` | string |
 | `e.gen_ai.tool.type` | string |
+| `e.gen_ai.usage.cache_creation.ephemeral_1h_input_tokens` | int |
 | `e.gen_ai.usage.cache_creation.input_tokens` | int |
 | `e.gen_ai.usage.cache_read.input_tokens` | int |
 | `e.gen_ai.usage.cost_usd` | double |
@@ -117,6 +120,7 @@ Regenerate with `beacon rules fields --markdown > spec/threat-rules/FIELDS.md`.
 | `e.policy.name` | string |
 | `e.policy.reason` | string |
 | `e.product` | string |
+| `e.prompt.id` | string |
 | `e.prompt.text` | string |
 | `e.repository` | string |
 | `e.rpc.response.status_code` | string |
@@ -140,6 +144,10 @@ Regenerate with `beacon rules fields --markdown > spec/threat-rules/FIELDS.md`.
 | `e.session.id` | string |
 | `e.session.working_directory` | string |
 | `e.severity` | string |
+| `e.share.visibility` | string |
+| `e.system_context.kind` | string |
+| `e.system_context.skills` | list(asymptoteobserve.SkillRefInfo) |
+| `e.system_context.source` | string |
 | `e.timestamp` | string |
 | `e.tool.command` | string |
 | `e.tool.name` | string |
@@ -159,3 +167,19 @@ Regenerate with `beacon rules fields --markdown > spec/threat-rules/FIELDS.md`.
 | `e.vcs.ref.head.type` | string |
 | `e.vcs.repository.url.full` | string |
 | `e.vendor` | string |
+
+## Derived fields
+
+These are computed by the engine from the event just before evaluation. They are
+never written to or read from the log, so a fixture sets the source field, not these.
+
+- `e.gen_ai.system_instructions_text`: `gen_ai.system_instructions` as text: the `content` of each
+  `text` part, one per line (a bare string as is), when content was retained. These are
+  runtime-provided instructions such as a skill index, never operator prompt text.
+  Each part is capped at 4096 bytes and secret-redacted like other retained text; empty otherwise.
+- `e.gen_ai.tool.call.result_text`: `gen_ai.tool.call.result` as text, only on read-type tool
+  results (`file.read`, `mcp.tool_invoked`, MCP-named tools, web fetch/search tools, a
+  `tool.path` that is an http(s) URL) whose content was retained. String leaves of an
+  object or list result are joined one per line;
+  content blocks in a list contribute their text without metadata or encoded bytes.
+  Capped at 4096 bytes and secret-redacted like other retained text; empty otherwise.

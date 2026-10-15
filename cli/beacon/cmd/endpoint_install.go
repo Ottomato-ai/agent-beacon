@@ -116,19 +116,20 @@ var (
 func endpointInstallOptions(selection endpointTargetSelection, serviceKind service.Kind) lifecycle.InstallOptions {
 	harnesses := append([]string{}, selection.OTLP...)
 	return lifecycle.InstallOptions{
-		UserMode:              endpointUserMode(),
-		LogPath:               endpointOpts.logPath,
-		Harnesses:             harnesses,
-		GRPCPort:              endpointOpts.grpcPort,
-		HTTPPort:              endpointOpts.httpPort,
-		HealthPort:            endpointOpts.healthPort,
-		CollectorPath:         endpointOpts.collectorPath,
-		StartService:          !endpointOpts.noStart,
-		IncludeRuntimeMetrics: endpointOpts.includeRuntimeMetrics,
-		IncludeCodexSpans:     endpointOpts.includeCodexSpans,
-		SplunkHEC:             splunkHECOptions(),
-		FalconHEC:             falconHECOptions(),
-		ServiceKind:           serviceKind,
+		UserMode:                  endpointUserMode(),
+		LogPath:                   endpointOpts.logPath,
+		Harnesses:                 harnesses,
+		GRPCPort:                  endpointOpts.grpcPort,
+		HTTPPort:                  endpointOpts.httpPort,
+		HealthPort:                endpointOpts.healthPort,
+		CollectorPath:             endpointOpts.collectorPath,
+		StartService:              !endpointOpts.noStart,
+		IncludeRuntimeMetrics:     endpointOpts.includeRuntimeMetrics,
+		IncludeCodexSpans:         endpointOpts.includeCodexSpans,
+		ClaudeCaptureModelContext: endpointOpts.claudeCaptureModelContext,
+		SplunkHEC:                 splunkHECOptions(),
+		FalconHEC:                 falconHECOptions(),
+		ServiceKind:               serviceKind,
 	}
 }
 
@@ -177,25 +178,58 @@ func runEndpointInstall(cmd *cobra.Command, args []string) error {
 	case result.InventoryJobDetail != "":
 		fmt.Printf("Scheduled inventory job not installed: %s\n", result.InventoryJobDetail)
 	}
+	reportManagedForwarder(os.Stdout, cmd.ErrOrStderr(), result.ManagedForwarder)
 	printLingerGap(cmd.ErrOrStderr(), result)
 	installHookTargetsFromEndpointInstall(cmd.ErrOrStderr(), selection.Hooks)
-	if connectAfterInstall {
-		// The install is complete and stands on its own; a failed connect is reported
-		// with the retry command rather than turning a working install into an error.
-		fmt.Fprintln(cmd.OutOrStdout())
-		if err := connectEndpoint(cmd, endpointUserMode(), result.LogPath); err != nil {
-			fmt.Fprintf(cmd.ErrOrStderr(), "beacon: managed ingest was not connected (%v). Run `beacon endpoint connect` to try again.\n", err)
-		} else {
-			recordDestinationAsymptote(cmd)
-			suggestMCPConnect(cmd.OutOrStdout(), onboarded.Connect)
-		}
+	refreshAgentSkills(cmd.ErrOrStderr())
+	installAgentSkillsFromOnboarding(cmd, onboarded)
+	// Read recent history from the agents' own session stores so the dashboard has sessions
+	// in it before any agent runs again. Local only, bounded, and never a reason to fail the
+	// install; a connect below ships what it wrote rather than sweeping again.
+	backfilled := false
+	if endpointBackfillEnabled() {
+		reportEndpointBackfill(cmd.OutOrStdout(), runEndpointBackfill(result.LogPath, endpointUserMode()))
+		backfilled = true
 	}
+	finishCloudSetup(cmd, onboarded, connectAfterInstall, func() error {
+		return connectEndpoint(cmd, endpointUserMode(), result.LogPath, backfilled)
+	})
 	return nil
 }
 
-// suggestMCPConnect points a person who just chose Beacon Cloud in the wizard at
-// `beacon mcp connect`. It only prints: registering the MCP server stays a separate,
-// explicit command, and the unattended install paths never reach the wizard at all.
+// finishCloudSetup connects the endpoint when the wizard or --connect asked for it, and then
+// registers Beacon Cloud MCP when the wizard kept it selected. MCP is registered only once the
+// endpoint forwards to Beacon Cloud, since there is nothing for it to search otherwise.
+func finishCloudSetup(cmd *cobra.Command, onboarded onboardingOutcome, connectAfterInstall bool, connect func() error) {
+	if !connectAfterInstall {
+		if onboarded.ConnectCloudMCP {
+			// An endpoint that was already connected keeps its device key and is not
+			// re-enrolled, but the person still asked for Beacon Cloud MCP.
+			connectCloudMCPFromOnboarding(cmd)
+		}
+		return
+	}
+	// The install is complete and stands on its own; a failed connect is reported with the
+	// retry command rather than turning a working install into an error.
+	fmt.Fprintln(cmd.OutOrStdout())
+	if err := connect(); err != nil {
+		fmt.Fprintf(cmd.ErrOrStderr(), "beacon: managed ingest was not connected (%v). Run `beacon endpoint connect` to try again.\n", err)
+		if onboarded.ConnectCloudMCP {
+			fmt.Fprintln(cmd.ErrOrStderr(), "beacon: Beacon Cloud MCP was not registered either; run `beacon mcp connect` once the endpoint is connected.")
+		}
+		return
+	}
+	recordDestinationAsymptote(cmd)
+	if onboarded.ConnectCloudMCP {
+		connectCloudMCPFromOnboarding(cmd)
+		return
+	}
+	suggestMCPConnect(cmd.OutOrStdout(), onboarded.Connect)
+}
+
+// suggestMCPConnect points a person who chose Beacon Cloud in the wizard, but turned Beacon
+// Cloud MCP off, at `beacon mcp connect`. It only prints, and the unattended install paths never
+// reach the wizard at all.
 func suggestMCPConnect(out io.Writer, chosenInWizard bool) {
 	if !chosenInWizard {
 		return
@@ -239,7 +273,12 @@ func runEndpointStatus(cmd *cobra.Command, args []string) error {
 	} else {
 		fmt.Println("Last event: present")
 	}
-	fmt.Println(managedIngestStatusLine(status.ManagedIngest))
+	for _, forwarder := range status.ScriptForwarders {
+		fmt.Println(scriptForwarderStatusLine(forwarder))
+	}
+	if line := cloudStatusLine(status.ManagedIngest, endpointUserMode(), len(status.ScriptForwarders) > 0); line != "" {
+		fmt.Println(line)
+	}
 	fmt.Println(inventoryHeartbeatStatusLine(status.InventoryHeartbeat))
 	return nil
 }
@@ -328,8 +367,10 @@ func runEndpointRepair(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	fmt.Printf("Endpoint repaired. Manifest: %s\n", result.ManifestPath)
+	reportManagedForwarder(os.Stdout, cmd.ErrOrStderr(), result.ManagedForwarder)
 	printLingerGap(cmd.ErrOrStderr(), result)
 	installHookTargetsFromEndpointInstall(cmd.ErrOrStderr(), selection.Hooks)
+	refreshAgentSkills(cmd.ErrOrStderr())
 	return nil
 }
 

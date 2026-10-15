@@ -31,12 +31,15 @@ type DetectionView struct {
 type DetectionsResponse struct {
 	Rules []DetectionView `json:"rules"`
 	Count int             `json:"count"`
+	// Skipped lists rule files left out because they need a newer Beacon.
+	Skipped []string `json:"skipped,omitempty"`
 }
 
-// BuildDetections lists the active rule set (store when present, else the
-// embedded baseline — the same set `beacon scan` would run) as detection views.
+// BuildDetections lists the active rule set (the store plus every embedded baseline
+// rule it does not replace by id — the same set `beacon scan` would run) as detection
+// views.
 func BuildDetections(userMode bool, rulesDir string) (DetectionsResponse, error) {
-	loaded, err := detect.LoadActive(userMode, strings.TrimSpace(rulesDir))
+	loaded, skipped, err := detect.LoadActiveSkipping(userMode, strings.TrimSpace(rulesDir))
 	if err != nil {
 		return DetectionsResponse{}, err
 	}
@@ -61,7 +64,7 @@ func BuildDetections(userMode bool, rulesDir string) (DetectionsResponse, error)
 			Taxonomy:    r.Taxonomy,
 		})
 	}
-	return DetectionsResponse{Rules: rules, Count: len(rules)}, nil
+	return DetectionsResponse{Rules: rules, Count: len(rules), Skipped: detect.SkippedStrings(skipped)}, nil
 }
 
 // FindingsResponse is the /api/findings payload: the hits from running the
@@ -70,6 +73,8 @@ type FindingsResponse struct {
 	Findings []threatrules.Finding `json:"findings"`
 	Scanned  int                   `json:"scanned"`
 	Count    int                   `json:"count"`
+	// Skipped lists rule files left out because they need a newer Beacon.
+	Skipped []string `json:"skipped,omitempty"`
 }
 
 // RunScan loads and compiles the active rules, streams the runtime log (optionally
@@ -89,20 +94,9 @@ func RunScan(userMode bool, logPath, rulesDir, session, minSeverity string) (Fin
 		}
 	}
 
-	loaded, err := detect.LoadActive(userMode, strings.TrimSpace(rulesDir))
+	compiled, skipped, err := compileActiveRules(userMode, rulesDir)
 	if err != nil {
-		return FindingsResponse{}, fmt.Errorf("load rules: %w", err)
-	}
-	if len(loaded) == 0 {
-		return FindingsResponse{}, fmt.Errorf("no rules to run (store is empty and baseline missing)")
-	}
-	compiled := make([]*threatrules.CompiledRule, 0, len(loaded))
-	for _, lr := range loaded {
-		c, err := threatrules.Compile(lr.Rule)
-		if err != nil {
-			return FindingsResponse{}, fmt.Errorf("compile rule %q: %w", lr.Rule.ID, err)
-		}
-		compiled = append(compiled, c)
+		return FindingsResponse{}, err
 	}
 
 	sessionFilter := strings.TrimSpace(session)
@@ -135,5 +129,26 @@ func RunScan(userMode bool, logPath, rulesDir, session, minSeverity string) (Fin
 	if findings == nil {
 		findings = []threatrules.Finding{}
 	}
-	return FindingsResponse{Findings: findings, Scanned: len(events), Count: len(findings)}, nil
+	return FindingsResponse{Findings: findings, Scanned: len(events), Count: len(findings), Skipped: skipped}, nil
+}
+
+// compileActiveRules loads and compiles the rules `beacon scan` would run. It returns a
+// *detect.NoRulesError when none are active, so callers can tell "no rules" from a broken rule.
+func compileActiveRules(userMode bool, rulesDir string) ([]*threatrules.CompiledRule, []string, error) {
+	loaded, skipped, err := detect.LoadActiveSkipping(userMode, strings.TrimSpace(rulesDir))
+	if err != nil {
+		return nil, nil, fmt.Errorf("load rules: %w", err)
+	}
+	if len(loaded) == 0 {
+		return nil, nil, &detect.NoRulesError{Skipped: skipped}
+	}
+	compiled := make([]*threatrules.CompiledRule, 0, len(loaded))
+	for _, lr := range loaded {
+		c, err := threatrules.Compile(lr.Rule)
+		if err != nil {
+			return nil, nil, fmt.Errorf("compile rule %q: %w", lr.Rule.ID, err)
+		}
+		compiled = append(compiled, c)
+	}
+	return compiled, detect.SkippedStrings(skipped), nil
 }

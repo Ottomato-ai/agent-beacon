@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve"
 )
 
 func TestScanCurrentUserMCPInventory(t *testing.T) {
@@ -345,19 +347,44 @@ func TestMissingCandidatesAreReportedAsNotFound(t *testing.T) {
 	}
 }
 
+// With CODEX_HOME set, the user-scope Codex files inventory reads are the ones Codex reads.
+func TestScanReadsCodexUserConfigFromCodexHome(t *testing.T) {
+	home := t.TempDir()
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	writeFile(t, filepath.Join(codexHome, "config.toml"), "[mcp_servers.github]\ncommand = \"gh\"\n")
+	writeFile(t, filepath.Join(home, ".codex", "config.toml"), "[mcp_servers.stale]\ncommand = \"old\"\n")
+	resolved, err := filepath.EvalSymlinks(codexHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := Scan(Options{HomeDir: home, SkipProjectScope: true, Runtimes: []string{"codex_cli"}, Now: fixedNow})
+	config := findConfig(result.Configs, "codex_cli", filepath.Join(resolved, "config.toml"))
+	if config == nil || !config.Exists || config.MCPServerCount != 1 {
+		t.Fatalf("CODEX_HOME config.toml = %#v, want it read with one MCP server", config)
+	}
+	if stale := findConfig(result.Configs, "codex_cli", filepath.Join(home, ".codex", "config.toml")); stale != nil {
+		t.Fatalf("inventory reported ~/.codex/config.toml, which Codex does not read with CODEX_HOME set: %#v", stale)
+	}
+}
+
 func TestScanIncludesAllSupportedCurrentUserAndProjectConfigs(t *testing.T) {
 	home := t.TempDir()
 	work := t.TempDir()
 	t.Setenv("SHELL", "/bin/bash")
 	// Oh My Pi's user extension path is the one candidate an environment variable can move, so the
-	// two it reads are cleared: a developer who happens to run Oh My Pi under a profile would
+	// variables it reads are cleared: a developer who happens to run Oh My Pi under a profile would
 	// otherwise see this test fail on a path that is correct for their machine.
-	t.Setenv("PI_CODING_AGENT_DIR", "")
-	t.Setenv("PI_CONFIG_DIR", "")
+	for _, name := range []string{"PI_CODING_AGENT_DIR", "PI_CONFIG_DIR", "OMP_PROFILE", "PI_PROFILE"} {
+		t.Setenv(name, "")
+	}
 	// Senpi reads the same PI_CODING_AGENT_DIR as its last fallback, plus two of its own; all three
 	// are cleared for the same reason.
 	t.Setenv("OMO_CODING_AGENT_DIR", "")
 	t.Setenv("SENPI_CODING_AGENT_DIR", "")
+	// Codex's user-scope files follow CODEX_HOME.
+	t.Setenv("CODEX_HOME", "")
 
 	result := Scan(Options{
 		HomeDir:    home,
@@ -636,6 +663,10 @@ func TestScanCurrentUserAndProjectSkillInventory(t *testing.T) {
 	}
 	if deploy.SourceScope != ScopeUser || !deploy.Exists || !deploy.Readable || deploy.ParserStatus != StatusOK {
 		t.Fatalf("Claude skill status = %#v", deploy)
+	}
+	// The same hash a session.context skill listing names the skill under, so the two join.
+	if deploy.SkillNameHash != asymptoteobserve.SkillNameHash("deploy") || deploy.SkillNameHash != hashString("deploy") {
+		t.Fatalf("skill_name_hash = %q, want the skill-listing hash of its name", deploy.SkillNameHash)
 	}
 	if deploy.FileSHA256 == "" || deploy.SkillNameHash == "" || deploy.RootPathHash == "" || deploy.ManifestPathHash == "" {
 		t.Fatalf("Claude skill missing hashes: %#v", deploy)

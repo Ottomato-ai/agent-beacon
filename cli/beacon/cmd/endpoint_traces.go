@@ -59,11 +59,24 @@ func runTopLevelTraces(cmd *cobra.Command, args []string) error {
 func printPlainTraceList(out io.Writer, result dashboard.TraceListResultV1) {
 	for _, trace := range result.Traces {
 		title := strings.Join(strings.Fields(trace.Title), " ")
-		fmt.Fprintf(out, "%s\t%s\t%s\t%s\n", trace.ID, trace.Harness.Name, trace.UpdatedAt, title)
+		fmt.Fprintf(out, "%s\t%s\t%s\t%s%s\n", trace.ID, trace.Harness.Name, trace.UpdatedAt, title, plainSharing(trace))
 	}
 	if result.Truncated {
 		fmt.Fprintf(out, "Showing %d of %d traces; use `beacon endpoint traces list --page` to continue.\n", result.Returned, result.TotalMatched)
 	}
+}
+
+// plainSharing is a shared trace's extra column: its state and link, and for a stale trace the
+// command that refreshes it.
+func plainSharing(trace dashboard.TraceSummaryV1) string {
+	if trace.Sharing.URL == "" {
+		return ""
+	}
+	column := "\t" + trace.Sharing.State + " " + trace.Sharing.URL
+	if trace.Sharing.State == "stale" && trace.Sharing.RefreshCommand != "" {
+		column += " (" + trace.Sharing.RefreshCommand + ")"
+	}
+	return column
 }
 
 var endpointTracesStatusCmd = &cobra.Command{
@@ -136,11 +149,11 @@ var endpointTracesSearchCmd = &cobra.Command{
 		}
 		if result.ResultLevel == "event" {
 			for _, match := range result.Events {
-				fmt.Printf("%s\t#%d\t%s\t%s\n", match.Trace.ID, match.Event.Number, match.Event.Type, traceFirstNonEmpty(match.Snippet, match.Event.Title, match.Event.Summary))
+				fmt.Printf("%s\t#%d\t%s\t%s\n", match.Trace.ID, match.Event.Number, match.Event.Type, strings.Join(strings.Fields(traceFirstNonEmpty(match.Snippet, match.Event.Title, match.Event.Summary)), " "))
 			}
 		} else {
 			for _, trace := range result.Traces {
-				fmt.Printf("%s\t%s\t%s\n", trace.ID, trace.Harness.Name, trace.Title)
+				fmt.Printf("%s\t%s\t%s\n", trace.ID, trace.Harness.Name, strings.Join(strings.Fields(trace.Title), " "))
 			}
 		}
 		return nil
@@ -165,9 +178,9 @@ var endpointTracesShowCmd = &cobra.Command{
 		if endpointOpts.jsonOutput {
 			return json.NewEncoder(os.Stdout).Encode(result)
 		}
-		fmt.Printf("%s\t%s\n", result.Trace.ID, result.Trace.Title)
+		fmt.Printf("%s\t%s\n", result.Trace.ID, strings.Join(strings.Fields(result.Trace.Title), " "))
 		for _, event := range result.Events {
-			fmt.Printf("#%d\t%s\t%s\n", event.Number, event.Type, traceFirstNonEmpty(event.Title, event.Summary))
+			fmt.Printf("#%d\t%s\t%s\n", event.Number, event.Type, strings.Join(strings.Fields(traceFirstNonEmpty(event.Title, event.Summary)), " "))
 			if event.Content != nil && event.Content.Text != "" {
 				fmt.Println(indentTraceText(event.Content.Text))
 			}

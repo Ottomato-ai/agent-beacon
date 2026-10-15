@@ -102,7 +102,7 @@ func traceAnswers(t *testing.T, path string, showIDs []string) map[string]string
 	queries := []string{
 		"", "index", "INDEX LOCAL", "go", "go test", "dashboard go", "endpoint.dashboard", "endpoint/dashboard",
 		"(", `"quoted"`, "a-b", "path:/repo", "*", "AND", "NEAR", "ü", "naïve café", "claude_code.token.usage",
-		"nothing-matches-this", "  ", "evt", "s1", "codex_cli", "retained answer",
+		"nothing-matches-this", "  ", "evt", "s1", "codex_cli", "retained answer", "no-near enforce",
 	}
 	for _, q := range queries {
 		for _, page := range []int{1, 2} {
@@ -125,7 +125,7 @@ func traceAnswers(t *testing.T, path string, showIDs []string) map[string]string
 		}
 		out[fmt.Sprintf("search q=%q typed", q)] = mustJSON(t, typed)
 	}
-	for _, state := range []string{"local_only", "LOCAL_ONLY", "shared"} {
+	for _, state := range []string{"local_only", "LOCAL_ONLY", "shared", "stale"} {
 		list, err := ReadTraceList(path, TraceQuery{State: state, Limit: 50})
 		if err != nil {
 			t.Fatalf("ReadTraceList state=%s: %v", state, err)
@@ -140,6 +140,9 @@ func traceAnswers(t *testing.T, path string, showIDs []string) map[string]string
 			"typed":    {Limit: 100, EventTypes: []string{"user_message", "command"}},
 			"around":   {AroundEvent: 3, Before: 1, After: 1},
 			"agent":    {Limit: 100, EventTypes: []string{"agent_text"}},
+			// Lens data reads a whole trace in one call.
+			"no-limit":        {EventQuery: EventQuery{NoLimit: true}},
+			"no-limit-offset": {EventQuery: EventQuery{NoLimit: true}, Offset: 2},
 		} {
 			show, ok, err := ShowTrace(path, id, query)
 			if err != nil {
@@ -171,8 +174,8 @@ func parityFixture() [][]byte {
 		`{"timestamp":"2026-06-11T10:01:00Z","event":{"id":"e3","action":"command.executed","category":"command"},"harness":{"name":"cursor","collection_method":"hook"},"session":{"id":"s1"},"tool":{"name":"Shell","command":"go test ./internal/endpoint/dashboard"},"command":{"command":"go test ./internal/endpoint/dashboard","exit_code":1,"duration_ms":1200,"output":"FAIL a-b path:/repo \"quoted\""}}`,
 		`{"timestamp":"2026-06-11T10:01:30Z","event":{"id":"e3","action":"command.executed","category":"command"},"harness":{"name":"cursor","collection_method":"otlp"},"session":{"id":"s1"},"command":{"command":"go test ./internal/endpoint/dashboard","exit_code":0}}`,
 		`{"timestamp":"2026-06-11T10:02:00Z","event":{"id":"e4","action":"file.modified","category":"file"},"harness":{"name":"cursor"},"session":{"id":"s1"},"file":{"path":"internal/endpoint/dashboard/traces.go","operation":"modify","language":"go","diff":"+ matchesAllTerms","diff_hash":"dh"}}`,
-		`{"timestamp":"2026-06-11T10:02:30Z","event":{"id":"e5","action":"approval.denied","category":"approval"},"harness":{"name":"cursor"},"session":{"id":"s1"},"approval":{"required":true,"decision":"denied","reason":"AND NEAR * not allowed"}}`,
-		`{"timestamp":"2026-06-11T10:03:00Z","event":{"id":"e6","action":"mcp.tool_invoked","category":"mcp"},"harness":{"name":"cursor"},"session":{"id":"s1"},"mcp":{"server":"beacon","tool":"search_sessions","method":{"name":"tools/call"}},"gen_ai":{"tool":{"name":"mcp__beacon__search_sessions","call":{"id":"call-1","arguments":{"query":"index"},"result":"one session"}}}}`,
+		`{"timestamp":"2026-06-11T10:02:30Z","event":{"id":"e5","action":"approval.denied","category":"approval"},"harness":{"name":"cursor"},"session":{"id":"s1"},"approval":{"required":true,"decision":"denied","reason":"AND NEAR * not allowed"},"policy":{"id":"no-near","decision":"deny","enforcement":"enforce","reason":"provider denied"}}`,
+		`{"timestamp":"2026-06-11T10:03:00Z","event":{"id":"e6","action":"mcp.tool_invoked","category":"mcp"},"harness":{"name":"cursor"},"session":{"id":"s1"},"mcp":{"server":"beacon","tool":"search_sessions","method":{"name":"tools/call"}},"gen_ai":{"tool":{"name":"mcp__beacon__search_sessions","call":{"id":"call-1","arguments":{"query":"index"},"result":"one session"}}},"error":{"type":"mcp_timeout"}}`,
 		`{"timestamp":"2026-06-11T10:04:00Z","event":{"action":"session.activity","category":"session"},"harness":{"name":"cursor"},"session":{"id":"s1"},"message":"hook with no event id"}`,
 		`{"timestamp":"2026-06-11T11:00:00Z","event":{"id":"o1","action":"tool.invoked","category":"tool"},"harness":{"name":"claude_code","collection_method":"otlp"},"session":{"id":"s2"},"trace":{"id":"t-abc","span_id":"span-1"},"tool":{"name":"Bash"},"message":"root span","model":"claude-opus-5"}`,
 		`{"timestamp":"2026-06-11T11:00:01Z","event":{"id":"o2","action":"tool.completed","category":"tool"},"harness":{"name":"claude_code","collection_method":"otlp"},"session":{"id":"s2"},"trace":{"id":"t-abc","span_id":"span-2","parent_span_id":"span-1"},"tool":{"name":"Bash"}}`,
@@ -197,6 +200,14 @@ func parityFixture() [][]byte {
 		`{"timestamp":"2026-06-11T14:00:00Z","event":{"id":"q0","action":"prompt.submitted","category":"prompt"},"harness":{"name":"codex_cli"},"session":{"id":"s6"},"prompt":{"text":"unsequenced goes first"}}`,
 		`{"timestamp":"2026-06-11T13:59:00Z","event":{"id":"q-early","action":"session.started","category":"session"},"harness":{"name":"codex_cli","version":"1.0"},"session":{"id":"s6"}}`,
 		`{"timestamp":"2026-06-11T13:00:05Z","event":{"id":"s5b","action":"command.executed","category":"command"},"harness":{"name":"opencode"},"session":{"id":"s5"},"command":{"command":"ls a-b"}}`,
+		// Shared with beacon share, then active again: the trace is stale. s8 was shared after
+		// its last activity, and the commit link after that does not make it stale.
+		`{"timestamp":"2026-06-11T15:00:00Z","event":{"id":"h1","action":"prompt.submitted","category":"prompt"},"harness":{"name":"claude_code","collection_method":"hook"},"session":{"id":"s7"},"prompt":{"text":"share me"}}`,
+		`{"timestamp":"2026-06-11T15:01:00Z","event":{"id":"h2","action":"session.shared","category":"session","fidelity":"inferred"},"harness":{"name":"claude_code"},"session":{"id":"s7"},"raw":{"shared_url":"https://beacon.sh/s/s7trace","visibility":"direct","shared_at":"2026-06-11T15:01:00Z","last_refreshed_at":"2026-06-11T15:01:00Z"}}`,
+		`{"timestamp":"2026-06-11T15:02:00Z","event":{"id":"h3","action":"command.executed","category":"command"},"harness":{"name":"claude_code","collection_method":"hook"},"session":{"id":"s7"},"command":{"command":"go test ./..."},"message":"later work"}`,
+		`{"timestamp":"2026-06-11T16:00:00Z","event":{"id":"k1","action":"prompt.submitted","category":"prompt"},"harness":{"name":"claude_code","collection_method":"hook"},"session":{"id":"s8"},"prompt":{"text":"shared and current"}}`,
+		`{"timestamp":"2026-06-11T16:01:00Z","event":{"id":"k2","action":"session.shared","category":"session","fidelity":"inferred"},"harness":{"name":"claude_code"},"session":{"id":"s8"},"raw":{"shared_url":"https://beacon.sh/s/s8trace","visibility":"private","shared_at":"2026-06-11T16:01:00Z","last_refreshed_at":"2026-06-11T16:01:00Z","shared_through":"2026-06-11T16:00:59Z"}}`,
+		`{"timestamp":"2026-06-11T16:02:00Z","event":{"id":"k3","action":"session.commit_linked","category":"session","fidelity":"inferred"},"harness":{"name":"claude_code"},"session":{"id":"s8"},"message":"commit linked"}`,
 	}
 	out := make([][]byte, len(lines))
 	for i, line := range lines {
@@ -207,7 +218,7 @@ func parityFixture() [][]byte {
 
 var parityShowIDs = []string{
 	"session:cursor:s1", "trace:t-abc", "session:codex_cli:s3", "session:opencode:s4", "session:opencode:s5",
-	"session:codex_cli:s6", "event:m1", "missing",
+	"session:codex_cli:s6", "session:claude_code:s7", "session:claude_code:s8", "event:m1", "missing",
 }
 
 // The core promise: for the same log, the history answers every list, search and show exactly
@@ -800,13 +811,19 @@ func noiseText(seed, n int) string {
 }
 
 // The store keeps only the raw keys in historyRawKeys. A raw key the dashboard reads and the store
-// drops would make a rebuilt history differ from the log, so every one must be listed.
+// drops would make a rebuilt history differ from the log, so every one must be listed. The trace
+// projection the dashboard calls lives in pkg/asymptoteobserve (tracebuild.go), so its reads count.
 func TestHistoryKeepsEveryRawKeyTheDashboardReads(t *testing.T) {
 	files, err := filepath.Glob("*.go")
 	if err != nil {
 		t.Fatal(err)
 	}
-	pattern := regexp.MustCompile(`(?:rawString\([^,]+, |intFromRaw\([^,]+, |Raw\[)"([^"]+)"`)
+	projection, err := filepath.Glob(filepath.Join("..", "..", "..", "..", "..", "pkg", "asymptoteobserve", "tracebuild*.go"))
+	if err != nil || len(projection) == 0 {
+		t.Fatalf("trace projection sources not found: %v", err)
+	}
+	files = append(files, projection...)
+	pattern := regexp.MustCompile(`(?:(?:rawString|traceRawString)\([^,]+, |(?:intFromRaw|traceIntFromRaw)\([^,]+, |Raw\[)"([^"]+)"`)
 	found := 0
 	for _, file := range files {
 		if strings.HasSuffix(file, "_test.go") {
@@ -957,5 +974,63 @@ func TestHistoryRenamesIDlessEventsWhenTheirFileRotates(t *testing.T) {
 	compareAnswers(t, want, history)
 	if !strings.Contains(want["idless archive-1-line-3"], "archive-1-line-3") {
 		t.Fatalf("fixture did not produce a rotated ID: %s", want["idless archive-1-line-3"])
+	}
+}
+
+// An event's error is part of the trace projection: a session-store MCP failure keeps its mcp
+// action and records only error.type, so without it no lens could tell the call failed.
+func TestTraceEventsCarryTheErrorType(t *testing.T) {
+	path := newTestLog(t, parityFixture())
+	for name, setup := range map[string]func(){
+		"jsonl":   func() { withoutHistory(t) },
+		"history": func() { withHistory(t); optIn(t, path) },
+	} {
+		setup()
+		show, ok, err := ShowTrace(path, "session:cursor:s1", TraceQuery{Limit: 100})
+		if err != nil || !ok {
+			t.Fatalf("%s: ShowTrace = ok %v, err %v", name, ok, err)
+		}
+		for _, event := range show.Events {
+			switch {
+			case event.ID == "e6" && (event.Error == nil || event.Error.Type != "mcp_timeout"):
+				t.Fatalf("%s: e6 error = %#v, want mcp_timeout", name, event.Error)
+			case event.ID != "e6" && event.Error != nil:
+				t.Fatalf("%s: %s error = %#v, want none", name, event.ID, event.Error)
+			}
+		}
+		found, err := SearchTraces(path, TraceQuery{EventQuery: EventQuery{Q: "mcp_timeout"}, ResultLevel: "event", Limit: 10})
+		if err != nil || found.TotalMatched != 1 || found.Events[0].Event.ID != "e6" {
+			t.Fatalf("%s: search for the error type = %+v, %v", name, found, err)
+		}
+	}
+}
+
+// The policy block is part of the trace projection, so both the JSONL scan and the history serve it.
+func TestTraceEventsCarryThePolicyBlock(t *testing.T) {
+	path := newTestLog(t, parityFixture())
+	for name, setup := range map[string]func(){
+		"jsonl":   func() { withoutHistory(t) },
+		"history": func() { withHistory(t); optIn(t, path) },
+	} {
+		setup()
+		show, ok, err := ShowTrace(path, "session:cursor:s1", TraceQuery{Limit: 100})
+		if err != nil || !ok {
+			t.Fatalf("%s: ShowTrace = ok %v, err %v", name, ok, err)
+		}
+		var policy *TracePolicyV1
+		for _, event := range show.Events {
+			if event.ID == "e5" {
+				policy = event.Policy
+			}
+		}
+		want := TracePolicyV1{ID: "no-near", Decision: "deny", Enforcement: "enforce", Reason: "provider denied"}
+		if policy == nil || *policy != want {
+			t.Fatalf("%s: e5 policy = %#v, want %#v", name, policy, want)
+		}
+		// The policy block is searchable, like the approval beside it.
+		found, err := SearchTraces(path, TraceQuery{EventQuery: EventQuery{Q: "no-near"}, ResultLevel: "event", Limit: 10})
+		if err != nil || found.TotalMatched != 1 || found.Events[0].Event.ID != "e5" {
+			t.Fatalf("%s: search for the policy id = %+v, %v", name, found, err)
+		}
 	}
 }

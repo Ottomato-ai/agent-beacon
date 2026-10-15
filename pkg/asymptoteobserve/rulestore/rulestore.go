@@ -103,32 +103,76 @@ func baselineRulePath(name string) string {
 // LoadActive resolves the active rule set:
 //
 //   - if rulesDir is non-empty, load only from that directory (explicit override);
-//   - else load from storeDir; if the store is empty (or absent), fall back to the
-//     embedded baseline.
+//   - else load the store rules from storeDir plus every embedded baseline rule whose
+//     id the store does not define (a store rule replaces the baseline rule with the
+//     same id). An empty or absent store therefore yields exactly the baseline.
 //
-// Every returned rule has passed validation (via threatrules.LoadDir / Baseline).
+// The baseline stays active alongside the store so that installing one rule can never
+// silently switch the baseline off; a store rule overrides a baseline rule only by id.
+//
+// Every returned rule has passed validation (via threatrules.LoadDir / Baseline). A rule
+// that needs a newer spec than this engine supports fails the load; LoadActiveSkipping is
+// the variant that sets it aside instead.
 func LoadActive(storeDir, rulesDir string) ([]LoadedRule, error) {
-	if rulesDir != "" {
-		rules, err := threatrules.LoadDir(rulesDir)
-		if err != nil {
-			return nil, err
-		}
-		return tag(rules, SourceStore), nil
+	loaded, skipped, err := LoadActiveSkipping(storeDir, rulesDir)
+	if err != nil {
+		return nil, err
 	}
+	if len(skipped) > 0 {
+		return nil, fmt.Errorf("%s: %w", skipped[0].Path, skipped[0].Err)
+	}
+	return loaded, nil
+}
 
-	if HasRuleFiles(storeDir) {
-		rules, err := threatrules.LoadDir(storeDir)
+// LoadActiveSkipping is LoadActive, except that store or override rules declaring a spec
+// newer than threatrules.SupportedSpec are left out and returned in skipped, so the rest
+// of the corpus still runs. Callers surface skipped as warnings. The embedded baseline is
+// never skipped: it ships with the engine that evaluates it.
+func LoadActiveSkipping(storeDir, rulesDir string) ([]LoadedRule, []threatrules.SkippedRule, error) {
+	if rulesDir != "" {
+		rules, skipped, err := threatrules.LoadDirSkipping(rulesDir)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		return tag(rules, SourceStore), nil
+		return tag(rules, SourceStore), skipped, nil
 	}
 
 	base, err := Baseline()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return tag(base, SourceBaseline), nil
+	if !HasRuleFiles(storeDir) {
+		return tag(base, SourceBaseline), nil, nil
+	}
+	stored, skipped, err := threatrules.LoadDirSkipping(storeDir)
+	if err != nil {
+		return nil, nil, err
+	}
+	active := tag(stored, SourceStore)
+	defined := make(map[string]bool, len(stored))
+	for _, r := range stored {
+		defined[r.ID] = true
+	}
+	for _, r := range base {
+		if !defined[r.ID] {
+			active = append(active, LoadedRule{Rule: r, Source: SourceBaseline})
+		}
+	}
+	return active, skipped, nil
+}
+
+// IsBaselineID reports whether id names a rule in the embedded baseline.
+func IsBaselineID(id string) bool {
+	base, err := Baseline()
+	if err != nil {
+		return false
+	}
+	for _, r := range base {
+		if r.ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 func tag(rules []*threatrules.Rule, src Source) []LoadedRule {
@@ -156,8 +200,29 @@ func HasRuleFiles(dir string) bool {
 // InstallFiles validates every *.rule.yaml found at src (a file or directory) and
 // writes the valid ones into storeDir. Each rule is validated before any file is
 // written; an invalid rule aborts the whole install. A rule whose id already exists
-// in the store is rejected unless force is set. Returns the rules installed.
+// in the store is rejected unless force is set. Returns the rules installed. A rule that
+// needs a newer spec than this engine supports aborts the install like any other invalid
+// rule; InstallFilesSkipping is the variant that leaves it out instead.
 func InstallFiles(storeDir, src string, force bool) ([]Installed, error) {
+	return installFiles(storeDir, src, force, nil)
+}
+
+// InstallFilesSkipping is InstallFiles, except that a rule declaring a spec newer than
+// threatrules.SupportedSpec is not installed and is returned in skipped, while the rest
+// of the source installs. The store only ever holds rules this engine validated, so a
+// skipped rule is picked up by re-running the install after upgrading Beacon.
+func InstallFilesSkipping(storeDir, src string, force bool) ([]Installed, []threatrules.SkippedRule, error) {
+	var skipped []threatrules.SkippedRule
+	installed, err := installFiles(storeDir, src, force, &skipped)
+	if err != nil {
+		return nil, nil, err
+	}
+	return installed, skipped, nil
+}
+
+// installFiles implements InstallFiles. When skipped is non-nil, rules needing a newer
+// spec are appended to it rather than aborting the install.
+func installFiles(storeDir, src string, force bool, skipped *[]threatrules.SkippedRule) ([]Installed, error) {
 	srcPaths, err := ruleFilesAt(src)
 	if err != nil {
 		return nil, err
@@ -190,6 +255,10 @@ func InstallFiles(storeDir, src string, force bool) ([]Installed, error) {
 			return nil, err
 		}
 		rule, err := threatrules.DecodeRule(data)
+		if unsupported, ok := threatrules.AsUnsupportedSpec(err); ok && skipped != nil {
+			*skipped = append(*skipped, threatrules.SkippedRule{Path: p, Err: unsupported})
+			continue
+		}
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", p, err)
 		}

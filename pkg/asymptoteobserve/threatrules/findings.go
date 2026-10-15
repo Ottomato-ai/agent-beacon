@@ -1,6 +1,7 @@
 package threatrules
 
 import (
+	"fmt"
 	"sort"
 
 	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve"
@@ -63,7 +64,8 @@ type Finding struct {
 	SessionID string                    `json:"session_id,omitempty"`
 	Reason    string                    `json:"reason"`
 	// Events is the evidence: the single matching event for a single-event rule, or the
-	// matched step events (in order) for a correlation rule.
+	// matched step events for a correlation rule (in step order for a sequence, in the
+	// order they happened for order: any).
 	Events []asymptoteobserve.Event `json:"events"`
 }
 
@@ -78,7 +80,7 @@ func (c *CompiledRule) Findings(events []asymptoteobserve.Event) ([]Finding, err
 	}
 	var findings []Finding
 	for i := range events {
-		matched, err := EvalMatch(c.match, events[i])
+		matched, err := c.eval(c.match, events[i])
 		if err != nil {
 			return nil, err
 		}
@@ -127,7 +129,10 @@ func ScanEvents(rules []*CompiledRule, events []asymptoteobserve.Event) ([]Findi
 	for _, rule := range rules {
 		found, err := rule.Findings(events)
 		if err != nil {
-			return nil, err
+			// Name the rule: an evaluation error (such as one that exceeded MaxEvalCost)
+			// belongs to the rule, not to the log, and the operator needs to know which to
+			// remove.
+			return nil, fmt.Errorf("rule %q: %w", rule.Rule().ID, err)
 		}
 		all = append(all, found...)
 	}

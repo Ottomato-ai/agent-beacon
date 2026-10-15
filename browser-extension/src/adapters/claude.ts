@@ -2,7 +2,8 @@
 //
 // claude.ai streams Server-Sent Events whose `data:` payloads are Anthropic
 // streaming objects keyed by `type`:
-//   message_start { message: { model, usage:{input_tokens, cache_creation_input_tokens, cache_read_input_tokens} } }
+//   message_start { message: { model, usage:{input_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+//                   cache_creation?:{ephemeral_5m_input_tokens, ephemeral_1h_input_tokens}} } }
 //   content_block_start { index, content_block:{ type:'text'|'tool_use', id?, name? } }
 //   content_block_delta { index, delta:{ type:'text_delta', text } | { type:'input_json_delta', partial_json } }
 //   content_block_stop { index }
@@ -29,17 +30,18 @@ class ClaudeParser implements TurnParser {
   private inputTokens?: number;
   private outputTokens?: number;
   private cacheCreationInputTokens?: number;
+  private cacheCreation1hInputTokens?: number;
   private cacheReadInputTokens?: number;
   private startedAt = Date.now();
   private completedAt?: number;
-  private reqId: number;
+  private reqId: string;
   /** Stable per-turn id from message_start; used for turnId so ids don't collide
    *  across service-worker restarts (which reset the reqId counter). */
   private messageId = '';
   // tool_use blocks keyed by content-block index.
   private blocks = new Map<number, { type: string; tool?: ToolCall; argBuf: string }>();
 
-  constructor(reqId: number) {
+  constructor(reqId: string) {
     this.reqId = reqId;
   }
 
@@ -154,6 +156,11 @@ class ClaudeParser implements TurnParser {
     if (typeof u.input_tokens === 'number') this.inputTokens = u.input_tokens;
     if (typeof u.cache_creation_input_tokens === 'number')
       this.cacheCreationInputTokens = u.cache_creation_input_tokens;
+    // cache_creation breaks the writes down by TTL. Only the one-hour part is
+    // kept: it is billed at 2x input against 1.25x for five-minute writes, and
+    // the five-minute part is the remainder.
+    if (typeof u.cache_creation?.ephemeral_1h_input_tokens === 'number')
+      this.cacheCreation1hInputTokens = u.cache_creation.ephemeral_1h_input_tokens;
     if (typeof u.cache_read_input_tokens === 'number')
       this.cacheReadInputTokens = u.cache_read_input_tokens;
   }
@@ -193,6 +200,7 @@ class ClaudeParser implements TurnParser {
         inputTokens: this.inputTokens,
         outputTokens: this.outputTokens,
         cacheCreationInputTokens: this.cacheCreationInputTokens,
+        cacheCreation1hInputTokens: this.cacheCreation1hInputTokens,
         cacheReadInputTokens: this.cacheReadInputTokens,
       },
       startedAt: this.startedAt,

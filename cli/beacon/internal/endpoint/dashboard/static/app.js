@@ -185,7 +185,15 @@ function updateURL(query) {
   window.history.replaceState(null, "", next);
 }
 
+let activityLoadGeneration = 0;
+let activityLoadInFlight = false;
+
 async function load({ updateLocation = false, mode = "replace" } = {}) {
+  // Do not let the poll timer continually supersede a slow local log scan.
+  // Explicit filter changes still start immediately and replace the old view.
+  if (mode === "poll" && activityLoadInFlight) return;
+  const generation = ++activityLoadGeneration;
+  activityLoadInFlight = true;
   const query = queryFromFilters();
   if (updateLocation) updateURL(query);
   const suffix = query ? `?${query}` : "";
@@ -201,6 +209,7 @@ async function load({ updateLocation = false, mode = "replace" } = {}) {
       getJSON(`/api/summary${suffix}`),
       getJSON(`${activityPath}${suffix}`),
     ]);
+    if (generation !== activityLoadGeneration) return;
     const previousEvents = state.events;
     const previousQuery = state.currentQuery;
     state.status = status;
@@ -216,10 +225,13 @@ async function load({ updateLocation = false, mode = "replace" } = {}) {
       rendered = true;
     }
   } catch (err) {
-    state.error = err;
+    if (generation === activityLoadGeneration) state.error = err;
   } finally {
-    state.loading = false;
-    if (!rendered) render();
+    if (generation === activityLoadGeneration) {
+      activityLoadInFlight = false;
+      state.loading = false;
+      if (!rendered) render();
+    }
   }
 }
 
@@ -798,9 +810,11 @@ const inventoryViewLabels = {
 const inventoryRuntimeLogos = {
   antigravity: "/runtime-logos/antigravity.png",
   antigravity_cli: "/runtime-logos/antigravity.png",
+  chatgpt_web: "/runtime-logos/chatgpt.svg",
   claude: "/runtime-logos/claude-code.png",
   claude_code: "/runtime-logos/claude-code.png",
   claude_cowork: "/runtime-logos/claude-code.png",
+  claude_web: "/runtime-logos/claude-code.png",
   cline: "/runtime-logos/cline.png",
   cline_cli: "/runtime-logos/cline.png",
   codex: "/runtime-logos/codex.png",
@@ -1595,6 +1609,8 @@ function sessionRowHTML(session) {
       <td class="col-message">
         <span class="session-list-prompt">
           ${models.length ? `<strong class="session-list-prompt-model">${models.map(escapeHTML).join(" · ")}</strong>` : ""}
+          ${session.is_recurring ? `<strong class="session-recurring-indicator">Recurring ×${escapeHTML(session.recurrence_count)}</strong>` : ""}
+          ${sessionSharingIndicator(session.sharing)}
           <span>${prompt}</span>
         </span>
       </td>
@@ -1605,6 +1621,47 @@ function sessionRowHTML(session) {
       <td class="col-message"><strong>${escapeHTML(session.last_action || "event")}</strong>${lastDetail ? `<br /><span class="muted">${escapeHTML(truncateMiddle(lastDetail, 140))}</span>` : ""}</td>
     </tr>
   `;
+}
+
+// Sharing state comes from the session.shared record `beacon share` writes. The dashboard is
+// read-only: it links to the shared trace and shows the refresh command to copy, and never shares.
+function sessionSharingIndicator(sharing) {
+  if (!sharing || !sharing.url) return "";
+  const stale = sharing.state === "stale";
+  return `<strong class="session-share-indicator${stale ? " session-share-stale" : ""}" title="${escapeHTML(stale ? "Shared; the session has newer activity than the shared trace" : "Shared on beacon.sh")}">${stale ? "Shared · stale" : "Shared"}</strong>`;
+}
+
+function safeShareURL(url) {
+  return typeof url === "string" && /^https:\/\/[^\s"'<>]+$/.test(url) ? url : "";
+}
+
+function sessionSharingRowHTML(sharing) {
+  if (!sharing || !sharing.url) return "";
+  const url = safeShareURL(sharing.url);
+  const stale = sharing.state === "stale";
+  const link = url
+    ? `<a href="${escapeHTML(url)}" target="_blank" rel="noopener noreferrer">${escapeHTML(url)}</a>`
+    : escapeHTML(sharing.url);
+  const detail = [sharing.visibility, stale ? "stale: newer local activity" : "up to date"].filter(Boolean).join(" · ");
+  const hint = sharing.refresh_command
+    ? `<span class="session-share-hint"><code>${escapeHTML(sharing.refresh_command)}</code> <button type="button" class="copy-share-refresh" data-command="${escapeHTML(sharing.refresh_command)}">Copy</button></span>`
+    : "";
+  return `${link}<small>${escapeHTML(detail)}</small>${hint}`;
+}
+
+function bindShareRefreshCopy(scope = document) {
+  scope.querySelectorAll(".copy-share-refresh").forEach((button) => {
+    button.onclick = async (event) => {
+      event.stopPropagation();
+      try {
+        await navigator.clipboard.writeText(button.dataset.command || "");
+        button.textContent = "Copied";
+      } catch (_) {
+        button.textContent = "Copy failed";
+      }
+      window.setTimeout(() => { button.textContent = "Copy"; }, 1400);
+    };
+  });
 }
 
 function bindSessionRows(scope = document) {
@@ -1957,6 +2014,11 @@ function renderSessionOverview(detail) {
       : `<span class="session-badge session-badge-ok">No high risk events</span>`,
     `<span class="session-badge session-badge-info">${escapeHTML(session.event_count || records.length)} events captured</span>`,
   ];
+  if (session.sharing && session.sharing.url) {
+    badges.push(session.sharing.state === "stale"
+      ? `<span class="session-badge session-badge-risk">Shared · stale</span>`
+      : `<span class="session-badge session-badge-ok">Shared</span>`);
+  }
   $("#session-badges").innerHTML = badges.join("");
 
   renderSessionMetadata(session, events);
@@ -1987,16 +2049,20 @@ function renderSessionMetadata(session, events) {
     },
     { label: "Model", value: models.length ? escapeHTML(models.join(", ")) : `<span class="muted">-</span>`, className: "mono" },
     { label: "Tokens", value: usage.tokens ? escapeHTML(formatCompactTokens(usage.tokens)) : `<span class="muted">-</span>` },
-    { label: "Est. Cost", value: usage.cost ? `$${escapeHTML(usage.cost.toFixed(4))}` : `<span class="muted">-</span>` },
+    { label: "Reported Cost", value: usage.cost ? `$${escapeHTML(usage.cost.toFixed(4))}` : `<span class="muted">-</span>` },
     { label: "Repository", value: session.repository ? escapeHTML(repositoryOptionLabel(session.repository)) : `<span class="muted">-</span>`, className: "mono" },
     { label: "Branch", value: session.branch ? escapeHTML(session.branch) : `<span class="muted">-</span>`, className: "mono" },
   ];
+  if (session.sharing && session.sharing.url) {
+    rows.push({ label: "Shared", value: sessionSharingRowHTML(session.sharing), className: "session-meta-sharing" });
+  }
   $("#session-metadata").innerHTML = rows.map((row) => `
     <div class="session-meta-item ${row.className || ""}">
       <span>${escapeHTML(row.label)}</span>
       <strong>${row.value}</strong>
     </div>
   `).join("");
+  bindShareRefreshCopy($("#session-metadata"));
 }
 
 function renderSessionActivity(session, records) {
@@ -2140,7 +2206,7 @@ function sessionEventCategory(event) {
   if (event.file) return "file";
   if (event.mcp) return "mcp";
   if (event.approval || event.policy) return "approval";
-  if (event.prompt) return "prompt";
+  if (event.prompt?.text) return "prompt";
   if (event.tool) return "tool";
   return "other";
 }
@@ -2328,9 +2394,11 @@ function renderDatalist(id, values) {
 
 function harnessLabel(value) {
   const labels = {
+    chatgpt_web: "ChatGPT Web",
     cline: "Cline",
     cursor: "Cursor",
     claude_code: "Claude Code",
+    claude_web: "Claude Web",
     codex_cli: "Codex CLI",
     codex_desktop: "Codex Desktop",
     copilot_cli: "GitHub Copilot CLI",
@@ -2565,7 +2633,7 @@ async function loadTokens() {
 function renderTokensPage(report, session) {
   setText("#log-path", state.status?.log_path || "Runtime log unavailable");
   setText("#token-meta", `${report.events_with_usage} of ${report.total_events} events carry usage`);
-  renderTokenCards(report.totals || {});
+  renderTokenCards(report.totals || {}, report.pricing);
   renderTokenThroughput(report.series || []);
   renderTokenSplit(report.totals || {});
   renderTokenBreakdowns(report);
@@ -2586,7 +2654,25 @@ function usageTotal(usage = {}) {
     (usage.reasoning_output_tokens || 0);
 }
 
-function renderTokenCards(totals) {
+// The estimate is labeled wherever it appears: it is a list price from the embedded catalog
+// (or the operator's pricing overrides file), not what anyone was billed, and it sits beside the
+// runtime-reported cost rather than in it.
+function estimateHint(totals, pricing) {
+  const overrides = pricing?.overrides;
+  const parts = [overrides && !overrides.error ? "list price + overrides" : "list price"];
+  const catalog = pricing?.catalog;
+  if (catalog?.generated_at) parts.push(`catalog ${catalog.generated_at}`);
+  if (overrides?.error) parts.push("overrides file invalid, not used");
+  if (totals.unpriced_events) parts.push(`${totals.unpriced_events} unpriced events excluded`);
+  return parts.join(" · ");
+}
+
+function formatEstimatedCost(usage = {}) {
+  if (usage.estimated_cost_usd) return `~${usage.estimated_cost_usd.toFixed(4)}`;
+  return usage.unpriced_events ? "?" : "-";
+}
+
+function renderTokenCards(totals, pricing) {
   if (!$("#token-cards")) return;
   const totalTokens = usageTotal(totals);
   const cards = [
@@ -2595,7 +2681,8 @@ function renderTokenCards(totals) {
     { label: "Output Tokens", value: formatTokens((totals.output_tokens || 0) + (totals.reasoning_output_tokens || 0)), hint: "completion + reasoning" },
     { label: "Cached Tokens", value: formatTokens((totals.cache_read_input_tokens || 0) + (totals.cache_creation_input_tokens || 0)) },
     { label: "Reasoning", value: formatTokens(totals.reasoning_output_tokens) },
-    { label: "Cost (USD)", value: totals.cost_usd ? totals.cost_usd.toFixed(4) : "-", hint: "runtime-reported only" },
+    { label: "Reported cost (USD)", value: totals.cost_usd ? totals.cost_usd.toFixed(4) : "-", hint: "runtime-reported only" },
+    { label: "Est. cost (USD)", value: formatEstimatedCost(totals), hint: estimateHint(totals, pricing) },
   ];
   $("#token-cards").innerHTML = cards
     .map((card) => `
@@ -2806,7 +2893,7 @@ function renderUsageGroupRows(selector, groups, filterKey) {
   const tbody = $(selector);
   if (!tbody) return;
   if (!groups.length) {
-    tbody.innerHTML = `<tr><td colspan="8" class="muted">No usage captured yet.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="9" class="muted">No usage captured yet.</td></tr>`;
     return;
   }
   tbody.innerHTML = groups
@@ -2852,7 +2939,7 @@ function renderSessionDetail(detail, session) {
   walk(detail.steps, 0);
   $("#token-session-detail").innerHTML = rows.length
     ? rows.join("")
-    : `<tr><td colspan="8" class="muted">No usage-bearing steps in this session.</td></tr>`;
+    : `<tr><td colspan="9" class="muted">No usage-bearing steps in this session.</td></tr>`;
 }
 
 function usageCells(usage = {}, { events = true } = {}) {
@@ -2863,6 +2950,7 @@ function usageCells(usage = {}, { events = true } = {}) {
     formatTokens(usage.cache_creation_input_tokens),
     formatTokens(usage.reasoning_output_tokens),
     usage.cost_usd ? usage.cost_usd.toFixed(4) : "-",
+    formatEstimatedCost(usage),
   ];
   if (events) cells.push(String(usage.events ?? 0));
   return cells.map((value) => `<td>${escapeHTML(value)}</td>`).join("");
@@ -3327,6 +3415,306 @@ $$("[data-preset]").forEach((button) => {
   button.addEventListener("click", () => applyPreset(button.dataset.preset));
 });
 
+// Lens tabs on the session page. Each lens runs in a sandboxed frame served by /lenses/frame/<id>
+// (see spec/lenses/SPEC.md). This is the host half of the protocol: it hands the frame one
+// MessagePort and answers getTrace over it with /api/lens-data. The frame never reaches the
+// dashboard any other way, and a lens that fails or stalls before it renders gives way to the full
+// session view.
+const lensAddedStorageKey = "beacon.dashboard.lenses";
+const lensRenderTimeoutMs = 10000;
+// After the data is delivered, a lens that throws within this window is treated as having failed
+// to render rather than as a lens with a late bug.
+const lensSettleMs = 1000;
+const lensMaxFrameHeight = 200000;
+
+const lensHost = {
+  session: "",
+  lenses: [],
+  added: [],
+  active: "",
+  mount: null,
+  dataPromise: null,
+};
+
+function readAddedLenses() {
+  try {
+    const value = JSON.parse(localStorage.getItem(lensAddedStorageKey) || "[]");
+    return Array.isArray(value) ? value.filter((id) => typeof id === "string") : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+function writeAddedLenses(ids) {
+  try {
+    localStorage.setItem(lensAddedStorageKey, JSON.stringify(ids));
+  } catch (_) {
+    // Remembering tabs is a convenience; a browser without storage still works.
+  }
+}
+
+function lensByID(id) {
+  return lensHost.lenses.find((lens) => lens.id === id);
+}
+
+async function initLensTabs() {
+  const params = new URLSearchParams(window.location.search);
+  lensHost.session = (params.get("id") || "").trim();
+  if (!lensHost.session || !$("#lens-tabs")) return;
+  try {
+    lensHost.lenses = (await getJSON("/api/lenses")).lenses || [];
+  } catch (err) {
+    console.warn("lenses unavailable", err);
+    lensHost.lenses = [];
+  }
+  lensHost.added = readAddedLenses().filter((id) => lensByID(id));
+  const wanted = (params.get("lens") || "").trim();
+  if (wanted && lensByID(wanted) && !lensHost.added.includes(wanted)) {
+    lensHost.added.push(wanted);
+    writeAddedLenses(lensHost.added);
+  }
+
+  const addButton = $("#lens-add-button");
+  addButton.addEventListener("click", (event) => {
+    event.stopPropagation();
+    toggleLensMenu();
+  });
+  document.addEventListener("click", (event) => {
+    if (!event.target.closest(".lens-add")) toggleLensMenu(false);
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") toggleLensMenu(false);
+  });
+  window.addEventListener("popstate", () => {
+    const id = new URLSearchParams(window.location.search).get("lens") || "";
+    selectLens(lensByID(id) ? id : "", { history: false });
+  });
+
+  renderLensTabs();
+  selectLens(lensByID(wanted) ? wanted : "", { history: false });
+}
+
+function renderLensTabs() {
+  const tabs = $("#lens-tabs");
+  tabs.replaceChildren();
+  const tab = (id, title) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "lens-tab";
+    button.setAttribute("role", "tab");
+    button.setAttribute("aria-selected", String(lensHost.active === id));
+    button.dataset.lens = id;
+    button.addEventListener("click", () => {
+      // The active tab is already showing; reselecting it would reload the lens and push a
+      // duplicate history entry.
+      if (lensHost.active !== id) selectLens(id);
+    });
+    const label = document.createElement("span");
+    label.textContent = title;
+    button.append(label);
+    return button;
+  };
+  tabs.append(tab("", "Full session"));
+  for (const id of lensHost.added) {
+    const lens = lensByID(id);
+    const button = tab(id, lens.title);
+    const remove = document.createElement("span");
+    remove.className = "lens-tab-remove";
+    remove.setAttribute("role", "button");
+    remove.setAttribute("aria-label", `Remove the ${lens.title} lens`);
+    remove.textContent = "×";
+    remove.addEventListener("click", (event) => {
+      event.stopPropagation();
+      removeLens(id);
+    });
+    button.append(remove);
+    tabs.append(button);
+  }
+  renderLensMenu();
+}
+
+function renderLensMenu() {
+  const menu = $("#lens-menu");
+  menu.replaceChildren();
+  const available = lensHost.lenses.filter((lens) => !lensHost.added.includes(lens.id));
+  if (available.length === 0) {
+    const empty = document.createElement("span");
+    empty.className = "lens-menu-empty";
+    empty.textContent = lensHost.lenses.length ? "Every lens is already open." : "No lenses are installed.";
+    menu.append(empty);
+    return;
+  }
+  for (const lens of available) {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "lens-menu-item";
+    item.setAttribute("role", "menuitem");
+    const title = document.createElement("span");
+    title.className = "lens-menu-title";
+    title.textContent = lens.title;
+    item.append(title);
+    if (lens.description) {
+      const description = document.createElement("span");
+      description.className = "lens-menu-description";
+      description.textContent = lens.description;
+      item.append(description);
+    }
+    item.addEventListener("click", () => {
+      lensHost.added.push(lens.id);
+      writeAddedLenses(lensHost.added);
+      toggleLensMenu(false);
+      selectLens(lens.id);
+    });
+    menu.append(item);
+  }
+}
+
+function toggleLensMenu(open) {
+  const menu = $("#lens-menu");
+  const button = $("#lens-add-button");
+  if (!menu || !button) return;
+  const show = open === undefined ? menu.hidden : open;
+  menu.hidden = !show;
+  button.setAttribute("aria-expanded", String(show));
+}
+
+function removeLens(id) {
+  lensHost.added = lensHost.added.filter((added) => added !== id);
+  writeAddedLenses(lensHost.added);
+  if (lensHost.active === id) {
+    selectLens("");
+  } else {
+    renderLensTabs();
+  }
+}
+
+function selectLens(id, { history = true } = {}) {
+  if (id && !lensHost.added.includes(id)) {
+    // Reached through history after its tab was removed: show the tab again with the lens.
+    lensHost.added.push(id);
+    writeAddedLenses(lensHost.added);
+  }
+  lensHost.active = id;
+  if (history) {
+    const params = new URLSearchParams(window.location.search);
+    if (id) params.set("lens", id);
+    else params.delete("lens");
+    window.history.pushState(null, "", `${window.location.pathname}?${params}`);
+  }
+  if (id) $("#lens-notice").hidden = true;
+  $("#session-detail-view").dataset.view = id ? "lens" : "full";
+  $("#lens-view").hidden = !id;
+  renderLensTabs();
+  if (id) mountLens(lensByID(id));
+  else unmountLens();
+}
+
+function lensData() {
+  if (!lensHost.dataPromise) {
+    lensHost.dataPromise = getJSON(`/api/lens-data?session=${encodeURIComponent(lensHost.session)}`);
+    // A failed load is not cached, so reopening the lens tries again.
+    lensHost.dataPromise.catch(() => {
+      lensHost.dataPromise = null;
+    });
+  }
+  return lensHost.dataPromise;
+}
+
+function unmountLens() {
+  const mount = lensHost.mount;
+  if (!mount) return;
+  lensHost.mount = null;
+  clearTimeout(mount.timer);
+  clearTimeout(mount.settleTimer);
+  if (mount.port) mount.port.close();
+  mount.frame.remove();
+}
+
+function mountLens(lens) {
+  unmountLens();
+  const status = $("#lens-status");
+  status.hidden = false;
+  status.textContent = `Loading ${lens.title}...`;
+
+  const frame = document.createElement("iframe");
+  frame.className = "lens-frame";
+  frame.setAttribute("sandbox", "allow-scripts");
+  frame.referrerPolicy = "no-referrer";
+  frame.title = `${lens.title} lens`;
+  frame.src = `/lenses/frame/${encodeURIComponent(lens.id)}`;
+
+  const mount = { lens, frame, port: null, loads: 0, delivered: false, rendered: false, timer: 0, settleTimer: 0 };
+  lensHost.mount = mount;
+  const fail = (reason) => {
+    if (lensHost.mount !== mount) return;
+    const notice = $("#lens-notice");
+    selectLens("", { history: false });
+    const params = new URLSearchParams(window.location.search);
+    params.delete("lens");
+    window.history.replaceState(null, "", `${window.location.pathname}?${params}`);
+    notice.textContent = `The ${lens.title} lens could not be shown (${reason}). Showing the full session instead.`;
+    notice.hidden = false;
+  };
+  const rendered = () => {
+    if (lensHost.mount !== mount || mount.rendered) return;
+    mount.rendered = true;
+    clearTimeout(mount.timer);
+    status.hidden = true;
+  };
+  mount.timer = setTimeout(() => fail("it did not render within 10 seconds"), lensRenderTimeoutMs);
+
+  frame.addEventListener("load", () => {
+    // A load queued before this lens was unmounted still fires; the frame is detached by then
+    // and has no window to post to.
+    if (lensHost.mount !== mount) return;
+    mount.loads += 1;
+    if (mount.loads > 1) {
+      // The lens navigated its own frame. Whatever loaded now is not the lens that was vetted,
+      // so it gets no port and the lens is closed.
+      fail("it navigated away from itself");
+      return;
+    }
+    const channel = new MessageChannel();
+    mount.port = channel.port1;
+    mount.port.onmessage = (event) => {
+      if (lensHost.mount !== mount) return;
+      const message = event.data;
+      if (!message || typeof message !== "object") return;
+      if (message.type === "getTrace") {
+        // The fetch can outlive this mount (another tab selected, the lens failed); its port is
+        // closed by then, and posting to it would throw.
+        const reply = (payload) => {
+          if (lensHost.mount !== mount) return false;
+          mount.port.postMessage(payload);
+          return true;
+        };
+        lensData().then(
+          (data) => reply({ type: "trace", data }),
+          (err) => reply({ type: "traceError", message: String(err.message || err) }),
+        ).then((sent) => {
+          if (!sent) return;
+          mount.delivered = true;
+          mount.settleTimer = setTimeout(rendered, lensSettleMs);
+        });
+      } else if (message.type === "resize") {
+        const height = Number(message.height);
+        if (Number.isFinite(height)) {
+          frame.style.height = `${Math.min(Math.max(height, 0), lensMaxFrameHeight)}px`;
+        }
+        if (mount.delivered && height > 0) rendered();
+      } else if (message.type === "error") {
+        const reason = String(message.message || "error").slice(0, 200);
+        if (mount.rendered) console.warn(`lens ${lens.id}: ${reason}`);
+        else fail(`it raised an error: ${reason}`);
+      }
+    };
+    // The frame's origin is opaque, so "*" is the only target that reaches it. The message carries
+    // the port and nothing else; the trace only ever crosses the port.
+    frame.contentWindow.postMessage({ type: "beacon.lens.connect", version: 1 }, "*", [channel.port2]);
+  });
+  $("#lens-frame-slot").append(frame);
+}
+
 if (isDetectionsPage) {
   loadDetections().catch(console.error);
   setInterval(() => loadDetections().catch(console.error), 15000);
@@ -3337,6 +3725,7 @@ if (isDetectionsPage) {
   loadTokens().catch(console.error);
   setInterval(() => loadTokens().catch(console.error), 15000);
 } else if (isSessionDetailPage) {
+  initLensTabs().catch(console.error);
   loadSessionPage().catch(console.error);
   setInterval(() => loadSessionPage().catch(console.error), 15000);
 } else if (isInventoryPage) {

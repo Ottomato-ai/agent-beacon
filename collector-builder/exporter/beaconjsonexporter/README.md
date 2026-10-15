@@ -38,6 +38,13 @@ Token and cost usage:
   `cacheCreation`, `reasoning`); cost datapoints map to
   `gen_ai.usage.cost_usd`. Unknown token types keep the raw value in
   `raw.metric_value` only.
+- Gemini CLI's counts overlap differently: its input includes the cache and its
+  output excludes thinking tokens. The `gemini_cli.api_response` log record and
+  the `gemini_cli.token.usage` series (`input`, `output`, `thought`, `cache`,
+  `tool`) both map to input = prompt - cached + tool-use prompt, cache read =
+  cached, output = candidates + thoughts, and reasoning = thoughts. The
+  `gen_ai.client.inference.operation.details` record that restates the same
+  response carries no usage, so a response is counted once.
 - Datapoint events use the datapoint timestamp and record
   `raw.metric_temporality`, `raw.metric_monotonic`, `raw.metric_value`, and
   (for histograms) `raw.metric_count` so downstream aggregation can dedupe
@@ -48,6 +55,14 @@ Token and cost usage:
   not its anonymous histogram. The exporter keeps that one span by default,
   promotes `thread.id`/`turn.id`/model, and maps cache reads and cache writes to
   disjoint canonical usage fields. Legacy Codex metric events remain readable.
+- Span and log attributes under the OTel GenAI semconv input names
+  (`gen_ai.usage.input_tokens`, and the older `gen_ai.usage.prompt_tokens` /
+  `llm.usage.prompt_tokens`) count cached prompt tokens as part of input, so the
+  exporter subtracts the cache read and cache creation (`cache_write`) counts
+  reported beside them to store uncached input. An input smaller than those
+  cache counts is already uncached and is stored as reported. Claude Code's bare
+  `input_tokens` is Anthropic's uncached count and is never reduced; `raw` keeps
+  every value as the runtime sent it.
 
 Noise controls:
 

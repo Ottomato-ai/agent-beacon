@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/sessionfs"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/sqliteuri"
 	"io/fs"
 	"net/url"
 	"os"
@@ -152,7 +154,7 @@ func (s *Store) listTranscripts() ([]TraceRef, error) {
 	if !dirExists(s.ProjectsDir) {
 		return nil, nil
 	}
-	projectDirs, err := os.ReadDir(s.ProjectsDir)
+	projectDirs, err := sessionfs.ReadDir(s.ProjectsDir)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, nil
@@ -195,7 +197,7 @@ type transcriptEntry struct {
 }
 
 func listTranscriptFiles(dir string) []transcriptEntry {
-	entries, err := os.ReadDir(dir)
+	entries, err := sessionfs.ReadDir(dir)
 	if err != nil {
 		return nil
 	}
@@ -213,7 +215,7 @@ func listTranscriptFiles(dir string) []transcriptEntry {
 		if !entry.IsDir() {
 			continue
 		}
-		children, err := os.ReadDir(path)
+		children, err := sessionfs.ReadDir(path)
 		if err == nil {
 			for _, child := range children {
 				childPath := filepath.Join(path, child.Name())
@@ -229,7 +231,7 @@ func listTranscriptFiles(dir string) []transcriptEntry {
 }
 
 func listSubagentTranscriptEntries(dir, parentID string) []transcriptEntry {
-	entries, err := os.ReadDir(dir)
+	entries, err := sessionfs.ReadDir(dir)
 	if err != nil {
 		return nil
 	}
@@ -366,7 +368,7 @@ func readBubble(db *sql.DB, composerID, bubbleID string) (bubbleData, bool) {
 }
 
 func (s *Store) readTranscript(ref TraceRef) ([]Record, error) {
-	data, err := os.ReadFile(ref.SourcePath)
+	data, err := sessionfs.ReadFile(ref.SourcePath)
 	if err != nil {
 		return nil, err
 	}
@@ -427,23 +429,18 @@ func (s *Store) readTranscript(ref TraceRef) ([]Record, error) {
 }
 
 func openSQLiteReadOnly(path string) (*sql.DB, error) {
-	uriPath := filepath.ToSlash(path)
-	if !strings.HasPrefix(uriPath, "/") {
-		uriPath = "/" + uriPath
+	path, err := sessionfs.SQLitePath(path)
+	if err != nil {
+		return nil, err
 	}
-	u := url.URL{Scheme: "file", Path: uriPath}
-	q := u.Query()
-	q.Set("mode", "ro")
-	q.Set("_pragma", "busy_timeout(1000)")
-	u.RawQuery = q.Encode()
-	return sql.Open("sqlite", u.String())
+	return sql.Open("sqlite", sqliteuri.File(path, url.Values{"mode": {"ro"}, "_pragma": {"busy_timeout(1000)"}}))
 }
 
 func fileExists(path string) bool {
 	if strings.TrimSpace(path) == "" {
 		return false
 	}
-	info, err := os.Stat(path)
+	info, err := sessionfs.Stat(path)
 	return err == nil && info.Mode().IsRegular()
 }
 
@@ -451,6 +448,6 @@ func dirExists(path string) bool {
 	if strings.TrimSpace(path) == "" {
 		return false
 	}
-	info, err := os.Stat(path)
+	info, err := sessionfs.Stat(path)
 	return err == nil && info.IsDir()
 }

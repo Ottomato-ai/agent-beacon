@@ -62,7 +62,7 @@ func walkFields(t reflect.Type, prefix string, seen map[reflect.Type]bool, out *
 		if !f.IsExported() {
 			continue
 		}
-		name := jsonFieldName(f)
+		name := celFieldName(f)
 		if name == "" || name == "-" {
 			continue
 		}
@@ -87,16 +87,6 @@ func walkFields(t reflect.Type, prefix string, seen map[reflect.Type]bool, out *
 // honest if a time.Time or similar is added.
 func isLeafStruct(t reflect.Type) bool {
 	return t.String() == "time.Time"
-}
-
-// jsonFieldName returns the CEL field name for a struct field: the first segment of its
-// json tag, falling back to the Go field name (mirroring cel-go's json tag handler).
-func jsonFieldName(f reflect.StructField) string {
-	tag := f.Tag.Get("json")
-	if tag == "" {
-		return f.Name
-	}
-	return strings.Split(tag, ",")[0]
 }
 
 func celTypeName(t reflect.Type) string {
@@ -135,5 +125,26 @@ func RenderFieldsMarkdown() string {
 	for _, f := range EventFields() {
 		fmt.Fprintf(&b, "| `e.%s` | %s |\n", f.Path, f.Type)
 	}
+	b.WriteString("\n## Derived fields\n\n")
+	b.WriteString("These are computed by the engine from the event just before evaluation. They are\n")
+	b.WriteString("never written to or read from the log, so a fixture sets the source field, not these.\n\n")
+	for _, path := range DerivedFields() {
+		fmt.Fprintf(&b, "- `e.%s`: %s\n", path, derivedFieldDocs[path])
+	}
 	return b.String()
+}
+
+// derivedFieldDocs is the field reference's entry for each of DerivedFields, wrapped as it is
+// rendered. TestEveryDerivedFieldIsDocumented requires one per field.
+var derivedFieldDocs = map[string]string{
+	ToolResultTextPath: "`gen_ai.tool.call.result` as text, only on read-type tool\n" +
+		"  results (`file.read`, `mcp.tool_invoked`, MCP-named tools, web fetch/search tools, a\n" +
+		"  `tool.path` that is an http(s) URL) whose content was retained. String leaves of an\n" +
+		"  object or list result are joined one per line;\n" +
+		"  content blocks in a list contribute their text without metadata or encoded bytes.\n" +
+		fmt.Sprintf("  Capped at %d bytes and secret-redacted like other retained text; empty otherwise.", ToolResultTextLimit),
+	SystemInstructionsTextPath: "`gen_ai.system_instructions` as text: the `content` of each\n" +
+		"  `text` part, one per line (a bare string as is), when content was retained. These are\n" +
+		"  runtime-provided instructions such as a skill index, never operator prompt text.\n" +
+		fmt.Sprintf("  Each part is capped at %d bytes and secret-redacted like other retained text; empty otherwise.", SystemInstructionsPartLimit),
 }

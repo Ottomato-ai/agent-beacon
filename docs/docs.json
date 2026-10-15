@@ -61,38 +61,27 @@
             ]
           },
           {
-            "group": "How Beacon Works",
-            "icon": "book-open",
+            "group": "Beacon Cloud",
+            "icon": "cloud",
             "pages": [
-              "concepts/core-concepts",
               {
-                "group": "System Architecture",
-                "root": "architecture/system-architecture",
+                "group": "Onboarding",
                 "pages": [
-                  "architecture/architecture",
-                  "concepts/vector-forwarding"
+                  "cloud/devices",
+                  "manage/profile"
                 ]
               },
-              "concepts/cross-harness-memory",
-              "concepts/beacon-skills",
-              "concepts/session-handoff",
-              {
-                "group": "Unified Telemetry Schema",
-                "root": "telemetry-schema/event-schema",
-                "pages": [
-                  "telemetry-schema/normalization",
-                  "telemetry-schema/fields",
-                  "telemetry-schema/examples"
-                ]
-              },
-              "concepts/faq"
-            ]
-          },
-          {
-            "group": "Manage Beacon",
-            "icon": "sliders",
-            "pages": [
+              "cloud/sessions",
               "deployment/managed-mcp",
+              {
+                "group": "Lenses",
+                "pages": [
+                  "cloud/lenses/adding-lenses",
+                  "cloud/lenses/creating-lenses",
+                  "cloud/lenses/managing-lenses",
+                  "cloud/lenses/lenses-mcp"
+                ]
+              },
               {
                 "group": "Inventory",
                 "root": "guides/inventory",
@@ -111,6 +100,47 @@
                   "detections/engine"
                 ]
               }
+            ]
+          },
+          {
+            "group": "Sharing Sessions",
+            "icon": "share-nodes",
+            "pages": [
+              "sharing/index",
+              "sharing/cli",
+              "sharing/agent-skills",
+              "sharing/agent-hooks",
+              "sharing/git-hooks",
+              "sharing/api-key"
+            ]
+          },
+          {
+            "group": "How Beacon Works",
+            "icon": "book-open",
+            "pages": [
+              "concepts/core-concepts",
+              {
+                "group": "System Architecture",
+                "root": "architecture/system-architecture",
+                "pages": [
+                  "architecture/architecture",
+                  "concepts/vector-forwarding"
+                ]
+              },
+              "concepts/cross-harness-memory",
+              "concepts/beacon-skills",
+              "concepts/session-handoff",
+              "concepts/lenses",
+              {
+                "group": "Unified Telemetry Schema",
+                "root": "telemetry-schema/event-schema",
+                "pages": [
+                  "telemetry-schema/normalization",
+                  "telemetry-schema/fields",
+                  "telemetry-schema/examples"
+                ]
+              },
+              "concepts/faq"
             ]
           },
           {
@@ -337,6 +367,7 @@
                 ]
               },
               "cli/memory",
+              "cli/skills",
               {
                 "group": "beacon rules",
                 "root": "cli/rules",
@@ -358,8 +389,11 @@
                 ]
               },
               "cli/handoff",
+              "cli/share",
+              "cli/lenses",
               "cli/git",
               "cli/token-usage",
+              "cli/pricing",
               "cli/version"
             ]
           }
@@ -471,7 +505,9 @@
                 "group": "Object Storage",
                 "expanded": true,
                 "pages": [
-                  "guides/macos-object-storage-system"
+                  "guides/macos-object-storage-system",
+                  "log-forwarding/aws-s3-terraform",
+                  "log-forwarding/gcs-terraform"
                 ]
               },
               {
@@ -624,7 +660,7 @@
     "primary": {
       "type": "button",
       "label": "Sign In",
-      "href": "https://beacon.sh/signin"
+      "href": "https://beacon.sh/sign-in"
     }
   },
   "contextual": {
@@ -640,6 +676,10 @@
     ]
   },
   "redirects": [
+    {
+      "source": "/manage/configure-s3-data-connector",
+      "destination": "https://docs.asymptotelabs.ai/deployment/self-hosted-s3"
+    },
     {
       "source": "/log-forwarding/s3",
       "destination": "/guides/macos-object-storage-system"

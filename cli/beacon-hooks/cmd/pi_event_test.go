@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -25,6 +26,33 @@ func piEventActions(t *testing.T, logPath string) []string {
 		actions = append(actions, meta["action"].(string))
 	}
 	return actions
+}
+
+// The tool results are mapped by the code the whole Pi family shares, so Pi's bash output and the
+// file it read reach the same fields Oh My Pi's do, under the path as Pi was given it.
+func TestPiToolResultsAreRecordedWhereRulesReadThem(t *testing.T) {
+	logPath := piTestLog(t)
+	runHookWithInput(t, runPiEvent, map[string]interface{}{
+		"type": "tool_result", "toolName": "bash", "toolCallId": "call-1", "sessionId": "sess-1",
+		"input": map[string]interface{}{"command": "cat notes.md"}, "isError": false,
+		"content": ompTextBlocks("Pi shell output marker"),
+	})
+	runHookWithInput(t, runPiEvent, map[string]interface{}{
+		"type": "tool_result", "toolName": "read", "toolCallId": "call-2", "sessionId": "sess-1",
+		"input": map[string]interface{}{"path": "notes.md"}, "isError": false,
+		"content": ompTextBlocks("Pi file content marker"),
+	})
+
+	if got := nested(t, piEventWithAction(t, logPath, "command.executed"), "command")["output"]; got != "Pi shell output marker" {
+		t.Fatalf("command.output = %v, want the bash tool's output", got)
+	}
+	read := piEventWithAction(t, logPath, "file.read")
+	if got := nested(t, read, "file")["path"]; got != "notes.md" {
+		t.Fatalf("file.path = %v, want the path as Pi was given it", got)
+	}
+	if !reflect.DeepEqual(fieldsToolCallResult(read), map[string]interface{}{"content": ompTextBlocks("Pi file content marker")}) {
+		t.Fatalf("gen_ai.tool.call.result = %v, want the file the model read", fieldsToolCallResult(read))
+	}
 }
 
 func piEventWithAction(t *testing.T, logPath, action string) map[string]interface{} {
@@ -355,6 +383,47 @@ func TestPiEventMessageEndRecordsUsageAndReasoning(t *testing.T) {
 	}
 	if _, ok := usage["totalTokens"]; ok {
 		t.Fatalf("usage carries Pi's own totalTokens spelling: %v", usage)
+	}
+}
+
+// Pi's Usage carries cacheWrite1h, the subset of cacheWrite written with one-hour retention, when
+// the provider is Anthropic. It is recorded inside cache_creation as the subset it is, clamped to
+// cacheWrite, and left absent when the provider does not report it.
+func TestPiEventMessageEndRecordsTheOneHourCacheWriteSplit(t *testing.T) {
+	cases := []struct {
+		name    string
+		usage   map[string]interface{}
+		oneHour interface{} // nil: absent
+	}{
+		{"anthropic", map[string]interface{}{"input": float64(3), "output": float64(40), "cacheRead": float64(110000),
+			"cacheWrite": float64(20000), "cacheWrite1h": float64(16000), "totalTokens": float64(130043)}, float64(16000)},
+		{"clamped", map[string]interface{}{"input": float64(3), "output": float64(40),
+			"cacheWrite": float64(500), "cacheWrite1h": float64(900), "totalTokens": float64(543)}, float64(500)},
+		{"not reported", map[string]interface{}{"input": float64(3), "output": float64(40),
+			"cacheWrite": float64(500), "totalTokens": float64(543)}, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logPath := piTestLog(t)
+			runHookWithInput(t, runPiEvent, map[string]interface{}{
+				"type": "message_end", "sessionId": "sess-1",
+				"message": map[string]interface{}{"role": "assistant", "model": "claude-opus-4-6", "usage": tc.usage},
+			})
+			got := nested(t, piEventWithAction(t, logPath, "token.usage"), "gen_ai", "usage", "cache_creation")
+			if got["input_tokens"] != tc.usage["cacheWrite"] {
+				t.Fatalf("cache_creation = %v, want input_tokens %v", got, tc.usage["cacheWrite"])
+			}
+			oneHour, present := got["ephemeral_1h_input_tokens"]
+			if tc.oneHour == nil {
+				if present {
+					t.Fatalf("cache_creation = %v, want no one-hour split", got)
+				}
+				return
+			}
+			if oneHour != tc.oneHour {
+				t.Fatalf("cache_creation = %v, want ephemeral_1h_input_tokens %v", got, tc.oneHour)
+			}
+		})
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/codexsession"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/hooks"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/integrations/cowork"
 	"gopkg.in/yaml.v3"
@@ -40,6 +41,11 @@ type Harness struct {
 type ConfigureOptions struct {
 	Endpoint string
 	UserMode bool
+	// CaptureModelContext has Claude Code log its API bodies so the collector can keep the context
+	// Claude Code gives the model that no other event reports: the pages WebFetch fetches and the
+	// MCP tool descriptions the model is shown.
+	// Off removes an inline setting a previous install wrote.
+	CaptureModelContext bool
 }
 
 type ValidationResult struct {
@@ -135,7 +141,13 @@ func DiscoverCodex() Harness {
 	h := Harness{Name: "codex_cli", DisplayName: "Codex CLI", Capability: "otel_config"}
 	detectExecutable(&h, "codex")
 	home, _ := os.UserHomeDir()
-	h.ConfigPath = filepath.Join(home, ".codex", "config.toml")
+	dir, err := codexsession.HomeDir(home)
+	if err != nil {
+		h.TelemetryStatus = TelemetryMissing
+		h.Message = "Codex home directory could not be resolved: " + err.Error()
+		return h
+	}
+	h.ConfigPath = filepath.Join(dir, "config.toml")
 	if fileExists(h.ConfigPath) {
 		status, msg := codexStatus(h.ConfigPath)
 		h.TelemetryStatus = status
@@ -385,6 +397,26 @@ func ConfigureClaude(opts ConfigureOptions) (string, error) {
 	// identity/arguments needed to reconstruct agent activity from OTel events.
 	env["OTEL_LOG_TOOL_DETAILS"] = "1"
 	env["OTEL_LOG_USER_PROMPTS"] = "1"
+	// Inline API bodies carry the page WebFetch sends to its summarizer model and the
+	// MCP tool definitions the model is shown, the only place Claude Code reports
+	// either, and also the system prompt and the whole conversation. The collector's
+	// claude_api_body processor keeps only that context, but Claude Code is asked for
+	// them only on opt-in. Neither branch overrides 0, file:<dir> or a user's own
+	// limit; without the opt-in an inline value goes, so opting out works.
+	rawBodies, configured := env["OTEL_LOG_RAW_API_BODIES"]
+	switch {
+	case opts.CaptureModelContext && !configured:
+		env["OTEL_LOG_RAW_API_BODIES"] = "1"
+	case !opts.CaptureModelContext && claudeInlineRawBodies(rawBodies):
+		delete(env, "OTEL_LOG_RAW_API_BODIES")
+	}
+	contentLimit, limited := env["CLAUDE_CODE_OTEL_CONTENT_MAX_LENGTH"]
+	switch {
+	case opts.CaptureModelContext && !limited && claudeInlineRawBodies(env["OTEL_LOG_RAW_API_BODIES"]):
+		env["CLAUDE_CODE_OTEL_CONTENT_MAX_LENGTH"] = claudeModelContextContentLimit
+	case !opts.CaptureModelContext && fmt.Sprint(contentLimit) == claudeModelContextContentLimit:
+		delete(env, "CLAUDE_CODE_OTEL_CONTENT_MAX_LENGTH")
+	}
 	settings["env"] = env
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return "", err
@@ -401,7 +433,11 @@ func ConfigureCodex(opts ConfigureOptions) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	path := filepath.Join(home, ".codex", "config.toml")
+	dir, err := codexsession.HomeDir(home)
+	if err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, "config.toml")
 	var existing string
 	if data, err := os.ReadFile(path); err == nil {
 		existing = string(data)
@@ -784,6 +820,24 @@ func commandVersion(path string) string {
 		return "unknown"
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// claudeModelContextContentLimit is the inline content limit Beacon sets for Claude Code with
+// --claude-capture-model-context. A request body lists the conversation and system prompt before
+// the tools array, and Claude Code puts MCP tools after its built-in ones, so at its default limit
+// the MCP tools are the first thing cut. In a one-prompt session they already start about 72 KB in;
+// the first request of a session is the one that matters, since the collector lists each tool once
+// per session.
+const claudeModelContextContentLimit = "262144"
+
+// claudeInlineRawBodies reports whether an OTEL_LOG_RAW_API_BODIES value has Claude Code put
+// API bodies inline in its log events, rather than leave them off or write them to files.
+func claudeInlineRawBodies(value interface{}) bool {
+	switch strings.ToLower(strings.TrimSpace(fmt.Sprint(value))) {
+	case "1", "true":
+		return true
+	}
+	return false
 }
 
 func backup(path string, data []byte) error {

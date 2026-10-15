@@ -85,6 +85,10 @@ BEACON_S3_PREFIX="beacon-prod/runtime" # avoid
 
 ## AWS permission
 
+<Tip>
+  Managing AWS with Terraform? [AWS S3 with Terraform](/log-forwarding/aws-s3-terraform) creates the bucket and an IAM user with this policy. Create its access key with the AWS CLI, then continue here.
+</Tip>
+
 Scope write access to the Beacon prefix:
 
 ```json
@@ -455,7 +459,7 @@ Check the forwarder:
 
 ```bash
 sudo launchctl print system/com.beacon.endpoint.s3-forwarder
-sudo tail -n 100 /tmp/com.beacon.endpoint.s3-forwarder.err
+sudo tail -n 100 /Library/Logs/Beacon/com.beacon.endpoint.s3-forwarder.err
 ```
 
 If `launchctl` reports `Could not find service "com.beacon.endpoint.s3-forwarder"`,

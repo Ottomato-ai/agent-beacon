@@ -46,18 +46,59 @@ var (
 func Env() (*cel.Env, error) {
 	celEnvOnce.Do(func() {
 		celEnvInst, celEnvErr = cel.NewEnv(
-			ext.NativeTypes(reflect.TypeOf(asymptoteobserve.Event{}), ext.ParseStructTag("json")),
+			ext.NativeTypes(reflect.TypeOf(asymptoteobserve.Event{}), ext.ParseStructField(celFieldName)),
 			cel.Variable(eventVar, cel.ObjectType(eventCELType)),
 		)
 	})
 	return celEnvInst, celEnvErr
 }
 
+// celFieldName is the CEL name of an event struct field: its `cel` tag when it has one,
+// otherwise the first segment of its json tag, otherwise the Go field name.
+//
+// The json tag is the rule for every field that is on the wire, so expressions read like the
+// event JSON. The `cel` tag exists for the one kind of field that is not: a value the engine
+// derives for rules to match on and never serializes (json:"-"), such as
+// gen_ai.tool.call.result_text. EventFields uses the same function, so the field reference
+// and the environment cannot disagree about a name.
+func celFieldName(f reflect.StructField) string {
+	if tag, ok := f.Tag.Lookup("cel"); ok {
+		if name := strings.Split(tag, ",")[0]; name != "" {
+			return name
+		}
+	}
+	if tag, ok := f.Tag.Lookup("json"); ok {
+		return strings.Split(tag, ",")[0]
+	}
+	return f.Name
+}
+
+// MaxEvalCost is the CEL runtime cost one evaluation of one match expression against one
+// event may spend before it is stopped with an error. Cost is cel-go's deterministic
+// measure of the work an expression does (comprehension iterations, string bytes
+// traversed, regex size times input size), so the limit holds on every machine and is
+// not a wall-clock timeout.
+//
+// Without it a rule could hang a scan: seven nested .all() macros over ten-element list
+// literals run ten million iterations per event, about six seconds each, and nested
+// .map() can exhaust memory. A rule arrives as data (`beacon rules pull`), so the engine
+// cannot trust it to be cheap.
+//
+// The value is generous. Across the open corpus and the embedded baseline the most
+// expensive expression spends 3,506 on its own fixtures, and 537,433 on a pessimistic
+// event whose every string field is 64 KiB at once (the writer caps the whole event line
+// at 64 KiB, so no real event gets close): the limit leaves over 1,400 times headroom on
+// the first and about 9 times on the second. TestCorpusStaysUnderEvalCostLimit pins that
+// headroom. At this limit the seven-deep .all() above stops with an error after roughly
+// two seconds instead of running to completion.
+const MaxEvalCost uint64 = 5_000_000
+
 // CompileMatch compiles a single match expression and verifies it types to bool. The
-// returned program is safe for concurrent reuse across events. A compile or type-check
-// error (including a reference to an unknown event field) is returned to the caller; this
-// is what makes "every shipped rule provably compiles against the schema" a load-time
-// guarantee.
+// returned program is safe for concurrent reuse across events, and each evaluation is
+// bounded by MaxEvalCost: one that exceeds it fails with an error rather than matching. A
+// compile or type-check error (including a reference to an unknown event field) is
+// returned to the caller; this is what makes "every shipped rule provably compiles
+// against the schema" a load-time guarantee.
 func CompileMatch(expr string) (cel.Program, error) {
 	if strings.TrimSpace(expr) == "" {
 		return nil, fmt.Errorf("empty match expression")
@@ -73,7 +114,7 @@ func CompileMatch(expr string) (cel.Program, error) {
 	if ast.OutputType() != cel.BoolType {
 		return nil, fmt.Errorf("match expression must evaluate to bool, got %s", ast.OutputType())
 	}
-	prog, err := env.Program(ast)
+	prog, err := env.Program(ast, cel.CostLimit(MaxEvalCost))
 	if err != nil {
 		return nil, fmt.Errorf("build CEL program: %w", err)
 	}
@@ -82,7 +123,16 @@ func CompileMatch(expr string) (cel.Program, error) {
 
 // EvalMatch runs a compiled match program against one event and reports whether it
 // matched. A non-bool result is treated as an evaluation error.
+//
+// Derived fields (gen_ai.tool.call.result_text, gen_ai.system_instructions_text) are filled
+// on a copy of the event first, so a caller holding only a program sees the same values a
+// CompiledRule does. CompiledRule skips that step for rules that never reference a derived
+// field.
 func EvalMatch(prog cel.Program, event asymptoteobserve.Event) (bool, error) {
+	return evalMatch(prog, withDerivedFields(event))
+}
+
+func evalMatch(prog cel.Program, event asymptoteobserve.Event) (bool, error) {
 	out, _, err := prog.Eval(map[string]any{eventVar: event})
 	if err != nil {
 		return false, fmt.Errorf("eval match: %w", err)

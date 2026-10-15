@@ -35,6 +35,7 @@ type TraceSummaryV1 struct {
 	Session            *TraceSessionV1       `json:"session,omitempty"`
 	Trace              *TraceIdentityV1      `json:"trace,omitempty"`
 	Repository         *TraceRepositoryV1    `json:"repository,omitempty"`
+	Project            *TraceProjectV1       `json:"project,omitempty"`
 	Namespace          *TraceNamespaceV1     `json:"namespace,omitempty"`
 	Model              *TraceModelV1         `json:"model,omitempty"`
 	TokenUsage         *TraceUsageV1         `json:"token_usage,omitempty"`
@@ -66,6 +67,12 @@ type TraceRepositoryV1 struct {
 	Path      string `json:"path,omitempty"`
 }
 
+// TraceProjectV1 names the project a trace worked in: the name of its directory (the repository's
+// root, or else the session's working directory), never a path.
+type TraceProjectV1 struct {
+	Name string `json:"name,omitempty"`
+}
+
 type TraceNamespaceV1 struct {
 	ID   string `json:"id,omitempty"`
 	Slug string `json:"slug,omitempty"`
@@ -90,6 +97,9 @@ type TraceSharingV1 struct {
 	SharedAt        string        `json:"shared_at,omitempty"`
 	LastRefreshedAt string        `json:"last_refreshed_at,omitempty"`
 	CreatedBy       *TraceActorV1 `json:"created_by,omitempty"`
+	// RefreshCommand is the `beacon share refresh` command that uploads what a shared session
+	// gained since, for a reader to copy. Local views show it; they never run it.
+	RefreshCommand string `json:"refresh_command,omitempty"`
 }
 
 type TraceActorV1 struct {
@@ -104,27 +114,32 @@ type TraceContentSummaryV1 struct {
 }
 
 type TraceEventV1 struct {
-	ID            string             `json:"id"`
-	Number        int                `json:"number"`
-	Timestamp     string             `json:"timestamp"`
-	Type          string             `json:"type"`
-	Action        string             `json:"action"`
-	Category      string             `json:"category,omitempty"`
-	Fidelity      string             `json:"fidelity,omitempty"`
-	Trace         *TraceEventTraceV1 `json:"trace,omitempty"`
-	ToolCallID    string             `json:"tool_call_id,omitempty"`
-	Actor         string             `json:"actor,omitempty"`
-	Title         string             `json:"title,omitempty"`
-	Summary       string             `json:"summary,omitempty"`
-	Content       *TraceContentV1    `json:"content,omitempty"`
-	Tool          *TraceToolV1       `json:"tool,omitempty"`
-	Command       *TraceCommandV1    `json:"command,omitempty"`
-	File          *TraceFileV1       `json:"file,omitempty"`
-	MCP           *TraceMCPV1        `json:"mcp,omitempty"`
-	Approval      *TraceApprovalV1   `json:"approval,omitempty"`
-	Model         string             `json:"model,omitempty"`
-	Usage         *TraceUsageV1      `json:"usage,omitempty"`
-	SourceEventID string             `json:"source_event_id"`
+	ID         string             `json:"id"`
+	Number     int                `json:"number"`
+	Timestamp  string             `json:"timestamp"`
+	Type       string             `json:"type"`
+	Action     string             `json:"action"`
+	Category   string             `json:"category,omitempty"`
+	Fidelity   string             `json:"fidelity,omitempty"`
+	Trace      *TraceEventTraceV1 `json:"trace,omitempty"`
+	ToolCallID string             `json:"tool_call_id,omitempty"`
+	// PromptID is prompt.id: the runtime's name for the turn the event belongs to, from its prompt
+	// through everything done for it.
+	PromptID      string           `json:"prompt_id,omitempty"`
+	Actor         string           `json:"actor,omitempty"`
+	Title         string           `json:"title,omitempty"`
+	Summary       string           `json:"summary,omitempty"`
+	Content       *TraceContentV1  `json:"content,omitempty"`
+	Tool          *TraceToolV1     `json:"tool,omitempty"`
+	Command       *TraceCommandV1  `json:"command,omitempty"`
+	File          *TraceFileV1     `json:"file,omitempty"`
+	MCP           *TraceMCPV1      `json:"mcp,omitempty"`
+	Approval      *TraceApprovalV1 `json:"approval,omitempty"`
+	Policy        *TracePolicyV1   `json:"policy,omitempty"`
+	Error         *TraceErrorV1    `json:"error,omitempty"`
+	Model         string           `json:"model,omitempty"`
+	Usage         *TraceUsageV1    `json:"usage,omitempty"`
+	SourceEventID string           `json:"source_event_id"`
 }
 
 type TraceEventTraceV1 struct {
@@ -182,13 +197,33 @@ type TraceApprovalV1 struct {
 	Reason   string `json:"reason,omitempty"`
 }
 
+// TracePolicyV1 is the policy decision an event recorded, such as a deny from the policy seam's
+// provider (policy.enforcement "enforce") or an audit-only verdict.
+type TracePolicyV1 struct {
+	ID          string `json:"id,omitempty"`
+	Name        string `json:"name,omitempty"`
+	Decision    string `json:"decision,omitempty"`
+	Enforcement string `json:"enforcement,omitempty"`
+	Reason      string `json:"reason,omitempty"`
+}
+
+// TraceErrorV1 is the failure an event recorded, such as a tool or MCP call that a runtime
+// reported as failed while keeping the call's own action.
+type TraceErrorV1 struct {
+	Type string `json:"type,omitempty"`
+}
+
+// TraceUsageV1 is gen_ai.usage flattened. CacheCreation1hInputTokens is the subset of
+// CacheCreationInputTokens written with a one-hour TTL, where the source reported it; like
+// ReasoningOutputTokens it is a breakdown and never part of a total.
 type TraceUsageV1 struct {
-	InputTokens              int64   `json:"input_tokens,omitempty"`
-	OutputTokens             int64   `json:"output_tokens,omitempty"`
-	CacheReadInputTokens     int64   `json:"cache_read_input_tokens,omitempty"`
-	CacheCreationInputTokens int64   `json:"cache_creation_input_tokens,omitempty"`
-	ReasoningOutputTokens    int64   `json:"reasoning_output_tokens,omitempty"`
-	CostUSD                  float64 `json:"cost_usd,omitempty"`
+	InputTokens                int64   `json:"input_tokens,omitempty"`
+	OutputTokens               int64   `json:"output_tokens,omitempty"`
+	CacheReadInputTokens       int64   `json:"cache_read_input_tokens,omitempty"`
+	CacheCreationInputTokens   int64   `json:"cache_creation_input_tokens,omitempty"`
+	CacheCreation1hInputTokens int64   `json:"cache_creation_1h_input_tokens,omitempty"`
+	ReasoningOutputTokens      int64   `json:"reasoning_output_tokens,omitempty"`
+	CostUSD                    float64 `json:"cost_usd,omitempty"`
 }
 
 type TraceSpanV1 struct {

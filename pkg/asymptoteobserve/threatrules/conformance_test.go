@@ -4,7 +4,10 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
+
+	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve"
 )
 
 // repoRoot locates the repository root by walking up from this test file until it finds
@@ -62,5 +65,116 @@ func TestPackConformance(t *testing.T) {
 				})
 			}
 		})
+	}
+}
+
+// TestPackMatchesWhatTheLogHolds runs every fixture again after the sanitizer every log writer
+// applies, and requires the same verdict. `beacon scan` and the dashboard only ever see the
+// sanitized line, so a rule that matches a raw value redaction removes (a token, a key) is dead on
+// real logs even though its plain fixtures pass.
+func TestPackMatchesWhatTheLogHolds(t *testing.T) {
+	rules, err := LoadDir(rulesDir(t))
+	if err != nil {
+		t.Fatalf("load rule pack: %v", err)
+	}
+	for _, rule := range rules {
+		compiled, err := Compile(rule)
+		if err != nil {
+			t.Fatalf("rule %q: compile: %v", rule.ID, err)
+		}
+		for _, fixture := range rule.Tests {
+			events := fixture.EventList()
+			for i := range events {
+				events[i] = asymptoteobserve.SanitizeEvent(events[i], 64*1024)
+			}
+			got, err := compiled.Evaluate(events)
+			if err != nil {
+				t.Errorf("%s/%s: evaluate sanitized events: %v", rule.ID, fixture.Name, err)
+				continue
+			}
+			if got != fixture.Verdict {
+				t.Errorf("%s/%s: verdict %q on the sanitized events the log holds, want %q", rule.ID, fixture.Name, got, fixture.Verdict)
+			}
+		}
+	}
+}
+
+// TestPackSharedCredentialRead pins correlation read steps that are meant to reuse
+// credential-file-read's definition of a secret. The format has no include mechanism, so
+// the expression is copied; this fails when one copy changes without the other.
+func TestPackSharedCredentialRead(t *testing.T) {
+	rules, err := LoadDir(rulesDir(t))
+	if err != nil {
+		t.Fatalf("load rule pack: %v", err)
+	}
+	byID := make(map[string]*Rule, len(rules))
+	for _, r := range rules {
+		byID[r.ID] = r
+	}
+	base := byID["credential-file-read"]
+	if base == nil {
+		t.Fatal("credential-file-read missing from the pack")
+	}
+	for _, ref := range []struct{ rule, step string }{
+		{"secret-read-then-destructive", "read_secret"},
+	} {
+		r := byID[ref.rule]
+		if r == nil || r.Correlation == nil {
+			t.Fatalf("%s missing or not a correlation rule", ref.rule)
+		}
+		var got string
+		for _, s := range r.Correlation.Steps {
+			if s.ID == ref.step {
+				got = s.Match
+			}
+		}
+		if normalizeCEL(got) != normalizeCEL(base.Match) {
+			t.Errorf("%s step %s drifted from credential-file-read's match:\n  got:  %s\n  want: %s",
+				ref.rule, ref.step, normalizeCEL(got), normalizeCEL(base.Match))
+		}
+	}
+}
+
+// normalizeCEL collapses whitespace so YAML indentation differences do not count.
+func normalizeCEL(expr string) string { return strings.Join(strings.Fields(expr), " ") }
+
+// TestPackCategoriesMatchDirectories pins taxonomy.beacon_category to the directory each rule
+// lives in. The rule store keeps rules flat, so the category travels inside the rule: it is what
+// groups findings by kind of risk (the Security Review lens, for one) once a rule is installed.
+func TestPackCategoriesMatchDirectories(t *testing.T) {
+	paths, err := filepath.Glob(filepath.Join(rulesDir(t), "*", "*.rule.yaml"))
+	if err != nil || len(paths) == 0 {
+		t.Fatalf("rule files: %v, %v", paths, err)
+	}
+	for _, path := range paths {
+		rule, err := LoadRule(path)
+		if err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		want := filepath.Base(filepath.Dir(path))
+		if got := rule.Taxonomy["beacon_category"]; got != want {
+			t.Errorf("%s: taxonomy.beacon_category = %q, want its directory %q", path, got, want)
+		}
+	}
+}
+
+// TestBaselineRulesAreCorpusCopies keeps the embedded baseline byte-identical to the rules it was
+// taken from, so a fix to a corpus rule cannot leave a stale copy in every binary.
+func TestBaselineRulesAreCorpusCopies(t *testing.T) {
+	baseline, err := filepath.Glob(filepath.Join(repoRoot(t), "pkg", "asymptoteobserve", "rulestore", "baseline", "*.rule.yaml"))
+	if err != nil || len(baseline) == 0 {
+		t.Fatalf("baseline rules: %v, %v", baseline, err)
+	}
+	for _, path := range baseline {
+		matches, _ := filepath.Glob(filepath.Join(rulesDir(t), "*", filepath.Base(path)))
+		if len(matches) != 1 {
+			t.Errorf("%s: want exactly one corpus copy, found %v", filepath.Base(path), matches)
+			continue
+		}
+		got, _ := os.ReadFile(path)
+		want, _ := os.ReadFile(matches[0])
+		if string(got) != string(want) {
+			t.Errorf("%s differs from %s; copy the corpus rule over", path, matches[0])
+		}
 	}
 }

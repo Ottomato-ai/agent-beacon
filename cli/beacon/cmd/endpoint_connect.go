@@ -17,6 +17,7 @@ import (
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/auth"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/asymptote"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/lifecycle"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/service"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/managedprivacy"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/onboarding"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/version"
@@ -73,6 +74,7 @@ func init() {
 	endpointConnectCmd.Flags().StringVar(&connectOpts.dashboardURL, "dashboard-url", "", "Beacon service URL (defaults to "+auth.DefaultDashboardURL+", or "+auth.DashboardURLEnv+")")
 	endpointConnectCmd.Flags().BoolVar(&connectOpts.noBrowser, "no-browser", false, "System mode: print the device approval URL instead of opening a browser")
 	endpointConnectCmd.Flags().StringVar(&connectOpts.vectorBin, "vector-bin", "", "Vector binary to run (defaults to "+asymptote.VectorBinEnv+", "+asymptote.PackagedVectorPath+", Homebrew, then PATH)")
+	endpointConnectCmd.Flags().BoolVar(&endpointOpts.noBackfill, "no-backfill", false, "Do not upload the last 30 days of agent sessions read from their local session stores (also "+endpointBackfillEnv+"=0)")
 	endpointConnectCmd.Flags().StringVar(&connectOpts.privacyMode, "privacy-mode", "", "Beacon Cloud forwarding privacy: standard or metadata-only (defaults to onboarding choice)")
 	endpointDisconnectCmd.Flags().BoolVar(&connectOpts.keepCredentials, "keep-credentials", false, "Keep the enrollment record and device key so a later connect can reuse this device")
 	endpointCmd.AddCommand(endpointConnectCmd)
@@ -84,13 +86,14 @@ func runEndpointConnect(cmd *cobra.Command, args []string) error {
 	if !userMode && !lifecycle.HasSystemPrivileges() {
 		return fmt.Errorf("connecting a system endpoint needs root: rerun with sudo, or pass --user for a per-user install")
 	}
-	return connectEndpoint(cmd, userMode, loadOrDefaultConfig().LogPath)
+	return connectEndpoint(cmd, userMode, loadOrDefaultConfig().LogPath, false)
 }
 
 // connectEndpoint runs the enrollment and forwarder setup for the given mode and log
 // path, printing the outcome. `endpoint install --connect` and the onboarding offer
-// call it after a successful install; `endpoint connect` calls it directly.
-func connectEndpoint(cmd *cobra.Command, userMode bool, logPath string) error {
+// call it after a successful install; `endpoint connect` calls it directly. backfilled
+// says the caller has just run the session backfill, so connect only ships it.
+func connectEndpoint(cmd *cobra.Command, userMode bool, logPath string, backfilled bool) error {
 	hostname, _ := os.Hostname()
 	out := cmd.OutOrStdout()
 	if endpointOpts.jsonOutput {
@@ -105,6 +108,7 @@ func connectEndpoint(cmd *cobra.Command, userMode bool, logPath string) error {
 		LogPath:     logPath,
 		VectorBin:   connectOpts.vectorBin,
 		PrivacyMode: privacyMode,
+		Backfill:    endpointConnectBackfill(out, userMode, logPath, backfilled),
 		Out:         out,
 		Enroll: asymptote.EnrollOptions{
 			DashboardURL: connectOpts.dashboardURL,
@@ -160,9 +164,14 @@ func connectEndpoint(cmd *cobra.Command, userMode bool, logPath string) error {
 	fmt.Fprintf(out, "Device key: %s (never printed; the Vector forwarder reads it)\n", result.SecretsFile)
 	// Close on what to do next rather than on more state. Setup is finished here,
 	// and this is the moment the user has the most intent and the least idea what
-	// happens now. Nothing is forwarded yet: the runtime source starts at the
-	// connection point, so the dashboard stays empty until an agent actually runs.
+	// happens now. The runtime source starts at the connection point, so apart from
+	// the staged session backfill the dashboard fills as agents run.
 	fmt.Fprintln(out)
+	if result.Backfill != nil && result.Backfill.Events > 0 {
+		fmt.Fprintf(out, "Uploading %d events of recent session history; they appear at %s within a few minutes.\n", result.Backfill.Events, dashboardHomeURL(result.Enrollment.DashboardURL))
+		fmt.Fprintln(out, "Next: keep using your agents as you normally would; new sessions appear within a minute of the activity.")
+		return nil
+	}
 	fmt.Fprintln(out, "Next: run any supported agent as you normally would.")
 	fmt.Fprintf(out, "Its sessions appear at %s within a minute of the activity.\n", dashboardHomeURL(result.Enrollment.DashboardURL))
 	return nil
@@ -262,6 +271,39 @@ func connectBrowserOpener(userMode bool) func(string) error {
 		cmd.Stdout, cmd.Stderr = nil, nil
 		return cmd.Start()
 	}
+}
+
+// cloudStatusLine is the Beacon Cloud line of `beacon endpoint status`, or "" when it has nothing
+// to say.
+//
+// A connected or half-connected endpoint always gets the line. An unconnected one gets it only on a
+// per-user install that sends nowhere else: a system install is an MDM or package rollout, often
+// forwarding to the customer's own S3, GCS or Falcon, and its hint, a per-user
+// `beacon endpoint connect`, fails there for want of a personal sign-in. Admins read that line as
+// a step left undone.
+func cloudStatusLine(status asymptote.ManagedIngestStatus, userMode, ownForwarder bool) string {
+	if !status.Enabled && status.Message == "" && (!userMode || ownForwarder) {
+		return ""
+	}
+	return managedIngestStatusLine(status)
+}
+
+// scriptForwarderStatusLine renders one package-helper forwarder for `beacon endpoint status`.
+func scriptForwarderStatusLine(status service.Status) string {
+	name := status.Label
+	switch status.Label {
+	case "com.beacon.endpoint.s3-forwarder":
+		name = "S3 forwarder"
+	case "com.beacon.endpoint.gcs-forwarder":
+		name = "GCS forwarder"
+	case "com.beacon.endpoint.falcon-forwarder":
+		name = "Falcon LogScale forwarder"
+	}
+	line := fmt.Sprintf("%s: loaded=%t running=%t", name, status.Loaded, status.Running)
+	if !status.Loaded && status.Message != "" {
+		line += " (" + status.Message + ")"
+	}
+	return line
 }
 
 // managedIngestStatusLine renders the human status line for `beacon endpoint status`.

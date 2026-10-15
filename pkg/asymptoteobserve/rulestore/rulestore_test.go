@@ -95,9 +95,87 @@ func TestInstallThenLoadActiveUsesStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load active: %v", err)
 	}
-	if len(loaded) != 1 || loaded[0].Source != SourceStore || loaded[0].Rule.ID != "custom-rule" {
-		t.Fatalf("expected store rule, got %+v", loaded)
+	fromStore := bySource(loaded, SourceStore)
+	if len(fromStore) != 1 || fromStore[0].ID != "custom-rule" {
+		t.Fatalf("expected the store rule, got %+v", srcOf(loaded))
 	}
+}
+
+// TestLoadActiveKeepsBaselineAlongsideStore guards against one installed rule silently
+// switching off the whole embedded baseline: every baseline rule the store does not
+// define stays active.
+func TestLoadActiveKeepsBaselineAlongsideStore(t *testing.T) {
+	base, err := Baseline()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := t.TempDir()
+	if err := os.WriteFile(filepath.Join(store, "custom-rule.rule.yaml"), []byte(ruleWithID("custom-rule")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadActive(store, "")
+	if err != nil {
+		t.Fatalf("load active: %v", err)
+	}
+	if len(loaded) != len(base)+1 {
+		t.Fatalf("want %d rules (store + full baseline), got %d", len(base)+1, len(loaded))
+	}
+	baseIDs := map[string]bool{}
+	for _, r := range bySource(loaded, SourceBaseline) {
+		baseIDs[r.ID] = true
+	}
+	for _, r := range base {
+		if !baseIDs[r.ID] {
+			t.Errorf("baseline rule %q is missing from the active set", r.ID)
+		}
+	}
+}
+
+// TestLoadActiveStoreOverridesBaselineByID: a store rule with a baseline rule's id
+// replaces that one baseline rule (store wins), and only that one.
+func TestLoadActiveStoreOverridesBaselineByID(t *testing.T) {
+	base, err := Baseline()
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := base[0].ID
+	if !IsBaselineID(id) || IsBaselineID("custom-rule") {
+		t.Fatalf("IsBaselineID disagrees with Baseline()")
+	}
+	store := t.TempDir()
+	if err := os.WriteFile(filepath.Join(store, id+RuleFileSuffix), []byte(ruleWithID(id)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadActive(store, "")
+	if err != nil {
+		t.Fatalf("load active: %v", err)
+	}
+	if len(loaded) != len(base) {
+		t.Fatalf("want %d rules, got %d", len(base), len(loaded))
+	}
+	seen := 0
+	for _, lr := range loaded {
+		if lr.Rule.ID != id {
+			continue
+		}
+		seen++
+		if lr.Source != SourceStore || lr.Rule.Title != "T" {
+			t.Errorf("rule %q should come from the store, got source %s title %q", id, lr.Source, lr.Rule.Title)
+		}
+	}
+	if seen != 1 {
+		t.Fatalf("rule %q active %d times, want once", id, seen)
+	}
+}
+
+func bySource(l []LoadedRule, src Source) []*threatrules.Rule {
+	var out []*threatrules.Rule
+	for _, lr := range l {
+		if lr.Source == src {
+			out = append(out, lr.Rule)
+		}
+	}
+	return out
 }
 
 func TestInstallFilesIgnoresAppleDoubleRuleFiles(t *testing.T) {
@@ -282,4 +360,81 @@ func srcOf(l []LoadedRule) []Source {
 		s[i] = l[i].Source
 	}
 	return s
+}
+
+// futureRule declares a spec newer than this engine supports and carries a field that
+// version might add, which a strict decode alone would report as unknown.
+const futureRule = `
+id: future-rule
+spec: threat-rules/v1.9
+version: 1
+title: T
+severity: low
+status: experimental
+posture: detect
+match: 'e.event.action == "file.read"'
+future_field: true
+emit:
+  reason: ok
+tests:
+  - name: p
+    verdict: match
+    events:
+      - event: { action: file.read }
+`
+
+func TestInstallFilesSkippingLeavesNewerSpecOut(t *testing.T) {
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "a.rule.yaml"), []byte(ruleWithID("current-rule")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "b.rule.yaml"), []byte(futureRule), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := t.TempDir()
+
+	if _, err := InstallFiles(store, src, false); err == nil || !strings.Contains(err.Error(), "upgrade Beacon") {
+		t.Fatalf("strict InstallFiles want the unsupported-spec error, got %v", err)
+	}
+	if HasRuleFiles(store) {
+		t.Fatal("strict InstallFiles must not write anything when it fails")
+	}
+
+	installed, skipped, err := InstallFilesSkipping(store, src, false)
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	if len(installed) != 1 || installed[0].ID != "current-rule" {
+		t.Fatalf("want current-rule installed, got %+v", installed)
+	}
+	if len(skipped) != 1 || skipped[0].Err.RuleID != "future-rule" {
+		t.Fatalf("want future-rule skipped, got %+v", skipped)
+	}
+	if _, err := os.Stat(filepath.Join(store, "future-rule"+RuleFileSuffix)); !os.IsNotExist(err) {
+		t.Fatalf("skipped rule must not land in the store (stat err %v)", err)
+	}
+}
+
+func TestLoadActiveSkippingRunsTheRestOfTheStore(t *testing.T) {
+	store := t.TempDir()
+	if err := os.WriteFile(filepath.Join(store, "current-rule.rule.yaml"), []byte(ruleWithID("current-rule")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(store, "future-rule.rule.yaml"), []byte(futureRule), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	loaded, skipped, err := LoadActiveSkipping(store, "")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	fromStore := bySource(loaded, SourceStore)
+	if len(fromStore) != 1 || fromStore[0].ID != "current-rule" {
+		t.Fatalf("want only current-rule from the store, got %d store rules", len(fromStore))
+	}
+	if len(skipped) != 1 || !strings.Contains(skipped[0].String(), `rule "future-rule" requires threat-rules/v1.9, but this Beacon supports up to `+threatrules.SupportedSpec+`; upgrade Beacon to load it`) {
+		t.Fatalf("want future-rule skipped with the upgrade message, got %+v", skipped)
+	}
+	if _, err := LoadActive(store, ""); err == nil {
+		t.Fatal("strict LoadActive want an error for the newer-spec rule")
+	}
 }
