@@ -5,6 +5,9 @@ import (
 	"path/filepath"
 	"sort"
 	"time"
+
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/claudesession"
+	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve"
 )
 
 const maxSkillsPerRoot = 200
@@ -67,8 +70,11 @@ func filterSkillRoots(items []skillRoot, runtimes []string) []skillRoot {
 }
 
 func skillRoots(home, wd string) []skillRoot {
-	items := []skillRoot{
-		{runtime: "claude_code", path: filepath.Join(home, ".claude", "skills"), scope: ScopeUser},
+	items := []skillRoot{}
+	if dir := claudesession.ConfigDir(home); dir != "" {
+		items = append(items, skillRoot{runtime: "claude_code", path: filepath.Join(dir, "skills"), scope: ScopeUser})
+	}
+	items = append(items, []skillRoot{
 		{runtime: "claude_code", path: filepath.Join(wd, ".claude", "skills"), scope: ScopeProject},
 		{runtime: "cursor", path: filepath.Join(home, ".cursor", "skills"), scope: ScopeUser},
 		{runtime: "cursor", path: filepath.Join(wd, ".cursor", "skills"), scope: ScopeProject},
@@ -76,7 +82,7 @@ func skillRoots(home, wd string) []skillRoot {
 		{runtime: "cursor", path: filepath.Join(wd, ".cursor", "skills-cursor"), scope: ScopeProject},
 		{runtime: "agent_skills", path: filepath.Join(home, ".agents", "skills"), scope: ScopeUser},
 		{runtime: "agent_skills", path: filepath.Join(wd, ".agents", "skills"), scope: ScopeProject},
-	}
+	}...)
 	seen := map[string]bool{}
 	out := make([]skillRoot, 0, len(items))
 	for _, item := range items {
@@ -99,7 +105,7 @@ func inspectSkillRoot(root skillRoot, redaction string, co contentOptions) []Ski
 		ParserStatus: StatusNotFound,
 		Redaction:    redaction,
 	}
-	info, err := os.Stat(root.path)
+	info, err := statPath(root.path)
 	if err != nil {
 		base.Reason = errReason(err)
 		if !os.IsNotExist(err) {
@@ -113,7 +119,7 @@ func inspectSkillRoot(root skillRoot, redaction string, co contentOptions) []Ski
 		base.Reason = "path is not a directory"
 		return []Skill{base}
 	}
-	entries, err := os.ReadDir(root.path)
+	entries, err := readDirPath(root.path)
 	if err != nil {
 		base.ParserStatus = StatusUnreadable
 		base.Reason = errReason(err)
@@ -124,14 +130,11 @@ func inspectSkillRoot(root skillRoot, redaction string, co contentOptions) []Ski
 		if len(skills) >= maxSkillsPerRoot {
 			break
 		}
-		if skipSkillDir(entry.Name()) {
-			continue
-		}
 		if !entry.IsDir() && entry.Type()&os.ModeSymlink == 0 {
 			continue
 		}
 		manifestPath := filepath.Join(root.path, entry.Name(), "SKILL.md")
-		if _, err := os.Stat(manifestPath); os.IsNotExist(err) {
+		if _, err := statPath(manifestPath); os.IsNotExist(err) {
 			continue
 		}
 		skills = append(skills, inspectSkillManifest(root, entry.Name(), manifestPath, redaction, co))
@@ -146,7 +149,7 @@ func inspectSkillManifest(root skillRoot, name, manifestPath, redaction string, 
 	skill := Skill{
 		Runtime:          root.runtime,
 		SkillName:        valueForName(name, redaction),
-		SkillNameHash:    hashString(name),
+		SkillNameHash:    asymptoteobserve.SkillNameHash(name),
 		RootPath:         valueForPath(root.path, redaction),
 		RootPathHash:     hashString(root.path),
 		SourceScope:      root.scope,
@@ -155,7 +158,7 @@ func inspectSkillManifest(root skillRoot, name, manifestPath, redaction string, 
 		ParserStatus:     StatusNotFound,
 		Redaction:        redaction,
 	}
-	info, err := os.Stat(manifestPath)
+	info, err := statPath(manifestPath)
 	if err != nil {
 		skill.Reason = errReason(err)
 		if !os.IsNotExist(err) {
@@ -170,7 +173,7 @@ func inspectSkillManifest(root skillRoot, name, manifestPath, redaction string, 
 		skill.Reason = "manifest path is a directory"
 		return skill
 	}
-	data, err := os.ReadFile(manifestPath)
+	data, err := readFilePath(manifestPath)
 	if err != nil {
 		skill.ParserStatus = StatusUnreadable
 		skill.Reason = errReason(err)
@@ -183,15 +186,6 @@ func inspectSkillManifest(root skillRoot, name, manifestPath, redaction string, 
 	}
 	skill.ParserStatus = StatusOK
 	return skill
-}
-
-func skipSkillDir(name string) bool {
-	switch name {
-	case ".git", "node_modules", "vendor", "dist", "build", "tmp", "temp":
-		return true
-	default:
-		return false
-	}
 }
 
 func dedupeSkills(skills []Skill) []Skill {

@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/codexsession"
 )
 
 type CodexOptions struct {
@@ -60,20 +62,66 @@ func codexStatusFromRuntime(status runtimeStatus) CodexStatus {
 	}
 }
 
+// Extension points for a build of Beacon that compiles in hook subcommands of its own (see
+// version.Edition). Both are nil in this build, which installs exactly the hooks listed in
+// installCodexHooks.
+var (
+	// codexExtraHookGroups returns further hook groups to install for Codex, keyed by event,
+	// given the command prefix Beacon's own hooks use; a group can carry a matcher. Their
+	// commands carry that prefix, so repair, status and uninstall treat them as Beacon's hooks:
+	// a reinstall removes every group Beacon wrote before writing the current ones, and an
+	// uninstall removes them all.
+	codexExtraHookGroups func(prefix string) map[string][]settingsHookGroup
+
+	// codexHooksChanged runs after Beacon has written its hooks into a Codex hooks.json
+	// (installed true) or taken them out (installed false), as whoever ran the install.
+	codexHooksChanged func(hooksPath string, installed bool) error
+)
+
 func installCodexHooks(path, binaryPath, logPath, configPath string) error {
 	prefix := endpointCommandPrefix("codex", binaryPath, logPath, configPath)
-	// Only the OS-user session context is hook-driven. Inventory used to ride SessionStart and
+	// Hooks supply only what Codex's OTLP export lacks: the OS-user session context, and the turn's
+	// final reply, which Codex's Stop payload carries as last_assistant_message and no span or log
+	// does. Both are dedicated commands rather than the generic ones, because OTLP already reports
+	// the session, prompts, tools and turn. Inventory used to ride SessionStart and
 	// UserPromptSubmit here; it is written by the scheduled inventory job now.
 	endpointHooks := map[string]settingsHookGroup{
 		"SessionStart": {Hooks: []settingsHookRef{
 			{Type: "command", Command: prefix + " codex-session-context", Timeout: 10},
 		}},
+		"Stop": {Hooks: []settingsHookRef{
+			{Type: "command", Command: prefix + " codex-assistant-response", Timeout: 10},
+		}},
 	}
-	return installSettingsEndpointHooks(path, "codex", endpointHooks)
+	groups := make(map[string][]settingsHookGroup, len(endpointHooks))
+	for event, group := range endpointHooks {
+		groups[event] = []settingsHookGroup{group}
+	}
+	if codexExtraHookGroups != nil {
+		for event, extra := range codexExtraHookGroups(prefix) {
+			groups[event] = append(groups[event], extra...)
+		}
+	}
+	if err := installSettingsEndpointHookGroups(path, "codex", groups); err != nil {
+		return err
+	}
+	if codexHooksChanged != nil {
+		return codexHooksChanged(path, true)
+	}
+	return nil
 }
 
 func removeCodexEndpointHooks(path string) (bool, error) {
-	return removeSettingsEndpointHooks(path, "codex")
+	removed, err := removeSettingsEndpointHooks(path, "codex")
+	if err != nil {
+		return removed, err
+	}
+	if codexHooksChanged != nil {
+		if err := codexHooksChanged(path, false); err != nil {
+			return removed, err
+		}
+	}
+	return removed, nil
 }
 
 func isCodexInstalledAt(path string) bool {
@@ -87,7 +135,11 @@ func codexHooksPath(level Level) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		return filepath.Join(home, ".codex", "hooks.json"), nil
+		dir, err := codexsession.HomeDir(home)
+		if err != nil {
+			return "", err
+		}
+		return filepath.Join(dir, "hooks.json"), nil
 	case LevelProject:
 		cwd, err := os.Getwd()
 		if err != nil {

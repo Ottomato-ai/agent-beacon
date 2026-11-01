@@ -16,6 +16,7 @@ import (
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/exporter"
+	"go.opentelemetry.io/collector/exporter/exporterhelper"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
@@ -30,6 +31,13 @@ type falconExporter struct {
 	client    *http.Client
 	logger    *zap.Logger
 	converter beaconevent.Converter
+	listings  *beaconevent.MCPListings
+	// releaseCodexSurfaces gives up this exporter's share of the Codex surface memory it holds
+	// with the other signals' exporters built from the same config. Unlike the JSONL exporter it
+	// doesn't hold records back for a conversation's logs (CodexSurfaces.Sort): exporterhelper
+	// retries a failed send by running the batch again, which would lose held records released
+	// into it.
+	releaseCodexSurfaces func()
 }
 
 type hecPayload struct {
@@ -55,6 +63,7 @@ func newExporter(raw component.Config, set exporter.Settings) (*falconExporter, 
 	if err != nil {
 		return nil, err
 	}
+	codexSurfaces, release := beaconevent.AcquireCodexSurfaces(cfg)
 	return &falconExporter{
 		cfg:    cfg,
 		client: client,
@@ -62,8 +71,19 @@ func newExporter(raw component.Config, set exporter.Settings) (*falconExporter, 
 		converter: beaconevent.NewConverter(beaconevent.Options{
 			IncludeRuntimeMetrics: cfg.IncludeRuntimeMetrics,
 			IncludeCodexSpans:     cfg.IncludeCodexSpans,
+			CaptureModelContext:   cfg.CaptureModelContext,
+			CodexSurfaces:         codexSurfaces,
 		}),
+		listings:             &beaconevent.MCPListings{},
+		releaseCodexSurfaces: release,
 	}, nil
+}
+
+func (e *falconExporter) shutdown(context.Context) error {
+	if e.releaseCodexSurfaces != nil {
+		e.releaseCodexSurfaces()
+	}
+	return nil
 }
 
 func httpClient(cfg *Config) (*http.Client, error) {
@@ -90,7 +110,12 @@ func httpClient(cfg *Config) (*http.Client, error) {
 }
 
 func (e *falconExporter) consumeLogs(ctx context.Context, logs plog.Logs) error {
-	return e.sendEvents(ctx, e.converter.EventsFromLogs(logs))
+	events := e.listings.Filter(e.converter.EventsFromLogs(logs))
+	if err := e.sendEvents(ctx, events); err != nil {
+		return err
+	}
+	e.listings.Remember(events...)
+	return nil
 }
 
 func (e *falconExporter) consumeTraces(ctx context.Context, traces ptrace.Traces) error {
@@ -184,7 +209,7 @@ func createLogsExporter(ctx context.Context, set exporter.Settings, cfg componen
 		return nil, err
 	}
 	fcfg := cfg.(*Config)
-	return exporterhelperNewLogs(ctx, set, cfg, consumer.ConsumeLogsFunc(exp.consumeLogs), fcfg)
+	return exporterhelperNewLogs(ctx, set, cfg, consumer.ConsumeLogsFunc(exp.consumeLogs), fcfg, exporterhelper.WithShutdown(exp.shutdown))
 }
 
 func createTracesExporter(ctx context.Context, set exporter.Settings, cfg component.Config) (exporter.Traces, error) {
@@ -193,7 +218,7 @@ func createTracesExporter(ctx context.Context, set exporter.Settings, cfg compon
 		return nil, err
 	}
 	fcfg := cfg.(*Config)
-	return exporterhelperNewTraces(ctx, set, cfg, consumer.ConsumeTracesFunc(exp.consumeTraces), fcfg)
+	return exporterhelperNewTraces(ctx, set, cfg, consumer.ConsumeTracesFunc(exp.consumeTraces), fcfg, exporterhelper.WithShutdown(exp.shutdown))
 }
 
 func createMetricsExporter(ctx context.Context, set exporter.Settings, cfg component.Config) (exporter.Metrics, error) {
@@ -202,5 +227,5 @@ func createMetricsExporter(ctx context.Context, set exporter.Settings, cfg compo
 		return nil, err
 	}
 	fcfg := cfg.(*Config)
-	return exporterhelperNewMetrics(ctx, set, cfg, consumer.ConsumeMetricsFunc(exp.consumeMetrics), fcfg)
+	return exporterhelperNewMetrics(ctx, set, cfg, consumer.ConsumeMetricsFunc(exp.consumeMetrics), fcfg, exporterhelper.WithShutdown(exp.shutdown))
 }

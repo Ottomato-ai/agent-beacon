@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -193,7 +194,7 @@ func (b supervisedBackend) unload(userMode bool) error {
 		if !st.running() {
 			break
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(supervisedStopPoll)
 	}
 	if st.running() {
 		_ = proc.Kill()
@@ -201,6 +202,9 @@ func (b supervisedBackend) unload(userMode bool) error {
 	st.PID = 0
 	return b.write(userMode, st)
 }
+
+// supervisedStopPoll is how often unload re-checks a collector it asked to stop; tests shorten it.
+var supervisedStopPoll = 100 * time.Millisecond
 
 func (b supervisedBackend) restart(userMode bool) error {
 	if err := b.unload(userMode); err != nil {
@@ -269,4 +273,11 @@ func (st supervisedState) running() bool {
 // supervisedLogPath is the file a supervised collector's stdout and stderr are appended to.
 func supervisedLogPath(userMode bool) string {
 	return filepath.Join(stateDir(userMode), "collector.out")
+}
+
+// DetachedProcAttrs returns the process attributes that let a background child outlive the
+// CLI invocation and the terminal that started it: its own session on Unix, no console and its
+// own process group on Windows.
+func DetachedProcAttrs() *syscall.SysProcAttr {
+	return detachAttrs()
 }

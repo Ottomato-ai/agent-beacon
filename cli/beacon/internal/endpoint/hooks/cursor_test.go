@@ -1,14 +1,62 @@
 package hooks
 
 import (
-	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/testenv"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
-	endpointconfig "github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/config"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/testenv"
+	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve/hookcmd"
 )
+
+// The hooks binary decides which Cursor entries cover a subcommand from hookcmd.CursorEvents and
+// hookcmd.Runs. Read back from what the installer actually writes, every Beacon entry must be one
+// of those pairs and every pair must be written; otherwise the Claude Code copy of an event is
+// dropped with no Cursor hook recording it, or recorded twice.
+func TestInstalledCursorHooksRoundTripThroughCursorEvents(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hooks.json")
+	if err := installCursorHooksJSON(path, "/opt/beacon hooks/beacon-hooks", "/var/log/beacon/runtime.jsonl", "/etc/beacon/config.json"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var file struct {
+		Hooks map[string][]struct {
+			Command string `json:"command"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal(data, &file); err != nil {
+		t.Fatal(err)
+	}
+	written := map[string][]string{}
+	for event, entries := range file.Hooks {
+		for _, entry := range entries {
+			fields := hookcmd.Fields(entry.Command)
+			subcommand := fields[len(fields)-1]
+			if !hookcmd.Runs(entry.Command, "cursor", subcommand) {
+				t.Fatalf("%s: installed command %q is not recognised as Beacon's", event, entry.Command)
+			}
+			written[subcommand] = append(written[subcommand], event)
+		}
+	}
+	want := map[string][]string{}
+	for subcommand, events := range hookcmd.CursorEvents {
+		want[subcommand] = append([]string(nil), events...)
+		slices.Sort(want[subcommand])
+	}
+	for subcommand := range written {
+		slices.Sort(written[subcommand])
+	}
+	if !reflect.DeepEqual(written, want) {
+		t.Fatalf("installed subcommand->events = %v, want hookcmd.CursorEvents %v", written, want)
+	}
+}
 
 func TestInstallCursorHooksJSONPreservesNonBeaconHooks(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "hooks.json")
@@ -41,31 +89,42 @@ func TestInstallCursorHooksJSONPreservesNonBeaconHooks(t *testing.T) {
 	if !strings.Contains(text, `"afterAgentThought"`) || !strings.Contains(text, "agent-thought") {
 		t.Fatalf("afterAgentThought reasoning hook was not installed: %s", text)
 	}
+	var parsed struct {
+		Hooks map[string][]HookRef `json:"hooks"`
+	}
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		t.Fatal(err)
+	}
+	responses := parsed.Hooks["afterAgentResponse"]
+	if len(responses) != 1 || !strings.HasSuffix(responses[0].Command, " agent-response") || !strings.Contains(responses[0].Command, "--platform cursor") {
+		t.Fatalf("afterAgentResponse hooks = %#v, want one Beacon agent-response command", responses)
+	}
 }
 
-func TestRemoveEndpointHooksPreservesOtherHooks(t *testing.T) {
+func TestInstallCursorHooksJSONAgentResponseIsIdempotentAndRemovable(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "hooks.json")
-	existing := `{"version":1,"hooks":{"sessionStart":[{"command":"echo keep"},{"command":"BEACON_ENDPOINT_MODE=1 beacon-hooks session-start"}]}}`
+	existing := `{"version":1,"hooks":{"afterAgentResponse":[{"command":"echo mine"}]}}`
 	if err := os.WriteFile(path, []byte(existing), 0644); err != nil {
 		t.Fatal(err)
 	}
-	changed, err := removeEndpointHooks(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !changed {
-		t.Fatal("expected endpoint hook removal")
+	for i := 0; i < 2; i++ {
+		if err := installCursorHooksJSON(path, "/tmp/beacon-hooks", "/tmp/runtime.jsonl", ""); err != nil {
+			t.Fatal(err)
+		}
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	text := string(data)
-	if !strings.Contains(text, "echo keep") {
-		t.Fatalf("non-Beacon hook was not preserved: %s", text)
+	if n := strings.Count(string(data), " agent-response"); n != 1 {
+		t.Fatalf("agent-response installed %d times after two installs, want 1: %s", n, data)
 	}
-	if strings.Contains(text, "BEACON_ENDPOINT_MODE") {
-		t.Fatalf("endpoint hook was not removed: %s", text)
+	if _, err := removeEndpointHooks(path); err != nil {
+		t.Fatal(err)
+	}
+	data, _ = os.ReadFile(path)
+	if strings.Contains(string(data), "agent-response") || !strings.Contains(string(data), "echo mine") {
+		t.Fatalf("uninstall should remove only Beacon's afterAgentResponse hook: %s", data)
 	}
 }
 
@@ -82,13 +141,13 @@ func TestCursorTargetDirProjectLevel(t *testing.T) {
 	}
 }
 
-func TestReadHooksJSONReturnsCorruptJSONError(t *testing.T) {
+func TestReadCursorHooksFileReturnsCorruptJSONError(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "hooks.json")
 	if err := os.WriteFile(path, []byte("{not json"), 0644); err != nil {
 		t.Fatalf("write corrupt hooks.json: %v", err)
 	}
 
-	if _, err := readHooksJSON(path); err == nil {
+	if _, err := readCursorHooksFile(path); err == nil {
 		t.Fatal("expected corrupt hooks.json error")
 	}
 }
@@ -171,11 +230,94 @@ func TestInstallCursorWithUnknownLevelFailsBeforeWritingTarget(t *testing.T) {
 	}
 }
 
-func TestEndpointConfigPathForHookUsesSystemConfigForSystemLog(t *testing.T) {
-	if got := endpointConfigPathForHook(endpointconfig.SystemLogPath(), true); got != endpointconfig.ConfigPath(false) {
-		t.Fatalf("system log config path = %q, want system endpoint config", got)
+// TestCursorHooksJSONKeepsFieldsBeaconDoesNotModel installs and then removes Beacon's hooks over a
+// hooks.json that uses Cursor options Beacon has no fields for. Everything that is not Beacon's must
+// come back with the same value: dropping `failClosed` would make a user's blocking hook fail open,
+// and a prompt-type hook decoded into a command struct would be written back as an empty command.
+func TestCursorHooksJSONKeepsFieldsBeaconDoesNotModel(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hooks.json")
+	existing := `{
+  "version": 1,
+  "$schema": "https://example.invalid/cursor-hooks.schema.json",
+  "x-team": {"owner": "secops", "rev": [1, 2]},
+  "hooks": {
+    "preToolUse": [
+      {"command": "./guard.sh", "matcher": "Shell", "failClosed": true, "timeout": 5, "x-note": "keep"},
+      {"type": "prompt", "prompt": "Block edits outside src/", "model": "fast", "failClosed": true}
+    ],
+    "stop": [
+      {"command": "./stop.sh", "loop_limit": null},
+      {"command": "BEACON_ENDPOINT_MODE=1 beacon-hooks stop"}
+    ],
+    "beforeReadFile": [
+      {"type": "prompt", "prompt": "Never read .env files"},
+      {"command": "./audit.sh", "loop_limit": 3, "failClosed": false}
+    ]
+  }
+}`
+	if err := os.WriteFile(path, []byte(existing), 0644); err != nil {
+		t.Fatal(err)
 	}
-	if got := endpointConfigPathForHook("/tmp/runtime.jsonl", true); got != endpointconfig.ConfigPath(true) {
-		t.Fatalf("user log config path = %q, want user endpoint config", got)
+	want := map[string]any{}
+	if err := json.Unmarshal([]byte(existing), &want); err != nil {
+		t.Fatal(err)
 	}
+	// The legacy Beacon stop hook is Beacon's own and is expected to go.
+	wantHooks := want["hooks"].(map[string]any)
+	wantHooks["stop"] = wantHooks["stop"].([]any)[:1]
+
+	if err := installCursorHooksJSON(path, "/tmp/beacon-hooks", "/tmp/runtime.jsonl", "/tmp/config.json"); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	installed := readJSONMap(t, path)
+	for key, value := range want {
+		if key == "hooks" {
+			continue
+		}
+		if !reflect.DeepEqual(installed[key], value) {
+			t.Fatalf("install changed top-level %q: got %#v want %#v", key, installed[key], value)
+		}
+	}
+	installedHooks := installed["hooks"].(map[string]any)
+	for event, entries := range wantHooks {
+		var userEntries []any
+		for _, entry := range installedHooks[event].([]any) {
+			command, _ := entry.(map[string]any)["command"].(string)
+			if !isEndpointHook(command) {
+				userEntries = append(userEntries, entry)
+			}
+		}
+		if !reflect.DeepEqual(userEntries, entries) {
+			t.Fatalf("install changed user hooks for %q:\n got %#v\nwant %#v", event, userEntries, entries)
+		}
+	}
+	if !isCursorInstalledAt(path) {
+		t.Fatal("Beacon hooks were not detected after install")
+	}
+
+	changed, err := removeEndpointHooks(path)
+	if err != nil {
+		t.Fatalf("uninstall: %v", err)
+	}
+	if !changed {
+		t.Fatal("expected uninstall to remove Beacon hooks")
+	}
+	if got := readJSONMap(t, path); !reflect.DeepEqual(got, want) {
+		gotJSON, _ := json.MarshalIndent(got, "", "  ")
+		wantJSON, _ := json.MarshalIndent(want, "", "  ")
+		t.Fatalf("install then uninstall did not restore the user's hooks.json:\n got %s\nwant %s", gotJSON, wantJSON)
+	}
+}
+
+func readJSONMap(t *testing.T, path string) map[string]any {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]any{}
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("parse %s: %v\n%s", path, err, data)
+	}
+	return out
 }

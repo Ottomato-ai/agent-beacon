@@ -18,7 +18,7 @@ var endpointCopilotCmd = &cobra.Command{
 	Short: "Collect telemetry from GitHub Copilot CLI sessions",
 	Long: `Collect endpoint telemetry from GitHub Copilot CLI's native session store.
 
-Copilot CLI persists local session records under ~/.copilot/session-state. Beacon
+Copilot CLI persists local session records under $COPILOT_HOME/session-state (default ~/.copilot/session-state). Beacon
 reads those records after the fact and maps them to endpoint events with
 harness.collection_method=poll. This complements the live OTLP integration:
 OTLP still provides live approvals and spans, while session sync backfills
@@ -41,14 +41,15 @@ var endpointCopilotStatusCmd = &cobra.Command{
 }
 
 var endpointCopilotOpts struct {
-	copilotDir string
-	statePath  string
-	logPath    string
-	print      bool
-	watch      bool
-	interval   time.Duration
-	workspace  string
-	sessionID  string
+	copilotDir  string
+	statePath   string
+	logPath     string
+	print       bool
+	watch       bool
+	interval    time.Duration
+	workspace   string
+	sessionID   string
+	rotateBytes int64
 }
 
 func init() {
@@ -58,7 +59,7 @@ func init() {
 
 	for _, c := range []*cobra.Command{endpointCopilotSyncCmd, endpointCopilotStatusCmd} {
 		f := c.Flags()
-		f.StringVar(&endpointCopilotOpts.copilotDir, "copilot-dir", "", "GitHub Copilot CLI directory (default ~/.copilot)")
+		f.StringVar(&endpointCopilotOpts.copilotDir, "copilot-dir", "", "GitHub Copilot CLI directory (default $COPILOT_HOME when set, otherwise ~/.copilot)")
 		f.StringVar(&endpointCopilotOpts.statePath, "state", "", "Collector cursor file (default ~/.beacon/endpoint/state/copilot.json)")
 		f.StringVar(&endpointCopilotOpts.workspace, "workspace", "", "Only include sessions whose cwd matches this workspace")
 		f.StringVar(&endpointCopilotOpts.sessionID, "session-id", "", "Only include one GitHub Copilot CLI session id")
@@ -72,18 +73,23 @@ func init() {
 	sync.BoolVar(&endpointCopilotOpts.print, "print", false, "Print mapped events as JSON without writing them or advancing the cursor")
 	sync.BoolVar(&endpointCopilotOpts.watch, "watch", false, "Sweep continuously on --interval")
 	sync.DurationVar(&endpointCopilotOpts.interval, "interval", time.Minute, "Sweep interval for --watch")
+	addSyncRotateBytesFlag(sync, &endpointCopilotOpts.rotateBytes)
 }
 
 func runEndpointCopilotSync(cmd *cobra.Command, args []string) error {
+	if err := checkSyncRotateBytes(endpointCopilotOpts.rotateBytes); err != nil {
+		return err
+	}
 	userMode := endpointUserMode()
 	opts := copilotsession.CollectOptions{
-		CopilotDir: endpointCopilotOpts.copilotDir,
-		Print:      endpointCopilotOpts.print,
-		Out:        cmd.OutOrStdout(),
-		Write:      !endpointCopilotOpts.print,
-		UserMode:   userMode,
-		Workspace:  endpointCopilotOpts.workspace,
-		SessionID:  endpointCopilotOpts.sessionID,
+		RotateBytes: endpointCopilotOpts.rotateBytes,
+		CopilotDir:  endpointCopilotOpts.copilotDir,
+		Print:       endpointCopilotOpts.print,
+		Out:         cmd.OutOrStdout(),
+		Write:       !endpointCopilotOpts.print,
+		UserMode:    userMode,
+		Workspace:   endpointCopilotOpts.workspace,
+		SessionID:   endpointCopilotOpts.sessionID,
 	}
 	if !endpointCopilotOpts.print {
 		opts.StatePath = resolveCopilotStatePath(endpointCopilotOpts.statePath, userMode)
@@ -130,6 +136,7 @@ func reportCopilotSweep(cmd *cobra.Command, summary copilotsession.Summary) {
 	}
 	fmt.Fprintf(cmd.OutOrStdout(), "copilot sync: %d sessions, %d changed, %d events, %d errors\n",
 		summary.Sessions, summary.SessionsChanged, summary.EventsEmitted, summary.Errors)
+	reportSyncRetention(cmd.OutOrStdout(), summary.Retention)
 	if summary.MalformedLines > 0 {
 		fmt.Fprintf(cmd.OutOrStdout(), "  %d unreadable line(s) in GitHub Copilot CLI session logs\n", summary.MalformedLines)
 	}

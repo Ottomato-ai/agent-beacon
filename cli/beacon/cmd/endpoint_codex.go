@@ -19,7 +19,8 @@ var endpointCodexCmd = &cobra.Command{
 	Long: `Collect endpoint telemetry from Codex CLI's local rollout session files.
 
 Beacon's normal Codex integration uses local OpenTelemetry logs and traces for live
-capture. This command reads Codex's committed JSONL session files under ~/.codex/sessions
+capture. This command reads Codex's committed JSONL session files under $CODEX_HOME/sessions
+when set, otherwise ~/.codex/sessions
 so historical sessions and sessions that ran without Beacon OTLP can still be represented
 in the local endpoint log. Every emitted event is marked harness.collection_method=poll:
 Beacon sees what Codex already wrote, so nothing here can hold or deny a tool call.`,
@@ -40,12 +41,13 @@ var endpointCodexStatusCmd = &cobra.Command{
 }
 
 var endpointCodexOpts struct {
-	codexDir  string
-	statePath string
-	logPath   string
-	print     bool
-	watch     bool
-	interval  time.Duration
+	codexDir    string
+	statePath   string
+	logPath     string
+	print       bool
+	watch       bool
+	interval    time.Duration
+	rotateBytes int64
 }
 
 func init() {
@@ -55,7 +57,7 @@ func init() {
 
 	for _, c := range []*cobra.Command{endpointCodexSyncCmd, endpointCodexStatusCmd} {
 		f := c.Flags()
-		f.StringVar(&endpointCodexOpts.codexDir, "codex-dir", "", "Codex directory (default ~/.codex)")
+		f.StringVar(&endpointCodexOpts.codexDir, "codex-dir", "", "Codex directory (default $CODEX_HOME when nonempty, otherwise ~/.codex)")
 		f.StringVar(&endpointCodexOpts.statePath, "state", "", "Collector cursor file (default ~/.beacon/endpoint/state/codex.json)")
 		f.BoolVar(&endpointOpts.jsonOutput, "json", false, "Print the result as JSON")
 		f.BoolVar(&endpointOpts.userMode, "user", true, "Use per-user endpoint paths")
@@ -67,16 +69,21 @@ func init() {
 	sync.BoolVar(&endpointCodexOpts.print, "print", false, "Print mapped events as JSON without writing them or advancing the cursor (dry run)")
 	sync.BoolVar(&endpointCodexOpts.watch, "watch", false, "Sweep continuously on --interval (default: one sweep then exit)")
 	sync.DurationVar(&endpointCodexOpts.interval, "interval", time.Minute, "Sweep interval for --watch")
+	addSyncRotateBytesFlag(sync, &endpointCodexOpts.rotateBytes)
 }
 
 func runEndpointCodexSync(cmd *cobra.Command, args []string) error {
+	if err := checkSyncRotateBytes(endpointCodexOpts.rotateBytes); err != nil {
+		return err
+	}
 	userMode := endpointUserMode()
 	opts := codexsession.CollectOptions{
-		CodexDir: endpointCodexOpts.codexDir,
-		Print:    endpointCodexOpts.print,
-		Out:      cmd.OutOrStdout(),
-		Write:    !endpointCodexOpts.print,
-		UserMode: userMode,
+		CodexDir:    endpointCodexOpts.codexDir,
+		RotateBytes: endpointCodexOpts.rotateBytes,
+		Print:       endpointCodexOpts.print,
+		Out:         cmd.OutOrStdout(),
+		Write:       !endpointCodexOpts.print,
+		UserMode:    userMode,
 	}
 	if !endpointCodexOpts.print {
 		opts.StatePath = resolveCodexStatePath(endpointCodexOpts.statePath, userMode)
@@ -125,6 +132,7 @@ func reportCodexSweep(cmd *cobra.Command, summary codexsession.Summary) {
 	}
 	fmt.Fprintf(cmd.OutOrStdout(), "codex sync: %d sessions, %d changed, %d events, %d errors\n",
 		summary.Sessions, summary.SessionsChanged, summary.EventsEmitted, summary.Errors)
+	reportSyncRetention(cmd.OutOrStdout(), summary.Retention)
 	if summary.MalformedLines > 0 {
 		fmt.Fprintf(cmd.OutOrStdout(), "  %d unreadable line(s) in Codex session logs\n", summary.MalformedLines)
 	}

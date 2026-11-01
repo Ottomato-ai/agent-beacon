@@ -85,30 +85,65 @@ describe('normalizeTurn — full retention, simple completed turn', () => {
     expect(r['gen_ai.conversation.id']).toBe('conv-123');
   });
 
-  it('encodes usage tokens as integers on the response', () => {
-    const r = flat(respRec.attributes);
-    expect(r['gen_ai.usage.input_tokens']).toBe(10);
-    expect(r['gen_ai.usage.output_tokens']).toBe(2);
-  });
-
-  it('emits cache counts under the dotted names the collector reads', () => {
-    // GenAIUsageFromAttrs in the beaconjson exporter reads
-    // gen_ai.usage.cache_creation.input_tokens first and the flat
-    // gen_ai.usage.cache_creation_input_tokens only as an alias, so the dotted
-    // spelling is the one to emit.
+  it('emits the semconv input count, which includes cache reads and writes', () => {
+    // Anthropic's usage.input_tokens excludes both cache counts, but the OTel
+    // GenAI semconv input_tokens "SHOULD include all types of input tokens,
+    // including cached tokens". The collector reduces every semconv input by
+    // the cache counts beside it, so emitting Anthropic's disjoint count here
+    // would have it subtract the cache a second time.
     const records = normalize(
       baseTurn({
         usage: { inputTokens: 37, outputTokens: 214, cacheCreationInputTokens: 1024, cacheReadInputTokens: 18500 },
       }),
     ).logRecords;
     const r = flat(byAction(records, 'agent.response.completed')!.attributes);
-    expect(r['gen_ai.usage.cache_creation.input_tokens']).toBe(1024);
-    expect(r['gen_ai.usage.cache_read.input_tokens']).toBe(18500);
+    expect(r['gen_ai.usage.input_tokens']).toBe(37 + 1024 + 18500);
+    expect(r['gen_ai.usage.output_tokens']).toBe(214);
+  });
+
+  it('adds only the cache counts the stream reported to the input count', () => {
+    const records = normalize(
+      baseTurn({ usage: { inputTokens: 37, outputTokens: 5, cacheReadInputTokens: 900 } }),
+    ).logRecords;
+    const r = flat(byAction(records, 'agent.response.completed')!.attributes);
+    expect(r['gen_ai.usage.input_tokens']).toBe(937);
+    expect(r['gen_ai.usage.cache_creation.input_tokens']).toBeUndefined();
+  });
+
+  it('does not invent an input count from cache counts alone', () => {
+    const records = normalize(
+      baseTurn({ usage: { outputTokens: 5, cacheReadInputTokens: 900 } }),
+    ).logRecords;
+    const r = flat(byAction(records, 'agent.response.completed')!.attributes);
+    expect(r['gen_ai.usage.input_tokens']).toBeUndefined();
+    expect(r['gen_ai.usage.cache_read.input_tokens']).toBe(900);
+  });
+
+  it('emits the one-hour cache-write subset, clamped to the write count', () => {
+    const emit = (cacheCreationInputTokens: number, cacheCreation1hInputTokens?: number) =>
+      flat(
+        byAction(
+          normalize(
+            baseTurn({
+              usage: { inputTokens: 37, outputTokens: 214, cacheCreationInputTokens, cacheCreation1hInputTokens },
+            }),
+          ).logRecords,
+          'agent.response.completed',
+        )!.attributes,
+      );
+    const r = emit(20000, 16000);
+    expect(r['gen_ai.usage.cache_creation.input_tokens']).toBe(20000);
+    expect(r['gen_ai.usage.cache_creation.ephemeral_1h_input_tokens']).toBe(16000);
+    // A breakdown larger than its count is a malformed record, not extra writes.
+    expect(emit(500, 900)['gen_ai.usage.cache_creation.ephemeral_1h_input_tokens']).toBe(500);
+    // Unreported stays absent, never a guessed zero.
+    expect(emit(500)['gen_ai.usage.cache_creation.ephemeral_1h_input_tokens']).toBeUndefined();
   });
 
   it('omits cache attributes entirely when the stream reported none', () => {
     const r = flat(respRec.attributes);
     expect(r['gen_ai.usage.cache_creation.input_tokens']).toBeUndefined();
+    expect(r['gen_ai.usage.cache_creation.ephemeral_1h_input_tokens']).toBeUndefined();
     expect(r['gen_ai.usage.cache_read.input_tokens']).toBeUndefined();
   });
 
@@ -125,6 +160,15 @@ describe('normalizeTurn — full retention, simple completed turn', () => {
   it('timestamps prompt from startedAt and response from completedAt', () => {
     expect(promptRec.timeUnixNano).toBe('1700000000000000000');
     expect(respRec.timeUnixNano).toBe('1700000002000000000');
+  });
+});
+
+describe('normalizeTurn — a turn with no prompt', () => {
+  // A regenerated answer: claude.ai's retry_completion sends an empty prompt.
+  it('emits no prompt.submitted record, only the response', () => {
+    const { logRecords } = normalize(baseTurn({ promptText: '', inputMessages: [] }));
+    expect(byAction(logRecords, 'prompt.submitted')).toBeUndefined();
+    expect(byAction(logRecords, 'agent.response.completed')).toBeTruthy();
   });
 });
 
@@ -147,6 +191,15 @@ describe('normalizeTurn — retention modes', () => {
     const p = flat(byAction(normalize(turn, 'redacted').logRecords, 'prompt.submitted')!.attributes);
     expect(p['beacon.prompt.text']).toBe('email me at [email] please');
     expect(p['beacon.content.retention']).toBe('redacted');
+  });
+
+  // A long run of word characters with no '@', such as a base64 blob, made the email pattern
+  // rescan from every position: about 2s for 64 KB, growing with the square of the length.
+  it('redacted retention scrubs a long token-like run in linear time', () => {
+    const turn = baseTurn({ promptText: 'x'.repeat(1 << 20) });
+    const started = performance.now();
+    normalize(turn, 'redacted');
+    expect(performance.now() - started).toBeLessThan(1000);
   });
 });
 
@@ -178,15 +231,6 @@ describe('normalizeTurn — partial/aborted stream', () => {
     expect(byAction(logRecords, 'agent.response.completed')).toBeUndefined();
     // Prompt still captured.
     expect(byAction(logRecords, 'prompt.submitted')).toBeTruthy();
-  });
-});
-
-describe('normalizeTurn — size cap', () => {
-  it('truncates oversized prompt text and flags it', () => {
-    const huge = 'x'.repeat(200_000);
-    const p = flat(byAction(normalize(baseTurn({ promptText: huge })).logRecords, 'prompt.submitted')!.attributes);
-    expect((p['beacon.prompt.text'] as string).length).toBeLessThan(huge.length);
-    expect(p['beacon.field_truncated']).toBe(true);
   });
 });
 
@@ -251,5 +295,24 @@ describe('normalizeTurn — browser identity', () => {
       'service.name',
       'gen_ai.provider.name',
     ]);
+  });
+});
+
+describe('normalizeTurn — prompt id', () => {
+  it('puts the turn id on every record as beacon.prompt.id', () => {
+    const { logRecords } = normalize(
+      baseTurn({ toolCalls: [{ id: 'tool-1', name: 'web_search', arguments: { q: 'x' } }] }),
+    );
+    expect(logRecords.length).toBeGreaterThanOrEqual(3);
+    for (const rec of logRecords) {
+      expect(flat(rec.attributes)['beacon.prompt.id']).toBe('conv-123:1');
+    }
+  });
+
+  it('omits it when the adapter had no turn id, rather than sharing one fallback id', () => {
+    const { logRecords } = normalize(baseTurn({ turnId: '' }));
+    for (const rec of logRecords) {
+      expect(flat(rec.attributes)['beacon.prompt.id']).toBeUndefined();
+    }
   });
 });

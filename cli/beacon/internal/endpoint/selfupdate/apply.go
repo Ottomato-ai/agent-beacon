@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -152,7 +153,45 @@ func (a *Applier) Apply(ctx context.Context) (ApplyResult, error) {
 		a.emit(false, result, fmt.Sprintf("no update artifact this host can install (looked for %s)", key))
 		return result, fmt.Errorf("no update artifact this host can install (looked for %s)", key)
 	}
+	pkg := Package{URL: artifact.URL, SHA256: artifact.SHA256, Version: manifest.Version}
+	return a.installPackage(ctx, pkg, result, fmt.Sprintf("updated %s -> %s", a.CurrentVersion, manifest.Version))
+}
 
+// Package is one release artifact to install: where it is, what it must hash to, and what the
+// installed beacon must report afterwards.
+type Package struct {
+	URL     string
+	SHA256  string
+	Version string
+	// Edition, when set, must be the edition the installed `beacon version` reports.
+	Edition string
+}
+
+// InstallPackage downloads, verifies and installs one package, then health-checks the result and
+// rolls back on failure, exactly as Apply does after it has picked an artifact. It consults no
+// manifest and has no version gate, so it can install the same version again or another edition
+// of it; deciding whether to install is the caller's job.
+func (a *Applier) InstallPackage(ctx context.Context, pkg Package) (ApplyResult, error) {
+	if a.SkipGatekeeper && !a.AllowInsecureTest {
+		return ApplyResult{}, fmt.Errorf("SkipGatekeeper requires AllowInsecureTest")
+	}
+	if a.AllowInsecureTest && filepath.Clean(a.prefix()) == string(filepath.Separator) {
+		return ApplyResult{}, fmt.Errorf("AllowInsecureTest requires a non-root install prefix")
+	}
+	result := ApplyResult{FromVersion: a.CurrentVersion, ToVersion: pkg.Version}
+	if !updatecheck.CanCheckVersion(pkg.Version) {
+		return result, fmt.Errorf("package version %q is not a release version", pkg.Version)
+	}
+	message := "installed " + pkg.Version
+	if pkg.Edition != "" {
+		message += ", " + pkg.Edition + " edition"
+	}
+	return a.installPackage(ctx, pkg, result, message)
+}
+
+// installPackage is everything after discovery: download, verify, snapshot, install, restart,
+// health check, and rollback when any step after the install fails.
+func (a *Applier) installPackage(ctx context.Context, pkg Package, result ApplyResult, success string) (ApplyResult, error) {
 	// Serialize concurrent updaters.
 	stage := a.stageDir()
 	if err := os.MkdirAll(stage, 0o755); err != nil {
@@ -166,14 +205,14 @@ func (a *Applier) Apply(ctx context.Context) (ApplyResult, error) {
 	defer unlock()
 
 	// Download + verify before touching the system.
-	pkgPath := filepath.Join(stage, "download"+packageExt(artifact.URL))
-	if err := a.download(ctx, artifact.URL, pkgPath); err != nil {
+	pkgPath := filepath.Join(stage, "download"+packageExt(pkg.URL))
+	if err := a.download(ctx, pkg.URL, pkgPath); err != nil {
 		a.emit(false, result, "download update: "+err.Error())
 		return result, fmt.Errorf("download update: %w", err)
 	}
 	defer os.Remove(pkgPath)
 
-	if err := verifySHA256(pkgPath, artifact.SHA256); err != nil {
+	if err := verifySHA256(pkgPath, pkg.SHA256); err != nil {
 		a.emit(false, result, err.Error())
 		return result, fmt.Errorf("verify checksum: %w", err)
 	}
@@ -197,7 +236,7 @@ func (a *Applier) Apply(ctx context.Context) (ApplyResult, error) {
 		result.Verification = "sha256 (notarization check skipped)"
 	default:
 		result.Verification = "sha256+notarization"
-		if err := a.verifyGatekeeper(ctx, pkgPath, manifest.TeamID); err != nil {
+		if err := a.verifyGatekeeper(ctx, pkgPath); err != nil {
 			a.emit(false, result, err.Error())
 			return result, fmt.Errorf("verify signature/notarization: %w", err)
 		}
@@ -236,7 +275,7 @@ func (a *Applier) Apply(ctx context.Context) (ApplyResult, error) {
 		}
 	}
 
-	if err := a.healthCheck(ctx, manifest.Version); err != nil {
+	if err := a.healthCheck(ctx, pkg.Version, pkg.Edition); err != nil {
 		rollbackErr := a.rollback(backup, &result)
 		message := "post-install health check failed: " + err.Error()
 		if rollbackErr != nil {
@@ -248,7 +287,7 @@ func (a *Applier) Apply(ctx context.Context) (ApplyResult, error) {
 	}
 
 	result.Applied = true
-	result.Message = fmt.Sprintf("updated %s -> %s", a.CurrentVersion, manifest.Version)
+	result.Message = success
 	a.cleanupSuccessfulUpdate()
 	a.emit(true, result, result.Message)
 	return result, nil
@@ -337,6 +376,10 @@ func (a *Applier) download(ctx context.Context, url, dest string) error {
 	if client == nil {
 		client = &http.Client{Timeout: 10 * time.Minute}
 	}
+	if err := updatecheck.RequireSecureURL(url); err != nil {
+		return err
+	}
+	client = updatecheck.SecureRedirects(client)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
@@ -382,18 +425,24 @@ func verifySHA256(path, want string) error {
 	return nil
 }
 
-// verifyGatekeeper confirms the .pkg is Developer ID Installer-signed and
-// accepted by Gatekeeper before it is run. stapler validation is best-effort:
-// endpoint machines commonly have only Command Line Tools installed, where the
+// AppleTeamID is the Apple Developer team that signs every Beacon package. It is compiled in, not
+// taken from the update manifest or a platform answer: neither is signed, so a team named there
+// would let whoever can rewrite it pick the signer of a package the updater installs as root.
+const AppleTeamID = "3A98D35XJR"
+
+// verifyGatekeeper confirms the .pkg is signed by Beacon's Developer ID Installer certificate and
+// accepted by Gatekeeper before it is run. Notarization alone only says some Developer ID signed
+// it, so the installer signer's team must be AppleTeamID exactly. stapler validation is
+// best-effort: endpoint machines commonly have only Command Line Tools installed, where the
 // stapler shim exists but refuses to run without full Xcode.
-func (a *Applier) verifyGatekeeper(ctx context.Context, pkgPath, teamID string) error {
+func (a *Applier) verifyGatekeeper(ctx context.Context, pkgPath string) error {
 	run := a.runner()
 	out, err := run(ctx, "pkgutil", "--check-signature", pkgPath)
 	if err != nil {
 		return fmt.Errorf("pkgutil --check-signature: %s: %w", strings.TrimSpace(out), err)
 	}
-	if teamID != "" && !strings.Contains(out, teamID) {
-		return fmt.Errorf("package signature does not match expected team id %s", teamID)
+	if signer := installerSignerTeamID(out); signer != AppleTeamID {
+		return fmt.Errorf("package is signed by team %q, want %s", signer, AppleTeamID)
 	}
 	if out, err := run(ctx, "stapler", "validate", pkgPath); err != nil {
 		if !staplerUnavailable(out, err) {
@@ -404,6 +453,17 @@ func (a *Applier) verifyGatekeeper(ctx context.Context, pkgPath, teamID string) 
 		return fmt.Errorf("spctl assessment failed: %s: %w", strings.TrimSpace(out), err)
 	}
 	return nil
+}
+
+var installerSignerPattern = regexp.MustCompile(`Developer ID Installer: [^\n]*\(([A-Z0-9]+)\)`)
+
+// installerSignerTeamID is the team id in the leaf "Developer ID Installer: Name (TEAMID)" line of
+// pkgutil --check-signature output, or "" when there is none.
+func installerSignerTeamID(out string) string {
+	if m := installerSignerPattern.FindStringSubmatch(out); m != nil {
+		return m[1]
+	}
+	return ""
 }
 
 func staplerUnavailable(out string, err error) bool {
@@ -556,8 +616,9 @@ func (a *Applier) rollback(backup string, result *ApplyResult) error {
 }
 
 // healthCheck confirms the freshly installed beacon reports the expected
-// version and, in production, that the collector service is running.
-func (a *Applier) healthCheck(ctx context.Context, wantVersion string) error {
+// version (and edition, when one is expected) and, in production, that the
+// collector service is running.
+func (a *Applier) healthCheck(ctx context.Context, wantVersion, wantEdition string) error {
 	bin := filepath.Join(a.binDir(), "beacon")
 	out, err := a.runner()(ctx, bin, "version")
 	if err != nil {
@@ -565,6 +626,9 @@ func (a *Applier) healthCheck(ctx context.Context, wantVersion string) error {
 	}
 	if !versionLineMatches(out, wantVersion) {
 		return fmt.Errorf("installed binary reports %q, expected version %s", strings.TrimSpace(out), wantVersion)
+	}
+	if wantEdition != "" && VersionLineEdition(out) != wantEdition {
+		return fmt.Errorf("installed binary reports %q, expected the %s edition", strings.TrimSpace(out), wantEdition)
 	}
 	if a.AllowInsecureTest {
 		return nil
@@ -603,6 +667,21 @@ func versionLineMatches(out, want string) bool {
 		}
 	}
 	return false
+}
+
+// VersionLineEdition returns the edition `beacon version` output names ("…, <edition> edition"
+// at the end of the line), or "" for a build that reports none, which is the default edition.
+func VersionLineEdition(out string) string {
+	line, _, _ := strings.Cut(strings.TrimSpace(out), "\n")
+	rest, ok := strings.CutSuffix(strings.TrimSpace(line), " edition")
+	if !ok {
+		return ""
+	}
+	i := strings.LastIndex(rest, ", ")
+	if i < 0 {
+		return ""
+	}
+	return rest[i+2:]
 }
 
 // selectArtifact picks the release artifact this host can actually install.

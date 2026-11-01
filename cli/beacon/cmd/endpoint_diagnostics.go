@@ -15,6 +15,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/atomicfile"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/dshsession"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/embedded"
 
@@ -31,7 +32,9 @@ import (
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/schema"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/service"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/writer"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/sessionfs"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/version"
+	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve"
 )
 
 type doctorResult struct {
@@ -170,9 +173,21 @@ func buildDoctorResult(status lifecycle.Status, generatedAt time.Time) doctorRes
 		checks = append(checks, codexTokenAttributionCheck(status.LogPath, status.RuntimeLog.EffectiveUserMode))
 	}
 	if dshDetected {
-		if check, ok := doctorDshHookCaptureCheck(status.LogPath); ok {
+		bridgeUnavailable := false
+		if check, ok := doctorDshHookBridgeCheck(); ok {
 			checks = append(checks, check)
+			bridgeUnavailable = check.Evidence == "dsh_hook_bridge_unavailable"
 		}
+		// When dsh cannot load the bridge at all, every session runs without hook events and the
+		// capture check would blame the sandbox for it. The bridge check has already said why.
+		if !bridgeUnavailable {
+			if check, ok := doctorDshHookCaptureCheck(status.LogPath); ok {
+				checks = append(checks, check)
+			}
+		}
+	}
+	if check, ok := gitHookBudgetCheck(status.LogPath, generatedAt); ok {
+		checks = append(checks, check)
 	}
 	result := doctorResult{
 		Status:      aggregateCheckStatus(checks),
@@ -562,6 +577,18 @@ func writeInventoryHeartbeat(cfg endpointconfig.Config, settings endpointconfig.
 	previous := state.LastSnapshotDigest
 	writeSnapshot := false
 	next := state
+	release := func() {}
+	if !scope.NoConsoleUser {
+		confined, err := confineInventoryScan(scope.HomeDir)
+		if err != nil {
+			// Never scan a home root does not own without the confinement; the liveness heartbeat
+			// still goes out.
+			fmt.Fprintf(os.Stderr, "warning: inventory scan skipped: %v\n", err)
+			scope = heartbeatScope{NoConsoleUser: true}
+		} else {
+			release = confined
+		}
+	}
 	if scope.NoConsoleUser {
 		inventoryResult = endpointinventory.Result{
 			GeneratedAt: now.Format(time.RFC3339),
@@ -576,6 +603,7 @@ func writeInventoryHeartbeat(cfg endpointconfig.Config, settings endpointconfig.
 			IncludeContents:  settings.IncludeContents,
 			MaxContentBytes:  settings.MaxContentBytes,
 		})
+		release()
 		digest = endpointinventory.SnapshotDigest(inventoryResult)
 		// Compare against the last digest for *this* home: a multi-user machine alternates
 		// console users, and a switch is not a change in anyone's inventory.
@@ -606,6 +634,9 @@ func writeInventorySnapshotEvents(cfg endpointconfig.Config, settings endpointco
 		// Metadata only (mode and hashes). It is what distinguishes a liveness heartbeat written
 		// with nobody at the console from one for an unchanged inventory.
 		"user_scope": result.UserScope,
+	}
+	if edition := version.ReportedEdition(); edition != "" {
+		inventoryMeta["edition"] = edition
 	}
 	if previousDigest == "" {
 		inventoryMeta["change_reason"] = "initial"
@@ -639,6 +670,14 @@ func writeInventorySnapshotEvents(cfg endpointconfig.Config, settings endpointco
 		Harness:      schema.HarnessInfo{Name: "endpoint"},
 		Message:      "Agent configuration inventory snapshot observed",
 	})
+	// The scanner has already redacted what it captures and cut file contents to max_content_bytes;
+	// an MCP server definition, whose keys come from the user's config, had the field-name and flag
+	// rules applied (inventory.redactStructured). CleanValue redacts every string in them again and
+	// leaves our own field names such as env_keys, a list of variable names, as they are. Its limit
+	// is max_content_bytes, so captured contents are not cut again, but never below the raw-field
+	// limit the event writer applies to other raw strings, so a small max_content_bytes does not cut
+	// paths, names and hashes.
+	contentLimit := max(endpointinventory.ContentLimit(settings.MaxContentBytes), asymptoteobserve.DefaultRawStringLimit)
 	snapshot.Raw = map[string]interface{}{
 		"inventory": map[string]interface{}{
 			"generated_at":             result.GeneratedAt,
@@ -648,9 +687,9 @@ func writeInventorySnapshotEvents(cfg endpointconfig.Config, settings endpointco
 			"previous_snapshot_digest": previousDigest,
 			"counts":                   counts,
 			"user_scope":               result.UserScope,
-			"configs":                  existingInventoryConfigs(result.Configs),
-			"mcp_servers":              result.MCPServers,
-			"skills":                   existingInventorySkills(result.Skills),
+			"configs":                  asymptoteobserve.CleanValue(existingInventoryConfigs(result.Configs), contentLimit),
+			"mcp_servers":              asymptoteobserve.CleanValue(result.MCPServers, contentLimit),
+			"skills":                   asymptoteobserve.CleanValue(existingInventorySkills(result.Skills), contentLimit),
 		},
 	}
 	if _, err := writer.AppendEvent(snapshot, writer.Options{Path: inventoryLogPath, UserMode: cfg.UserMode}); err != nil {
@@ -1143,7 +1182,7 @@ func actionForCheck(check diagnostics.Check, runtimeLog lifecycle.RuntimeLogSour
 		switch check.Evidence {
 		case "runtime_log_missing", "missing_optional_file":
 			return "beacon endpoint doctor --fix"
-		case "acl_missing_interactive_write":
+		case "acl_missing_interactive_write", "acl_too_broad":
 			// Printed rather than only offered through --fix: this one needs an elevated shell, and
 			// an operator who cannot elevate right now still deserves to know the exact command.
 			if hint := writer.GrantCommandHint(check.Target); hint != "" {
@@ -1154,6 +1193,12 @@ func actionForCheck(check diagnostics.Check, runtimeLog lifecycle.RuntimeLogSour
 			return "grant your account write access to " + check.Target
 		case "acl_unreadable":
 			return "inspect the access control list on " + check.Target
+		}
+		if runtimeLog.EffectiveUserMode {
+			// A user-mode log is written only by processes running as its owner, so owner
+			// read/write is the whole fix. Advising 666 here would hand the user's prompts and
+			// command output to every local account.
+			return "chmod 600 " + check.Target
 		}
 		return "chmod 666 " + check.Target
 	case "runtime_log_source":
@@ -1435,6 +1480,14 @@ func harnessAction(h harness.Harness, effectiveUserMode bool) string {
 	// sweep can only read what Grok has already committed. The check's message names the sweep for
 	// the cases where that is what is behind.
 	case "hooks+session_log":
+		// DeepSeek Harness hooks that are installed but cannot be loaded are not fixed by
+		// installing again, which would refuse: the bridge has to be installed into dsh first,
+		// and the dsh_hook_bridge check names the command.
+		// Discovery points ConfigPath at the hooks file only when the hooks are installed.
+		if h.Name == dshsession.Harness && h.TelemetryStatus == harness.TelemetryMisconfigured &&
+			filepath.Base(h.ConfigPath) == "beacon-endpoint-hooks.json" {
+			return "see the dsh_hook_bridge check; until then run beacon endpoint dsh sync"
+		}
 		return "beacon endpoint hooks install --harness " + h.Name
 	}
 	return ""
@@ -1514,8 +1567,10 @@ func planDoctorFixes(result doctorResult, status lifecycle.Status) doctorFixPlan
 			// The one permission failure that is repairable in place, and the one that matters
 			// most: without this grant a system-mode Windows endpoint runs a healthy collector
 			// that records nothing an agent did, because hooks cannot write to its log.
-			case "acl_missing_interactive_write":
-				addFix(plannedAction{Action: "grant_log_access", Target: check.Target, Message: "grant interactive users write access to the log directory"})
+			case "acl_missing_interactive_write", "acl_too_broad":
+				// Target is the log itself: the repair creates the log and its lock, which needs
+				// their name, not just the directory the check reports.
+				addFix(plannedAction{Action: "grant_log_access", Target: status.LogPath, Message: "reset the log directory ACL so interactive users can append to the runtime log and nothing more"})
 			default:
 				// Anything else here is a permission problem doctor cannot repair. Reported as a
 				// skip rather than dropped: falling out of this switch is how a broken systemd unit
@@ -1571,6 +1626,10 @@ func planDoctorFixes(result doctorResult, status lifecycle.Status) doctorFixPlan
 				addSkip(plannedAction{Action: "manual_fix", Target: check.Target, Message: check.Action})
 			}
 		case "dsh_hook_capture":
+			addSkip(plannedAction{Action: "manual_fix", Target: check.Target, Message: check.Action})
+		// The budget is fixed, so there is nothing to repair; a commit the hook left unlinked is
+		// linked by hand.
+		case "git_hook_budget":
 			addSkip(plannedAction{Action: "manual_fix", Target: check.Target, Message: check.Action})
 		}
 	}
@@ -1724,7 +1783,7 @@ func restoreRepairFile(path string, snapshot repairFileSnapshot) error {
 	if mode == 0 {
 		mode = 0600
 	}
-	return os.WriteFile(path, snapshot.data, mode)
+	return atomicfile.Write(path, snapshot.data, mode)
 }
 
 func checkLogWritable(cfg endpointconfig.Config) diagnostics.Check {
@@ -1839,4 +1898,27 @@ func syntheticEvent(destination string) schema.Event {
 	})
 	event.Destination = &schema.DestinationInfo{Type: destination, Mode: mode, Status: "configured"}
 	return event
+}
+
+// confineInventoryScan confines the inventory scan of home with sessionfs when this process is root
+// scanning a home it does not own -- the system job reading the console user's home. That user can
+// plant anything there: a symlink to a root-only file (whose content or hash would land in the
+// world-readable system log), a FIFO that hangs the job while it holds the inventory lock, or a
+// link to /dev/zero. Confined, those read as absent. It returns the release to call after the scan.
+func confineInventoryScan(home string) (func(), error) {
+	if strings.TrimSpace(home) == "" || os.Geteuid() != 0 {
+		return func() {}, nil
+	}
+	uid, err := sessionfs.OwnerUID(home)
+	if err != nil {
+		return nil, fmt.Errorf("could not read the owner of %s: %w", home, err)
+	}
+	if uid == 0 {
+		return func() {}, nil
+	}
+	confined, err := sessionfs.Confine(home, uid, sessionfs.Options{})
+	if err != nil {
+		return nil, err
+	}
+	return confined.Release, nil
 }

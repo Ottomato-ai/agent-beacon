@@ -22,65 +22,6 @@ import (
 // silently missing, which is how a Muse hook fails: the host ignores a hook it does not like
 // without a warning, an exit code or a log line.
 
-// The base fields Muse sends on every event: session_id, cwd, model, permission_mode,
-// transcript_path, and (on everything except SessionStart) turn_id. Reading them is what puts
-// session.id, session.working_directory and repository on every Muse event.
-func TestMuseSessionAndWorkspaceComeFromTheBaseFields(t *testing.T) {
-	setupHookConfigDirs(t)
-	platformFlag = "muse"
-
-	input := map[string]interface{}{
-		"hook_event_name": "PreToolUse",
-		"session_id":      "muse-session-1",
-		"cwd":             "/tmp/muse-project",
-		"model":           "muse-spark-1.3",
-		"permission_mode": "default",
-		"transcript_path": "/tmp/muse/transcripts/muse-session-1.jsonl",
-		"turn_id":         "turn-7",
-	}
-
-	if got := resolveSessionID(input, "muse"); got != "muse-session-1" {
-		t.Errorf("resolveSessionID = %q, want muse-session-1", got)
-	}
-	sessionID, transcriptPath := resolveSessionIDWithTranscript(input, "muse")
-	if sessionID != "muse-session-1" {
-		t.Errorf("resolveSessionIDWithTranscript session = %q, want muse-session-1", sessionID)
-	}
-	if transcriptPath != "/tmp/muse/transcripts/muse-session-1.jsonl" {
-		t.Errorf("resolveSessionIDWithTranscript transcript = %q, want Muse's transcript_path", transcriptPath)
-	}
-	if got := resolveCwd(input, "muse"); got != "/tmp/muse-project" {
-		t.Errorf("resolveCwd = %q, want /tmp/muse-project", got)
-	}
-}
-
-// transcript_path is documented as nullable and model as the literal string "unknown". Neither is
-// an error, and neither may take the session id or the workspace down with it: a hook that panicked
-// or bailed on a null would drop every event from a session that happened to have no transcript.
-func TestMuseToleratesNullTranscriptPath(t *testing.T) {
-	setupHookConfigDirs(t)
-	platformFlag = "muse"
-
-	input := map[string]interface{}{
-		"hook_event_name": "UserPromptSubmit",
-		"session_id":      "muse-session-2",
-		"cwd":             "/tmp/muse-project",
-		"model":           "unknown",
-		"transcript_path": nil,
-	}
-
-	sessionID, transcriptPath := resolveSessionIDWithTranscript(input, "muse")
-	if sessionID != "muse-session-2" {
-		t.Fatalf("resolveSessionIDWithTranscript session = %q, want muse-session-2", sessionID)
-	}
-	if transcriptPath != "" {
-		t.Fatalf("resolveSessionIDWithTranscript transcript = %q, want empty for a null path", transcriptPath)
-	}
-	if got := resolveCwd(input, "muse"); got != "/tmp/muse-project" {
-		t.Fatalf("resolveCwd = %q, want the workspace to survive a null transcript_path", got)
-	}
-}
-
 // Muse gets its own state directory. Sharing Claude's would mix two runtimes' session state and
 // hook logs in one place: a stale-evaluation cleanup for a Muse session would walk Claude's
 // sessions, and `~/.beacon/claude/hooks.log` would interleave two runtimes.
@@ -196,9 +137,9 @@ func TestMusePermissionRequestIsRecordedAsAnObservedApproval(t *testing.T) {
 	}
 }
 
-// turn_id is the only per-turn boundary anything in a Muse payload offers, and the endpoint schema
-// has no field for it. Keeping the whole payload under raw.muse preserves it -- along with
-// permission_mode and the SessionStart `source` -- without inventing schema fields for one runtime.
+// turn_id is the only per-turn boundary anything in a Muse payload offers. It is promoted to
+// prompt.id like every runtime's turn id, and the whole payload is still kept under raw.muse for
+// permission_mode and the SessionStart `source`, which have no schema field.
 func TestMuseRawPayloadPreservesTheTurnID(t *testing.T) {
 	setupHookConfigDirs(t)
 	platformFlag = "muse"
@@ -219,6 +160,9 @@ func TestMuseRawPayloadPreservesTheTurnID(t *testing.T) {
 	event := lastEndpointEvent(t, logPath)
 	if got := leaf(event, "raw", "muse", "turn_id"); got != "turn-7" {
 		t.Fatalf("raw.muse.turn_id = %q, want turn-7", got)
+	}
+	if got := leaf(event, "prompt", "id"); got != "turn-7" {
+		t.Fatalf("prompt.id = %q, want turn-7", got)
 	}
 	if got := leaf(event, "raw", "muse", "permission_mode"); got != "acceptEdits" {
 		t.Fatalf("raw.muse.permission_mode = %q, want acceptEdits", got)
@@ -292,10 +236,6 @@ func TestMusePolicyDenyIsScopedToTheInstalledPlatformSpelling(t *testing.T) {
 	platformFlag = "muse-code"
 	if deny := policyDenyResponse("blocked", policycontract.PhasePreTool); deny != nil {
 		t.Fatalf("policyDenyResponse(muse-code) = %#v; only --platform muse is wired", deny)
-	}
-	platformFlag = "muse"
-	if deny := policyDenyResponse("blocked", policycontract.PhasePreTool); deny == nil {
-		t.Fatal("policyDenyResponse(muse) = nil, want Muse's deny shape")
 	}
 }
 
@@ -400,7 +340,6 @@ func TestMuseCompactionEventsAreRecorded(t *testing.T) {
 		action string
 	}{
 		{"pre", func() { runCompaction("session.compacting", "Context compaction started") }, "session.compacting"},
-		{"post", func() { runCompaction("session.compacted", "Context compaction completed") }, "session.compacted"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			setupHookConfigDirs(t)

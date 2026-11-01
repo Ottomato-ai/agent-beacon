@@ -2,9 +2,11 @@ package service
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -48,6 +50,10 @@ type InventoryManager struct {
 	UserMode bool
 	// Kind selects the backend; the zero value auto-detects.
 	Kind Kind
+	// Env is set in the job's environment. launchd and systemd start the job without the
+	// installing user's shell environment, so anything the inventory scan reads from it has to
+	// be written into the unit.
+	Env map[string]string
 }
 
 func (m InventoryManager) resolvedKind() Kind {
@@ -170,7 +176,7 @@ func (m InventoryManager) WriteUnit(program, logPath string) (string, error) {
 	args := inventoryJobArgs(m.UserMode, logPath)
 	if m.resolvedKind() == KindSystemd {
 		svc := filepath.Join(filepath.Dir(path), InventoryServiceUnit)
-		if err := os.WriteFile(svc, []byte(inventoryServiceUnit(program, args, m.UserMode)), 0o644); err != nil {
+		if err := os.WriteFile(svc, []byte(inventoryServiceUnit(program, args, m.UserMode, m.Env)), 0o644); err != nil {
 			return "", err
 		}
 		if err := os.WriteFile(path, []byte(inventoryTimerUnit(InventoryInterval())), 0o644); err != nil {
@@ -181,7 +187,14 @@ func (m InventoryManager) WriteUnit(program, logPath string) (string, error) {
 		}
 		return path, nil
 	}
-	content := inventoryPlist(InventoryLabel, program, args, InventoryInterval(), inventoryJobLogPrefix(m.UserMode))
+	if err := ensureLaunchdLogDir(m.UserMode, InventoryLabel); err != nil {
+		return "", err
+	}
+	stdout, stderr, err := launchdLogPaths(m.UserMode, InventoryLabel)
+	if err != nil {
+		return "", err
+	}
+	content := inventoryPlist(InventoryLabel, program, args, InventoryInterval(), stdout, stderr, m.Env)
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		return "", err
 	}
@@ -270,13 +283,16 @@ func (m InventoryManager) Status() Status {
 }
 
 // inventoryServiceUnit is the oneshot job the timer triggers.
-func inventoryServiceUnit(program string, args []string, userMode bool) string {
+func inventoryServiceUnit(program string, args []string, userMode bool, env map[string]string) string {
 	var b strings.Builder
 	b.WriteString("[Unit]\n")
 	b.WriteString("Description=Beacon endpoint inventory heartbeat\n")
 	b.WriteString("Documentation=https://docs.asymptotelabs.ai/cli/endpoint-inventory\n")
 	b.WriteString("\n[Service]\n")
 	b.WriteString("Type=oneshot\n")
+	for _, key := range slices.Sorted(maps.Keys(env)) {
+		fmt.Fprintf(&b, "Environment=%s\n", systemdArg(key+"="+env[key]))
+	}
 	fmt.Fprintf(&b, "ExecStart=%s", systemdArg(program))
 	for _, arg := range args {
 		fmt.Fprintf(&b, " %s", systemdArg(arg))
@@ -308,24 +324,21 @@ WantedBy=timers.target
 `, int(interval.Seconds()), InventoryServiceUnit)
 }
 
-// inventoryJobLogPrefix is where launchd sends the job's stdout and stderr. The user-mode path
-// carries the uid: a machine that also has (or once had) the system-mode job owns
-// /tmp/<label>.out as root, and a LaunchAgent that cannot open its own log files is refused by
-// launchd with EX_CONFIG before it ever runs.
-func inventoryJobLogPrefix(userMode bool) string {
-	if userMode {
-		return fmt.Sprintf("/tmp/%s.%d", InventoryLabel, os.Getuid())
-	}
-	return "/tmp/" + InventoryLabel
-}
-
 // inventoryPlist renders the launchd job: one shot at load, then every interval. No KeepAlive,
 // so launchd does not restart a job that exited normally.
-func inventoryPlist(label, program string, args []string, interval time.Duration, logPrefix string) string {
+func inventoryPlist(label, program string, args []string, interval time.Duration, stdoutPath, stderrPath string, env map[string]string) string {
 	var argv strings.Builder
 	fmt.Fprintf(&argv, "    <string>%s</string>\n", xmlEscape(program))
 	for _, arg := range args {
 		fmt.Fprintf(&argv, "    <string>%s</string>\n", xmlEscape(arg))
+	}
+	var envBlock strings.Builder
+	if len(env) > 0 {
+		envBlock.WriteString("  <key>EnvironmentVariables</key>\n  <dict>\n")
+		for _, key := range slices.Sorted(maps.Keys(env)) {
+			fmt.Fprintf(&envBlock, "    <key>%s</key>\n    <string>%s</string>\n", xmlEscape(key), xmlEscape(env[key]))
+		}
+		envBlock.WriteString("  </dict>\n")
 	}
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -336,15 +349,15 @@ func inventoryPlist(label, program string, args []string, interval time.Duration
   <key>ProgramArguments</key>
   <array>
 %s  </array>
-  <key>RunAtLoad</key>
+%s  <key>RunAtLoad</key>
   <true/>
   <key>StartInterval</key>
   <integer>%d</integer>
   <key>StandardOutPath</key>
-  <string>%s.out</string>
+  <string>%s</string>
   <key>StandardErrorPath</key>
-  <string>%s.err</string>
+  <string>%s</string>
 </dict>
 </plist>
-`, xmlEscape(label), argv.String(), int(interval.Seconds()), xmlEscape(logPrefix), xmlEscape(logPrefix))
+`, xmlEscape(label), argv.String(), envBlock.String(), int(interval.Seconds()), xmlEscape(stdoutPath), xmlEscape(stderrPath))
 }

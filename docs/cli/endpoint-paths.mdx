@@ -12,6 +12,7 @@ Beacon manages different paths depending on whether you install in user mode or 
 | Config | `~/.beacon/endpoint/config.json` | `/Library/Application Support/Beacon/Endpoint/config.json` | `/etc/beacon/endpoint/config.json` | `%ProgramData%\Beacon\Endpoint\config.json` |
 | Base directory | `~/.beacon/endpoint` | `/Library/Application Support/Beacon/Endpoint` | `/etc/beacon/endpoint` | `%ProgramData%\Beacon\Endpoint` |
 | Runtime log | `~/.beacon/endpoint/logs/runtime.jsonl` | `/var/log/beacon-agent/runtime.jsonl` | `/var/log/beacon-agent/runtime.jsonl` | `%ProgramData%\Beacon\Endpoint\logs\runtime.jsonl` |
+| Staged Beacon Cloud session backfill (written by each connect) | `~/.beacon/endpoint/logs/cloud-backfill.jsonl` | `/var/log/beacon-agent/cloud-backfill.jsonl` | `/var/log/beacon-agent/cloud-backfill.jsonl` | `%ProgramData%\Beacon\Endpoint\logs\cloud-backfill.jsonl` |
 | Rotated runtime archives | `~/.beacon/endpoint/logs/runtime.jsonl.1` through `.5` | `/var/log/beacon-agent/runtime.jsonl.1` through `.5` | `/var/log/beacon-agent/runtime.jsonl.1` through `.5` | `%ProgramData%\Beacon\Endpoint\logs\runtime.jsonl.1` through `.5` |
 | Threat rule store | `~/.beacon/endpoint/rules` | `/Library/Application Support/Beacon/Endpoint/rules` | `/etc/beacon/endpoint/rules` | `%ProgramData%\Beacon\Endpoint\rules` |
 | Collector config | `~/.beacon/endpoint/otelcol.yaml` | `/Library/Application Support/Beacon/Endpoint/otelcol.yaml` | `/etc/beacon/endpoint/otelcol.yaml` | `%ProgramData%\Beacon\Endpoint\otelcol.yaml` |
@@ -53,16 +54,16 @@ Hook and plugin configuration is written to:
 | Runtime | Global config path | Project-local config path |
 |---|---|---|
 | Antigravity CLI | `~/.gemini/config/hooks.json` | `./.agents/hooks.json` |
-| Claude Code | `~/.claude/settings.json` | `./.claude/settings.json` |
+| Claude Code | `~/.claude/settings.json` (`$CLAUDE_CONFIG_DIR/settings.json` when set) | `./.claude/settings.json` |
 | Cline | `~/.cline/plugins/beacon.ts` | `./.cline/plugins/beacon.ts` |
 | Cursor | `~/.cursor/hooks.json` | `./.cursor/hooks.json` |
 | Devin CLI | `~/.config/devin/config.json` | `./.devin/hooks.v1.json` |
 | Devin Desktop | `~/.codeium/windsurf/hooks.json` | `./.windsurf/hooks.json` |
 | Factory | `~/.factory/settings.json` | `./.factory/settings.json` |
 | Grok Build | `~/.grok/hooks/beacon-endpoint.json` | `./.grok/hooks/beacon-endpoint.json` |
-| Hermes Agent | `~/.hermes/config.yaml` | Not supported |
+| Hermes Agent | `$HERMES_HOME/config.yaml` or the active profile's (default `~/.hermes/config.yaml`) | Not supported |
 | OpenCode | `~/.config/opencode/plugins/beacon.ts` | `./.opencode/plugins/beacon.ts` |
-| Pi | `~/.pi/agent/extensions/beacon.ts` | `./.pi/extensions/beacon.ts` |
+| Pi | `$PI_CODING_AGENT_DIR/extensions/beacon.ts` (default `~/.pi/agent/extensions/beacon.ts`) | `./.pi/extensions/beacon.ts` |
 | Qwen Code | `~/.qwen/settings.json` | `./.qwen/settings.json` |
 
 ## Related

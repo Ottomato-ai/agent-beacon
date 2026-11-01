@@ -91,14 +91,18 @@ type MCPResourceInfo = asymptoteobserve.MCPResourceInfo
 type MCPSessionInfo = asymptoteobserve.MCPSessionInfo
 type ApprovalInfo = asymptoteobserve.ApprovalInfo
 type HandoffInfo = asymptoteobserve.HandoffInfo
+type ShareInfo = asymptoteobserve.ShareInfo
 type VCSInfo = asymptoteobserve.VCSInfo
 type VCSRefInfo = asymptoteobserve.VCSRefInfo
 type VCSRefHeadInfo = asymptoteobserve.VCSRefHeadInfo
 type VCSRepositoryInfo = asymptoteobserve.VCSRepositoryInfo
 type VCSRepositoryURLInfo = asymptoteobserve.VCSRepositoryURLInfo
 type VCSAttributionInfo = asymptoteobserve.VCSAttributionInfo
+type VCSHookInfo = asymptoteobserve.VCSHookInfo
 type PolicyInfo = asymptoteobserve.PolicyInfo
 type PromptInfo = asymptoteobserve.PromptInfo
+type SystemContextInfo = asymptoteobserve.SystemContextInfo
+type SkillRefInfo = asymptoteobserve.SkillRefInfo
 type ContentInfo = asymptoteobserve.ContentInfo
 type DestinationInfo = asymptoteobserve.DestinationInfo
 type HealthInfo = asymptoteobserve.HealthInfo
@@ -135,6 +139,10 @@ const (
 	ContentRetentionMetadata = asymptoteobserve.ContentRetentionMetadata
 	ContentRetentionRedacted = asymptoteobserve.ContentRetentionRedacted
 	ContentRetentionFull     = asymptoteobserve.ContentRetentionFull
+
+	SystemContextSkillListing       = asymptoteobserve.SystemContextSkillListing
+	SystemContextSourceSystemPrompt = asymptoteobserve.SystemContextSourceSystemPrompt
+	SystemContextSourceTranscript   = asymptoteobserve.SystemContextSourceTranscript
 )
 
 var NewEvent = asymptoteobserve.NewEvent

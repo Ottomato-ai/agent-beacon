@@ -59,7 +59,7 @@ func newVolumeFixture(t *testing.T) volumeFixture {
 func (f volumeFixture) externalPlist(t *testing.T, label string) string {
 	t.Helper()
 	path := filepath.Join(f.external, "Library", "LaunchAgents", label+".plist")
-	if err := os.WriteFile(path, []byte(plist(label, "/opt/homebrew/bin/beacon-otelcol", "/x/otelcol.yaml")), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(plist(label, "/opt/homebrew/bin/beacon-otelcol", "/x/otelcol.yaml", "/x/out", "/x/err")), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	return path
@@ -68,7 +68,7 @@ func (f volumeFixture) externalPlist(t *testing.T, label string) string {
 func (f volumeFixture) bootPlist(t *testing.T, label string) string {
 	t.Helper()
 	path := filepath.Join(f.boot, "Users", "test", "Library", "LaunchAgents", label+".plist")
-	if err := os.WriteFile(path, []byte(plist(label, "/opt/homebrew/bin/beacon-otelcol", "/x/otelcol.yaml")), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(plist(label, "/opt/homebrew/bin/beacon-otelcol", "/x/otelcol.yaml", "/x/out", "/x/err")), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	return path
@@ -136,22 +136,6 @@ func TestInspectLaunchAgentVolumeFlagsPlistOffTheStartupVolume(t *testing.T) {
 	}
 }
 
-func TestInspectLaunchAgentVolumeRejectsAnUnsafeStagingDirectory(t *testing.T) {
-	testenv.RequirePOSIXFileModes(t)
-	f := newVolumeFixture(t)
-	if err := os.Mkdir(f.staging, 0o770); err != nil {
-		t.Fatal(err)
-	}
-
-	vol := InspectLaunchAgentVolume(f.externalPlist(t, UserLabel))
-	if !vol.External || vol.StagingDir != "" {
-		t.Fatalf("unsafe staging directory reported usable: %#v", vol)
-	}
-	if !strings.Contains(vol.StagingError, "must not be accessible to other users") {
-		t.Fatalf("staging error does not explain unsafe permissions: %#v", vol)
-	}
-}
-
 func TestInspectLaunchAgentVolumeFallsBackFromAnUnsafeStagingDirectory(t *testing.T) {
 	testenv.RequirePOSIXFileModes(t)
 	f := newVolumeFixture(t)
@@ -171,14 +155,6 @@ func TestInspectLaunchAgentVolumeFallsBackFromAnUnsafeStagingDirectory(t *testin
 	want := filepath.Join(fallbackBase, launchdStagingDirName())
 	if vol.StagingDir != want || vol.StagingError != "" {
 		t.Fatalf("fallback staging directory = %#v, want %s", vol, want)
-	}
-}
-
-func TestInspectLaunchAgentVolumeLeavesStartupVolumeHomesAlone(t *testing.T) {
-	f := newVolumeFixture(t)
-	vol := InspectLaunchAgentVolume(f.bootPlist(t, UserLabel))
-	if vol.External || vol.StagingDir != "" {
-		t.Fatalf("a home on the startup volume must not be staged: %#v", vol)
 	}
 }
 

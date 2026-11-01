@@ -20,7 +20,7 @@ function Fail {
     $script:failures++
 }
 
-$scripts = @('install-endpoint.ps1', 'uninstall-endpoint.ps1', 'build-msi.ps1')
+$scripts = @('install-endpoint.ps1', 'uninstall-endpoint.ps1', 'build-msi.ps1', 'smoke-restricted-log.ps1')
 foreach ($name in $scripts) {
     $path = Join-Path $scriptDir $name
     if (-not (Test-Path -LiteralPath $path)) {
@@ -47,6 +47,10 @@ foreach ($needle in @('endpoint', 'install', '--system', 'user-config', 'repair-
         Fail "install-endpoint.ps1 no longer references '$needle'"
     }
 }
+# BEACON_LOG_ACCESS is the one contract for the log access mode across all three platforms' scripts.
+if ($install -notmatch "BEACON_LOG_ACCESS" -or $install -notmatch [regex]::Escape("'--log-access'")) {
+    Fail "install-endpoint.ps1 no longer passes BEACON_LOG_ACCESS on as --log-access"
+}
 # The step whose absence made the Linux package produce a healthy collector that captured nothing.
 if ($install -notmatch 'repair-installed') {
     Fail "install-endpoint.ps1 must configure the interactive user's runtime, or the endpoint captures nothing"
@@ -56,6 +60,17 @@ $uninstall = Get-Content -Raw -LiteralPath (Join-Path $scriptDir 'uninstall-endp
 foreach ($needle in @('--keep-logs', '--keep-config', 'BEACON_PURGE')) {
     if ($uninstall -notmatch [regex]::Escape($needle)) {
         Fail "uninstall-endpoint.ps1 no longer honors '$needle'; removing the product must not destroy configuration or logs by default"
+    }
+}
+
+# The ACL on %ProgramData%\Beacon belongs to `beacon endpoint install --system`, which gives ordinary
+# users read and execute plus append to the runtime log, and nothing that lets them delete, rename or
+# plant links. A packaging script that grants Modify or Full Control on top would quietly undo that.
+foreach ($name in @('install-endpoint.ps1', 'uninstall-endpoint.ps1')) {
+    $text = Get-Content -Raw -LiteralPath (Join-Path $scriptDir $name)
+    $code = ($text -split "`n" | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
+    if ($code -match '(?i)icacls[^\n]*/grant' -or $code -match '(?i)FileSystemAccessRule') {
+        Fail "$name grants file system access itself; the ACL is applied by 'beacon endpoint install --system' and must not be widened here"
     }
 }
 

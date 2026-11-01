@@ -10,6 +10,7 @@ import (
 	"github.com/asymptote-labs/agent-beacon/cli/beacon-hooks/internal/config"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon-hooks/internal/diff"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon-hooks/internal/logging"
+	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve"
 )
 
 var postToolCmd = &cobra.Command{
@@ -222,11 +223,15 @@ func parseClaudeCopilotInput(input map[string]interface{}, logger *logging.Logge
 	// missing the event: the log would assert a file changed when it did not.
 	//
 	// Returning nil hands the payload back to emitPostToolObserved, which classifies it as
-	// `tool.failed` at high severity. Antigravity guards the same way just above, for the same
-	// reason. Scoped to the platform rather than applied to every runtime because the branch above
-	// establishes that each runtime's failure signal is its own; widening it would change Claude
-	// Code's recorded behavior with no fixture to say what that behavior should become.
+	// `tool.failed` at high severity. Antigravity guards the same way just above, and Grok just
+	// below, for the same reason. Scoped to the platform rather than applied to every runtime
+	// because the branch above establishes that each runtime's failure signal is its own; widening
+	// it would change Claude Code's recorded behavior with no fixture to say what that behavior
+	// should become.
 	if platformFlag == "qwen" && qwenToolFailed(input) {
+		return nil
+	}
+	if platformFlag == "grok" && reportedPostToolFailure(getFirstStr(input, "hook_event_name", "hookEventName"), input) {
 		return nil
 	}
 
@@ -328,6 +333,7 @@ func recordLocalEdit(params *evaluationParams, input map[string]interface{}, log
 	if platformFlag == "dsh" {
 		fields["raw"] = mergeNested(fields["raw"], map[string]interface{}{"dsh": input})
 	}
+	applyPromptID(fields, input)
 	logger.EndpointEvent("file.modified", "file", "info", "File edit observed", fields)
 }
 
@@ -395,11 +401,38 @@ func resolveToolResponse(input map[string]interface{}) map[string]interface{} {
 			}
 		}
 	}
+	// Cursor's postToolUse puts the result under `tool_output`, as a JSON-encoded string. Scoped to
+	// Cursor because Kimi Code uses the same key with its own reader (applyKimiToolResult).
+	if platformFlag == "cursor" {
+		if output := strings.TrimSpace(getFirstStr(input, "tool_output")); output != "" {
+			var parsed map[string]interface{}
+			if strings.HasPrefix(output, "{") && json.Unmarshal([]byte(output), &parsed) == nil && len(parsed) > 0 {
+				return parsed
+			}
+			return map[string]interface{}{"result": output}
+		}
+	}
+	// Claude Code sends an MCP tool's result as a bare list of content blocks. A list from any
+	// other runtime is read the same way: until this, every list response was dropped.
+	if content, ok := input["tool_response"].([]interface{}); ok {
+		return contentBlockResponse(content)
+	}
 	// If tool_response is a plain string, wrap it for downstream compatibility
 	if respStr, ok := input["tool_response"].(string); ok && respStr != "" {
 		return map[string]interface{}{"result": respStr}
 	}
 	return nil
+}
+
+// contentBlockResponse is a tool result that arrived as a list of content blocks, in the shape every
+// capture path records one: under "content", where an MCP CallToolResult holds its blocks, so a
+// result reads the same whichever path or runtime recorded it, with each block's encoded bytes
+// replaced by their size and digest. An empty list is a result with no content.
+func contentBlockResponse(blocks []interface{}) map[string]interface{} {
+	if len(blocks) == 0 {
+		return nil
+	}
+	return map[string]interface{}{"content": asymptoteobserve.SummarizeEncodedContent(blocks)}
 }
 
 func emitPostToolObserved(logger *logging.Logger, input map[string]interface{}) {
@@ -432,6 +465,13 @@ func emitPostToolObserved(logger *logging.Logger, input map[string]interface{}) 
 	for key, value := range toolFieldsWithResponse(toolName, toolInput, toolResponse) {
 		fields[key] = value
 	}
+	// A Bash command that ran and exited non-zero is recorded the way the OTLP and transcript paths
+	// record the same call: command.executed, high severity. As tool.failed it would never match
+	// their copies, and each copy would keep the command's output in the log.
+	if platformFlag == "claude" && applyClaudeBashResult(fields, input, toolName, toolResponse) {
+		emitHookEvent(logger, "command.executed", "command", "high", "Shell command failed", input, fields)
+		return
+	}
 	// Kimi Code's result is read before the shared failure branch below, unlike every other
 	// runtime's, and the ordering is the whole point. Kimi Code reports a failure by sending
 	// `PostToolUseFailure` -- the exact spelling that branch matches -- so it is the branch that
@@ -444,7 +484,7 @@ func emitPostToolObserved(logger *logging.Logger, input map[string]interface{}) 
 	if platformFlag == kimiPlatform {
 		applyKimiToolResult(fields, toolName, toolInput, input)
 	}
-	if hookEvent == "PostToolUseFailure" || hookEvent == "postToolUseFailure" || hookEvent == "post_tool_use_failure" || getFirstStr(input, "error") != "" {
+	if reportedPostToolFailure(hookEvent, input) {
 		emitHookEvent(logger, "tool.failed", "tool", "high", "Tool execution failed", input, fields)
 		return
 	}
@@ -502,6 +542,7 @@ func emitPostToolObserved(logger *logging.Logger, input map[string]interface{}) 
 		return
 	}
 	action := actionForTool(hookEvent, toolName, toolInput, toolResponse)
+	applyIngestedToolResult(fields, action, toolName, toolResponse)
 	category := "tool"
 	if strings.HasPrefix(action, "file.") {
 		category = "file"
@@ -515,6 +556,11 @@ func emitPostToolObserved(logger *logging.Logger, input map[string]interface{}) 
 		message = "Shell command executed"
 	}
 	emitHookEvent(logger, action, category, "info", message, input, fields)
+}
+
+func reportedPostToolFailure(hookEvent string, input map[string]interface{}) bool {
+	return hookEvent == "PostToolUseFailure" || hookEvent == "postToolUseFailure" ||
+		hookEvent == "post_tool_use_failure" || getFirstStr(input, "error") != ""
 }
 
 func emitCursorPostHookObserved(logger *logging.Logger, input map[string]interface{}) bool {

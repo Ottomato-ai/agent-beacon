@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/schema"
+	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve"
 )
 
 func TestSanitizeRemoteURL(t *testing.T) {
@@ -43,10 +44,10 @@ func TestLinkEventsShape(t *testing.T) {
 		RepoRoot:     "/work/repo",
 		ChangedFiles: 3,
 		Candidates: []Candidate{
-			{Link: Link{"claude_code", "s1"}, Files: []string{"a.go", "b.go"}},
-			{Link: Link{"cursor", "c1"}, Files: []string{"a.go"}, AlreadyLinked: true},
+			{Link: Link{Harness: "claude_code", SessionID: "s1"}, Files: []string{"a.go", "b.go"}},
+			{Link: Link{Harness: "cursor", SessionID: "c1"}, Files: []string{"a.go"}, AlreadyLinked: true},
 		},
-		Added:       []Link{{"claude_code", "s1"}},
+		Added:       []Link{{Harness: "claude_code", SessionID: "s1"}},
 		NoteUpdated: true,
 	}
 	events := LinkEvents(result, CommitContext{Branch: "main", RemoteURL: "https://github.com/org/repo.git"}, "1.2.3")
@@ -57,7 +58,7 @@ func TestLinkEventsShape(t *testing.T) {
 	if err := e.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	if e.Event.Action != LinkAction || e.Event.Fidelity != "inferred" || e.Harness.Name != "claude_code" || e.Harness.CollectionMethod != "" {
+	if e.Event.Action != asymptoteobserve.ActionCommitLinked || e.Event.Fidelity != "inferred" || e.Harness.Name != "claude_code" || e.Harness.CollectionMethod != "" {
 		t.Fatalf("event info %+v harness %+v", e.Event, e.Harness)
 	}
 	if e.Session == nil || e.Session.ID != "s1" || e.Session.WorkingDirectory != "/work/repo" || e.Repository != "/work/repo" || e.Branch != "main" {
@@ -124,8 +125,8 @@ func TestLinkEventsAreNeverEvidence(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "runtime.jsonl")
 	events := LinkEvents(Result{
 		Commit: Commit{SHA: strings.Repeat("a", 40)}, RepoRoot: repo.Root, ChangedFiles: 1,
-		Candidates: []Candidate{{Link: Link{"codex_cli", "s"}, Files: []string{"x.go"}}},
-		Added:      []Link{{"codex_cli", "s"}},
+		Candidates: []Candidate{{Link: Link{Harness: "codex_cli", SessionID: "s"}, Files: []string{"x.go"}}},
+		Added:      []Link{{Harness: "codex_cli", SessionID: "s"}},
 	}, CommitContext{Branch: "main"}, "")
 	var b strings.Builder
 	for _, e := range events {

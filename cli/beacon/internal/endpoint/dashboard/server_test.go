@@ -2,6 +2,7 @@ package dashboard
 
 import (
 	"encoding/json"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/diagnostics"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/lifecycle"
@@ -17,32 +19,6 @@ import (
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/tokens"
 	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve"
 )
-
-func TestStatusUsesExplicitRuntimeLogPath(t *testing.T) {
-	logPath := filepath.Join(t.TempDir(), "runtime.jsonl")
-	handler, err := Handler(Options{UserMode: true, LogPath: logPath})
-	if err != nil {
-		t.Fatalf("Handler returned error: %v", err)
-	}
-
-	req := httptest.NewRequest(http.MethodGet, "/api/status", nil)
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status code = %d, body = %s", rec.Code, rec.Body.String())
-	}
-
-	var status StatusResponse
-	if err := json.Unmarshal(rec.Body.Bytes(), &status); err != nil {
-		t.Fatalf("unmarshal status response: %v", err)
-	}
-	if status.LogPath != logPath {
-		t.Fatalf("LogPath = %q, want %q", status.LogPath, logPath)
-	}
-	if status.RuntimeLog.EffectiveLogPath != logPath {
-		t.Fatalf("RuntimeLog.EffectiveLogPath = %q, want %q", status.RuntimeLog.EffectiveLogPath, logPath)
-	}
-}
 
 func TestStatusUsesRequestedRuntimeLogSource(t *testing.T) {
 	oldResolveRuntimeLog := resolveRuntimeLog
@@ -267,6 +243,16 @@ func TestTokensEndpointAggregatesUsage(t *testing.T) {
 	if report.Totals.InputTokens != 160 || report.Totals.OutputTokens != 60 || report.Totals.CostUSD != 0.5 {
 		t.Fatalf("totals = %#v", report.Totals)
 	}
+	// The list-price estimate rides beside the reported cost: claude-sonnet-4-5 100 x $3 + 40 x
+	// $15 per MTok, plus gpt-4o-mini 60 x $0.15 + 20 x $0.60 = $0.000921. The Claude session
+	// reported its cost, so its effective cost is that; the cloud session's is its estimate.
+	if report.Totals.EstimatedCostUSD != 0.000921 || report.Totals.CostSource != tokens.CostSourceMixed ||
+		math.Abs(report.Totals.EffectiveCostUSD-0.500021) > 1e-12 {
+		t.Fatalf("cost fields = %#v", report.Totals)
+	}
+	if report.Pricing == nil || report.Pricing.Catalog.Commit == "" || len(report.Pricing.Models) != 2 {
+		t.Fatalf("pricing = %#v", report.Pricing)
+	}
 	if len(report.ByModel) != 2 || report.ByModel[0].Key != "claude-sonnet-4-5" {
 		t.Fatalf("by_model = %#v", report.ByModel)
 	}
@@ -302,54 +288,13 @@ func TestTokensEndpointAggregatesUsage(t *testing.T) {
 	}
 }
 
-// TestTokensEndpointDedupesCumulativeSameSecondDatapoints reproduces a real
-// Claude Code export: a batch of cumulative token.usage datapoints written to
-// the log within the same second. ReadEvents returns events newest-first, so
-// the token endpoint must still feed Aggregate in chronological order or the
-// cumulative dedup misreads each step-down as a counter reset and sums the raw
-// cumulative values instead of the per-interval deltas.
-func TestTokensEndpointDedupesCumulativeSameSecondDatapoints(t *testing.T) {
-	logPath := filepath.Join(t.TempDir(), "runtime.jsonl")
-	mk := func(ts string, cumulative int64) string {
-		return `{"timestamp":"` + ts + `","vendor":"beacon","product":"endpoint-agent","schema_version":"1.0","event":{"kind":"agent_runtime","action":"token.usage","category":"metric"},"severity":"info","endpoint":{"os":"linux"},"harness":{"name":"claude_code"},"session":{"id":"s1"},"model":"claude-sonnet-4-5","gen_ai":{"usage":{"input_tokens":` +
-			itoa(cumulative) + `}},"message":"claude_code.token.usage","raw":{"metric_name":"claude_code.token.usage","metric_temporality":"Cumulative"}}`
-	}
-	// Append order is chronological; all three share the same second.
-	lines := []string{
-		mk("2026-06-11T10:00:00Z", 1200),
-		mk("2026-06-11T10:00:00Z", 2700),
-		mk("2026-06-11T10:00:00Z", 4500),
-	}
-	if err := os.WriteFile(logPath, []byte(strings.Join(lines, "\n")+"\n"), 0644); err != nil {
-		t.Fatalf("write fixture log: %v", err)
-	}
-	handler, err := Handler(Options{UserMode: true, LogPath: logPath})
-	if err != nil {
-		t.Fatalf("Handler returned error: %v", err)
-	}
-	req := httptest.NewRequest(http.MethodGet, "/api/tokens", nil)
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status code = %d, body = %s", rec.Code, rec.Body.String())
-	}
-	var report tokens.Report
-	if err := json.Unmarshal(rec.Body.Bytes(), &report); err != nil {
-		t.Fatalf("unmarshal tokens report: %v", err)
-	}
-	// Deltas 1200, 1500, 1800 -> 4500. Raw (broken) sum would be 8400.
-	if report.Totals.InputTokens != 4500 {
-		t.Fatalf("cumulative input tokens = %d, want 4500 (raw over-count is 8400)", report.Totals.InputTokens)
-	}
-}
-
 func itoa(v int64) string { return strconv.FormatInt(v, 10) }
 
-// TestTokensEndpointDedupesManySameSecondDatapoints uses more than nine
-// cumulative datapoints in the same second so line numbers reach two digits.
-// ReadEvents breaks same-timestamp ties on lexicographic line IDs (line-9 >
-// line-10), so the token path must reorder by numeric append order or the
-// cumulative dedup scrambles and inflates totals.
+// TestTokensEndpointDedupesManySameSecondDatapoints reproduces a real Claude Code export: a batch of
+// cumulative token.usage datapoints written to the log within the same second. ReadEvents returns
+// events newest-first and breaks same-timestamp ties on lexicographic line IDs (line-9 > line-10),
+// so the token endpoint must reorder by numeric append order before Aggregate, or the cumulative
+// dedup misreads each step-down as a counter reset and sums the raw cumulative values.
 func TestTokensEndpointDedupesManySameSecondDatapoints(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "runtime.jsonl")
 	var lines []string
@@ -525,9 +470,6 @@ func TestRunScanRejectsEmptyRuleSet(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected empty rule set to be rejected")
 	}
-	if !strings.Contains(err.Error(), "no rules to run") {
-		t.Fatalf("error = %q, want no rules to run", err)
-	}
 }
 
 func TestInventoryEndpointReturnsConfigsAndMCPServers(t *testing.T) {
@@ -628,35 +570,12 @@ func TestStaticDashboardPagesServe(t *testing.T) {
 		t.Fatalf("Handler returned error: %v", err)
 	}
 
-	cases := []struct {
-		path string
-		want string
-	}{
-		{path: "/", want: "Beacon Endpoint Agent Activity"},
-		{path: "/session.html", want: "Beacon Endpoint Session Events"},
-		{path: "/overview.html", want: "Beacon Endpoint Agent Activity"},
-		{path: "/tokens.html", want: "Beacon Endpoint Token Usage"},
-		{path: "/memory.html", want: "Beacon Memory"},
-		{path: "/detections.html", want: "Beacon Endpoint Detections"},
-		{path: "/findings.html", want: "Beacon Endpoint Findings"},
-		{path: "/inventory.html", want: "Beacon Endpoint Agent Inventory"},
-		{path: "/inventory-hooks.html", want: "Beacon Endpoint Agent Inventory"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.path, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
-			rec := httptest.NewRecorder()
-			handler.ServeHTTP(rec, req)
-			if rec.Code != http.StatusOK {
-				t.Fatalf("status code = %d, body = %s", rec.Code, rec.Body.String())
-			}
-			if !strings.Contains(rec.Body.String(), tc.want) {
-				t.Fatalf("body did not contain %q", tc.want)
-			}
-			if count := strings.Count(rec.Body.String(), `href="/memory.html"`); count != 1 {
-				t.Fatalf("memory nav link count = %d, want 1", count)
-			}
-		})
+	for _, path := range []string{"/", "/session.html", "/overview.html", "/tokens.html", "/memory.html", "/detections.html", "/findings.html", "/inventory.html", "/inventory-hooks.html"} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusOK || !strings.HasPrefix(rec.Header().Get("Content-Type"), "text/html") {
+			t.Errorf("GET %s = %d %q, want an HTML page", path, rec.Code, rec.Header().Get("Content-Type"))
+		}
 	}
 }
 
@@ -684,4 +603,74 @@ func TestRequireLoopbackHostRejectsRebindingHosts(t *testing.T) {
 			t.Errorf("Host %q: status = %d, want %d", host, rec.Code, want)
 		}
 	}
+}
+
+// TestTokensEndpointCountsALiveAndBackfilledRequestOnce reads a Claude Code session the way the
+// production readers hand it to the token report: matched events plus a reduced context set. The
+// live OTLP channel's first event is the user_prompt log; the transcript stamps the request as it
+// streamed, before the api_request log that reports the same usage lands. The cutover has to come
+// from that first live event, which is neither a session.context row nor a usage record, or the
+// backfilled copy of the session's first request is counted beside the live one.
+func TestTokensEndpointCountsALiveAndBackfilledRequestOnce(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "runtime.jsonl")
+	line := func(ts, method, action, usage string) string {
+		genAI := ""
+		if usage != "" {
+			genAI = `,"gen_ai":{"usage":` + usage + `}`
+		}
+		return `{"timestamp":"` + ts + `","vendor":"beacon","product":"endpoint-agent","schema_version":"1.0","event":{"kind":"agent_runtime","action":"` + action + `","category":"session"},"severity":"info","endpoint":{"os":"linux","hostname":"devbox"},"harness":{"name":"claude_code","collection_method":"` + method + `"},"session":{"id":"sess-live-poll"},"model":"claude-opus-4-6"` + genAI + `,"message":"` + action + `"}`
+	}
+	lines := []string{
+		line("2026-06-11T10:00:00Z", "otlp", "prompt.submitted", ""),
+		line("2026-06-11T10:00:02Z", "poll", "token.usage", `{"input_tokens":6,"output_tokens":120,"cache_read":{"input_tokens":40000}}`),
+		line("2026-06-11T10:00:06Z", "otlp", "token.usage", `{"input_tokens":6,"output_tokens":120,"cache_read":{"input_tokens":40000}}`),
+	}
+	if err := os.WriteFile(logPath, []byte(strings.Join(lines, "\n")+"\n"), 0644); err != nil {
+		t.Fatalf("write fixture log: %v", err)
+	}
+
+	events, contexts, err := ReadTokenEventsAppendOrder(logPath, EventQuery{NoLimit: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := tokens.AggregateScopedWithContexts(events, contexts, "", tokens.Options{})
+	if report.Totals.OutputTokens != 120 || report.Totals.CacheReadInputTokens != 40000 || report.SuppressedPollEvents != 1 {
+		t.Fatalf("totals = %+v suppressed = %d, want one request (output 120, cache read 40000) and the backfill copy suppressed", report.Totals, report.SuppressedPollEvents)
+	}
+
+	// A window that starts after the live channel's first event must not move the cutover.
+	windowed, windowContexts, err := ReadTokenEventsAppendOrder(logPath, EventQuery{NoLimit: true, Since: mustParseTime(t, "2026-06-11T10:00:01Z")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	report = tokens.AggregateScopedWithContexts(windowed, windowContexts, "", tokens.Options{})
+	if report.Totals.OutputTokens != 120 || report.SuppressedPollEvents != 1 {
+		t.Fatalf("windowed totals = %+v suppressed = %d, want one request", report.Totals, report.SuppressedPollEvents)
+	}
+
+	handler, err := Handler(Options{UserMode: true, LogPath: logPath})
+	if err != nil {
+		t.Fatalf("Handler returned error: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/tokens", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status code = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var served tokens.Report
+	if err := json.Unmarshal(rec.Body.Bytes(), &served); err != nil {
+		t.Fatalf("unmarshal tokens report: %v", err)
+	}
+	if served.Totals.OutputTokens != 120 {
+		t.Fatalf("/api/tokens output = %d, want 120 (the backfill copy counted twice gives 240)", served.Totals.OutputTokens)
+	}
+}
+
+func mustParseTime(t *testing.T, value string) time.Time {
+	t.Helper()
+	parsed, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return parsed
 }

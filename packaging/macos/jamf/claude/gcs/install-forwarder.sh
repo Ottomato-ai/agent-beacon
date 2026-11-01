@@ -6,6 +6,7 @@ VECTOR_BIN="${BEACON_VECTOR_BIN:-/opt/beacon/bin/vector}"
 WRAPPER="${BEACON_GCS_FORWARDER_WRAPPER:-/opt/beacon/jamf/claude/gcs/run-forwarder.sh}"
 BASE_DIR="${BEACON_FORWARDER_BASE_DIR:-/Library/Application Support/Beacon/Forwarders}"
 LAUNCHDAEMONS_DIR="${BEACON_LAUNCHDAEMONS_DIR:-/Library/LaunchDaemons}"
+LOG_DIR="${BEACON_FORWARDER_LOG_DIR:-/Library/Logs/Beacon}"
 CONFIG_PATH="${BEACON_GCS_VECTOR_CONFIG:-$BASE_DIR/gcs-vector.toml}"
 ENV_PATH="${BEACON_GCS_VECTOR_ENV:-$BASE_DIR/gcs-vector.env}"
 DATA_DIR="${BEACON_GCS_VECTOR_DATA_DIR:-$BASE_DIR/vector-data/gcs}"
@@ -23,6 +24,7 @@ CREDENTIALS_PATH="${GOOGLE_APPLICATION_CREDENTIALS:-}"
 NO_START="${BEACON_NO_START:-0}"
 STOP_ATTEMPTS="${BEACON_FORWARDER_STOP_ATTEMPTS:-65}"
 START_ATTEMPTS="${BEACON_FORWARDER_START_ATTEMPTS:-15}"
+POLL_SECONDS="${BEACON_FORWARDER_POLL_SECONDS:-1}"
 
 GCS_PREFIX="${GCS_PREFIX%/}"
 case "$GCS_PREFIX" in
@@ -124,10 +126,16 @@ include_array() {
       *)
         mkdir -p "$(dirname "$path")"
         # Hooks run as the console user and append to the runtime log, so a missing log is
-        # created 0666, the mode Beacon's own writer uses. An existing log keeps its mode.
+        # created 0666, the mode Beacon's own writer uses. A log in the restricted access mode,
+        # which only the collector writes, is created 0640 instead (its directory's setgid bit
+        # gives it the beacon-log group). An existing log keeps its mode.
         if [ ! -e "$path" ]; then
           touch "$path"
-          chmod 0666 "$path" || true
+          if grep -qx restricted "$(dirname "$path")/.beacon-log-access" 2>/dev/null; then
+            chmod 0640 "$path" || true
+          else
+            chmod 0666 "$path" || true
+          fi
         fi
         ;;
     esac
@@ -159,6 +167,26 @@ trap cleanup_temp_files EXIT
 trap 'exit 1' INT TERM
 
 mkdir -p "$BASE_DIR" "$DATA_DIR" "$LAUNCHDAEMONS_DIR"
+
+# launchd opens StandardOutPath/StandardErrorPath as root for this daemon. They used to be fixed
+# names in world-writable /tmp, where any local user could pre-create them or plant a symlink for
+# root to append through. Keep them in a root-owned 0755 directory instead, and drop any job log
+# file that is not a plain file owned by root; launchd recreates it on the next start.
+if [ -L "$LOG_DIR" ]; then
+  rm -f "$LOG_DIR"
+fi
+mkdir -p "$LOG_DIR"
+if [ "$(id -u)" = "0" ]; then
+  chown 0:0 "$LOG_DIR"
+fi
+chmod 0755 "$LOG_DIR"
+for log_file in "$LOG_DIR/$LABEL.out" "$LOG_DIR/$LABEL.err"; do
+  if [ -L "$log_file" ] || { [ -e "$log_file" ] && [ ! -f "$log_file" ]; }; then
+    rm -rf "$log_file"
+  elif [ -e "$log_file" ] && [ "$(id -u)" = "0" ] && [ -n "$(find "$log_file" -prune ! -user 0 2>/dev/null)" ]; then
+    rm -f "$log_file"
+  fi
+done
 chmod 0755 "$BASE_DIR" "$DATA_DIR" "$LAUNCHDAEMONS_DIR" 2>/dev/null || true
 
 RUNTIME_INCLUDES="$(include_array "$RUNTIME_LOG_PATHS")"
@@ -265,13 +293,30 @@ chmod 0644 "$CONFIG_TMP"
 } >"$ENV_TMP"
 chmod 0600 "$ENV_TMP"
 
-# Validate syntax with the same environment the launch daemon will receive.
-BEACON_GCS_BUCKET="$GCS_BUCKET" \
-BEACON_GCS_PREFIX="$GCS_PREFIX" \
-BEACON_GCS_STORAGE_CLASS="$GCS_STORAGE_CLASS" \
-BEACON_VECTOR_READ_FROM="$VECTOR_READ_FROM" \
-GOOGLE_APPLICATION_CREDENTIALS="$CREDENTIALS_PATH" \
-  "$VECTOR_BIN" validate --skip-healthchecks "$CONFIG_TMP" >/dev/null
+# Validate syntax with the same environment the launch daemon will receive. Vector's GCS sink
+# fetches an OAuth token while it validates, so a key Google does not accept yet fails here too.
+# Vector prints the reason on stdout; pass it on, because an exit code alone explains nothing.
+set +e
+validate_output="$(
+  BEACON_GCS_BUCKET="$GCS_BUCKET" \
+  BEACON_GCS_PREFIX="$GCS_PREFIX" \
+  BEACON_GCS_STORAGE_CLASS="$GCS_STORAGE_CLASS" \
+  BEACON_VECTOR_READ_FROM="$VECTOR_READ_FROM" \
+  GOOGLE_APPLICATION_CREDENTIALS="$CREDENTIALS_PATH" \
+    "$VECTOR_BIN" validate --skip-healthchecks "$CONFIG_TMP" 2>&1
+)"
+validate_status=$?
+set -e
+if [ "$validate_status" -ne 0 ]; then
+  printf '%s\n' "$validate_output" >&2
+  case "$validate_output" in
+    *"Invalid JWT Signature"*)
+      echo "Google rejected the service-account key. A new key takes up to a minute to start working, so wait and run this again; a deleted or disabled key never will." >&2
+      ;;
+  esac
+  echo "Vector rejected the GCS forwarder config; the installed forwarder was left unchanged." >&2
+  exit "$validate_status"
+fi
 
 cat >"$PLIST_TMP" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -289,9 +334,9 @@ cat >"$PLIST_TMP" <<EOF
   <key>KeepAlive</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>/tmp/$LABEL.out</string>
+  <string>$(xml_escape "$LOG_DIR/$LABEL.out")</string>
   <key>StandardErrorPath</key>
-  <string>/tmp/$LABEL.err</string>
+  <string>$(xml_escape "$LOG_DIR/$LABEL.err")</string>
 </dict>
 </plist>
 EOF
@@ -323,7 +368,7 @@ if command -v launchctl >/dev/null 2>&1; then
       echo "Timed out waiting for $LABEL to stop" >&2
       exit 1
     fi
-    sleep 1
+    sleep "$POLL_SECONDS"
   done
   launchctl bootstrap system "$PLIST_PATH" >/dev/null 2>&1 || {
     echo "Could not bootstrap $LABEL" >&2
@@ -339,7 +384,7 @@ if command -v launchctl >/dev/null 2>&1; then
       consecutive_running=0
     fi
     if [ "$consecutive_running" -lt 3 ]; then
-      sleep 1
+      sleep "$POLL_SECONDS"
     fi
   done
   if [ "$consecutive_running" -lt 3 ]; then
@@ -352,7 +397,7 @@ else
   echo "launchctl unavailable; wrote config but did not start $LABEL" >&2
 fi
 
-if [ -f "/tmp/$LABEL.err" ]; then
+if [ -f "$LOG_DIR/$LABEL.err" ]; then
   echo "Last GCS Vector stderr lines:"
-  tail -n 20 "/tmp/$LABEL.err" || true
+  tail -n 20 "$LOG_DIR/$LABEL.err" || true
 fi

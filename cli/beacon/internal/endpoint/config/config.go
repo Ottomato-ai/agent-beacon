@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/atomicfile"
 )
 
 const (
@@ -100,15 +102,29 @@ const (
 )
 
 type Config struct {
-	UserMode        bool           `json:"user_mode"`
-	LogPath         string         `json:"log_path"`
-	Collector       Collector      `json:"collector"`
-	Harnesses       []string       `json:"harnesses"`
-	EventCategories []string       `json:"event_categories,omitempty"`
-	Inventory       *Inventory     `json:"inventory_heartbeat,omitempty"`
-	Destinations    *Destinations  `json:"destinations,omitempty"`
-	ManagedIngest   *ManagedIngest `json:"managed_ingest,omitempty"`
-	AutoUpdate      *AutoUpdate    `json:"auto_update,omitempty"`
+	UserMode        bool      `json:"user_mode"`
+	LogPath         string    `json:"log_path"`
+	Collector       Collector `json:"collector"`
+	Harnesses       []string  `json:"harnesses"`
+	EventCategories []string  `json:"event_categories,omitempty"`
+	// ClaudeCaptureModelContext is the --claude-capture-model-context opt-in, recorded so the per-user
+	// config repair writes Claude Code's settings the way the install did.
+	ClaudeCaptureModelContext bool           `json:"claude_capture_model_context,omitempty"`
+	Inventory                 *Inventory     `json:"inventory_heartbeat,omitempty"`
+	Destinations              *Destinations  `json:"destinations,omitempty"`
+	ManagedIngest             *ManagedIngest `json:"managed_ingest,omitempty"`
+	AutoUpdate                *AutoUpdate    `json:"auto_update,omitempty"`
+	// LogAccess is the system log's access mode: "shared" (empty, the default) or "restricted".
+	// Read it through RestrictedLogAccess, which also accounts for user mode.
+	LogAccess string `json:"log_access,omitempty"`
+}
+
+// RestrictedLogAccess reports whether this endpoint's system log is in the restricted access mode:
+// written only by the privileged collector, readable by root (SYSTEM and Administrators on
+// Windows) and the beacon-log group, with hooks sending their events over the local ingest socket
+// or pipe. It is never true in user mode, whose log is already private.
+func (c Config) RestrictedLogAccess() bool {
+	return !c.UserMode && strings.EqualFold(strings.TrimSpace(c.LogAccess), "restricted")
 }
 
 // ManagedIngest records that this endpoint forwards to Asymptote managed ingest. It holds
@@ -247,13 +263,21 @@ func DeriveHealthCheckPort(grpcPort, httpPort int) int {
 	return DefaultHealthCheckPort
 }
 
-// ValidateCollectorPorts rejects a health-check port the collector could not bind: outside the TCP
-// range, or shared with an OTLP receiver, which would make the collector fail at start with a bind
-// error rather than at install with an explanation.
+// ValidateCollectorPorts rejects out-of-range or shared collector endpoints before install writes
+// a configuration the collector cannot bind. A zero health port keeps the legacy default.
 func ValidateCollectorPorts(collector Collector) error {
+	if !validPort(collector.GRPCPort) {
+		return fmt.Errorf("collector OTLP gRPC port %d is out of range; choose a port between 1 and 65535 with --otlp-grpc-port", collector.GRPCPort)
+	}
+	if !validPort(collector.HTTPPort) {
+		return fmt.Errorf("collector OTLP HTTP port %d is out of range; choose a port between 1 and 65535 with --otlp-http-port", collector.HTTPPort)
+	}
+	if collector.GRPCPort == collector.HTTPPort {
+		return fmt.Errorf("collector OTLP gRPC and HTTP ports are both %d; choose different --otlp-grpc-port and --otlp-http-port values", collector.GRPCPort)
+	}
 	health := HealthCheckPort(collector)
-	if !validPort(health) {
-		return fmt.Errorf("collector health-check port %d is out of range; choose a port between 1 and 65535 with --health-port", health)
+	if collector.HealthPort < 0 || !validPort(health) {
+		return fmt.Errorf("collector health-check port %d is out of range; choose a port between 1 and 65535 with --health-port", collector.HealthPort)
 	}
 	if health == collector.GRPCPort || health == collector.HTTPPort {
 		return fmt.Errorf("collector health-check port %d is also an OTLP receiver port; choose a different --health-port", health)
@@ -366,11 +390,8 @@ func Save(cfg Config) (string, error) {
 	if HasSecretDestinations(cfg) {
 		perm = 0600
 	}
-	if err := os.WriteFile(path, data, perm); err != nil {
+	if err := atomicfile.Write(path, data, perm); err != nil {
 		return "", err
-	}
-	if HasSecretDestinations(cfg) {
-		return path, os.Chmod(path, perm)
 	}
 	return path, nil
 }

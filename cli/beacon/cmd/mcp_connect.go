@@ -24,8 +24,10 @@ import (
 )
 
 // `beacon mcp connect` registers the Beacon Cloud MCP server in the harnesses on this machine.
-// It is an explicit, interactive, per-user command: `beacon endpoint install`, onboarding and
-// every unattended path (root, system/MDM installs, CI, piped stdin) never run it. It writes no
+// It is an explicit, per-user command. The one other caller is the interactive onboarding
+// wizard, which runs the same flow after the person chose Beacon Cloud and left "Beacon Cloud
+// MCP" selected on its agent tools screen; that screen is the confirmation. Every unattended path
+// (root, system/MDM installs, CI, piped stdin) never reaches it. It writes no
 // secret -- OAuth harnesses get only the URL, and --token-env writes a reference to a variable --
 // and it never reads the Beacon account token in ~/.beacon/auth/session.json. Its only network
 // request is the resource-metadata check of the URL, which --dry-run skips.
@@ -57,7 +59,7 @@ var mcpConnectCmd = &cobra.Command{
 	Use:   "connect",
 	Short: "Register Beacon Cloud MCP in the harnesses on this machine",
 	Long: `Register the Beacon Cloud MCP server, as "beacon-managed", in every detected harness that
-supports it: Claude Code, Codex CLI, Cursor, VS Code, Gemini CLI and OpenCode.
+supports it: Claude Code, Codex CLI, Cursor, VS Code, Gemini CLI, OpenCode and Oh My Pi.
 
 By default only the URL is written, and each harness signs in with OAuth the first time it
 connects. With --token-env, each config references an environment variable holding a personal
@@ -203,10 +205,28 @@ func mcpTargetNames() []string {
 }
 
 func mcpOptions(home, url string) mcpconnect.Options {
+	return mcpOptionsFor(home, url, mcpConnectOpts.tokenEnv, mcpConnectOpts.force)
+}
+
+func mcpOptionsFor(home, url, tokenEnv string, force bool) mcpconnect.Options {
 	return mcpconnect.Options{
-		Home: home, URL: url, TokenEnv: mcpConnectOpts.tokenEnv, Force: mcpConnectOpts.force,
+		Home: home, URL: url, TokenEnv: tokenEnv, Force: force,
 		LookPath: mcpLookPath, Run: mcpRunCLI,
 	}
+}
+
+// cloudMCPRequest is one run of the connect flow: the flags of `beacon mcp connect`, or what
+// onboarding asks for (detected harnesses, OAuth, already confirmed).
+type cloudMCPRequest struct {
+	harnesses []string
+	url       string
+	tokenEnv  string
+	dryRun    bool
+	yes       bool
+	force     bool
+	// brief says the outcome in one line instead of the plan and per-harness steps, for the
+	// onboarding wizard's short closing. Failures are still printed one per harness.
+	brief bool
 }
 
 // connectRefusal is why connect will not run here, or "" when it may.
@@ -225,55 +245,71 @@ func connectRefusal() string {
 }
 
 func runMCPConnect(cmd *cobra.Command, args []string) error {
-	out := cmd.OutOrStdout()
 	if reason := connectRefusal(); reason != "" {
 		return errors.New(reason)
 	}
-	if err := validateTokenEnv(mcpConnectOpts.tokenEnv); err != nil {
+	return connectCloudMCP(commandContext(cmd), cmd.OutOrStdout(), cloudMCPRequest{
+		harnesses: mcpConnectOpts.harnesses,
+		url:       mcpConnectOpts.url,
+		tokenEnv:  mcpConnectOpts.tokenEnv,
+		dryRun:    mcpConnectOpts.dryRun,
+		yes:       mcpConnectOpts.yes,
+		force:     mcpConnectOpts.force,
+	})
+}
+
+func connectCloudMCP(ctx context.Context, out io.Writer, req cloudMCPRequest) error {
+	if err := validateTokenEnv(req.tokenEnv); err != nil {
 		return err
 	}
 	home, err := mcpHome()
 	if err != nil {
 		return err
 	}
-	targets, unsupported, err := resolveMCPTargets(mcpConnectOpts.harnesses)
+	targets, unsupported, err := resolveMCPTargets(req.harnesses)
 	if err != nil {
 		return err
 	}
-	url, derived, err := mcpconnect.ResolveURL(mcpConnectOpts.url, mcpIngestURL())
+	url, derived, err := mcpconnect.ResolveURL(req.url, mcpIngestURL())
 	if err != nil {
 		return fmt.Errorf("%w (Beacon Cloud serves MCP at https://mcp.beacon.sh)", err)
 	}
 	checked := "not checked (--dry-run)"
-	if !mcpConnectOpts.dryRun {
-		canonical, err := mcpconnect.CheckURL(cmd.Context(), mcpHTTPClient, url, derived)
+	if !req.dryRun {
+		canonical, err := mcpconnect.CheckURL(ctx, mcpHTTPClient, url, derived)
 		if err != nil {
 			return fmt.Errorf("the MCP URL check failed, so nothing was written: %w", err)
 		}
 		url, checked = canonical, "checked"
 	}
 	if len(targets) == 0 {
+		if req.brief {
+			fmt.Fprintln(out, "Beacon Cloud MCP was not added: no app it supports was detected. Run `beacon mcp connect --harness <name>` to add one.")
+			return nil
+		}
 		fmt.Fprintln(out, "No harness Beacon can connect was detected. Pass --harness to name one.")
 		printUnsupported(out, unsupported)
 		return nil
 	}
-	opts := mcpOptions(home, url)
+	opts := mcpOptionsFor(home, url, req.tokenEnv, req.force)
 	plan, err := mcpconnect.Plan(opts, targets)
 	if err != nil {
 		return err
 	}
 
-	fmt.Fprintf(out, "Beacon Cloud MCP: %s (%s)\n", url, checked)
-	fmt.Fprintf(out, "Server name: %s\n", mcpconnect.ServerName)
-	if opts.TokenEnv != "" {
-		fmt.Fprintf(out, "Auth: a personal MCP token read from $%s; Beacon writes only the variable's name\n", opts.TokenEnv)
-	} else {
-		fmt.Fprintln(out, "Auth: OAuth; Beacon writes only the URL, and each harness signs in on first use")
+	if !req.brief {
+		fmt.Fprintf(out, "Beacon Cloud MCP: %s (%s)\n", url, checked)
+		fmt.Fprintf(out, "Server name: %s\n", mcpconnect.ServerName)
+		if opts.TokenEnv != "" {
+			fmt.Fprintf(out, "Auth: a personal MCP token read from $%s; Beacon writes only the variable's name\n", opts.TokenEnv)
+		} else {
+			fmt.Fprintln(out, "Auth: OAuth; Beacon writes only the URL, and each harness signs in on first use")
+		}
+		fmt.Fprintln(out)
+		printPlan(out, home, plan)
+		printManual(out, plan, opts)
+		printUnsupported(out, unsupported)
 	}
-	fmt.Fprintln(out)
-	printPlan(out, home, plan)
-	printManual(out, plan, opts)
-	printUnsupported(out, unsupported)
 
 	writes := 0
 	for _, it := range plan {
@@ -281,27 +317,33 @@ func runMCPConnect(cmd *cobra.Command, args []string) error {
 			writes++
 		}
 	}
-	if mcpConnectOpts.dryRun {
+	if req.dryRun {
 		fmt.Fprintln(out, "\nDry run: nothing was written.")
 		return nil
 	}
 	if writes == 0 {
+		if req.brief {
+			printMCPSummary(out, plan, opts)
+			return nil
+		}
 		fmt.Fprintln(out, "\nNothing to change.")
 		printNextSteps(out, plan, opts)
 		return nil
 	}
-	if !mcpConnectOpts.yes {
+	if !req.yes {
 		fmt.Fprintf(out, "\nWrite %d change(s)? Each changed file is backed up first. [y/N] ", writes)
 		if !confirmNo(mcpStdin) {
 			fmt.Fprintln(out, "Nothing was written.")
 			return nil
 		}
 	}
-	applied, err := mcpconnect.Apply(cmd.Context(), opts, plan)
+	applied, err := mcpconnect.Apply(ctx, opts, plan)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintln(out)
+	if !req.brief {
+		fmt.Fprintln(out)
+	}
 	var failed []string
 	for _, it := range applied {
 		if !it.Writes() {
@@ -312,9 +354,15 @@ func runMCPConnect(cmd *cobra.Command, args []string) error {
 			fmt.Fprintf(out, "✗ %s: %v\n", it.Target.DisplayName, it.Err)
 			continue
 		}
-		fmt.Fprintf(out, "✓ %s: %s %s\n", it.Target.DisplayName, pastTense(it.Action), displayPath(home, it.Path))
+		if !req.brief {
+			fmt.Fprintf(out, "✓ %s: %s %s\n", it.Target.DisplayName, pastTense(it.Action), displayPath(home, it.Path))
+		}
 	}
-	printNextSteps(out, applied, opts)
+	if req.brief {
+		printMCPSummary(out, applied, opts)
+	} else {
+		printNextSteps(out, applied, opts)
+	}
 	if len(failed) > 0 {
 		return fmt.Errorf("could not connect %s", strings.Join(failed, ", "))
 	}
@@ -421,6 +469,57 @@ func printNextSteps(out io.Writer, items []mcpconnect.Item, opts mcpconnect.Opti
 		fmt.Fprintln(out, "  Restart any harness that is already running so it loads the new server.")
 	} else {
 		fmt.Fprintf(out, "  Create a token at %s and export it as %s, then restart any running harness.\n", mcpconnect.TokenPage, opts.TokenEnv)
+	}
+}
+
+// printMCPSummary says where Beacon Cloud MCP is set up and what is left to do, in one line, for
+// the onboarding wizard's short closing. A detected harness that takes the server only by hand gets
+// a second line naming the command that prints its steps. `beacon mcp connect` prints the plan and
+// every harness's own sign-in step.
+func printMCPSummary(out io.Writer, items []mcpconnect.Item, opts mcpconnect.Options) {
+	var added, present, manual []string
+	claudeCode := false
+	for _, it := range items {
+		switch {
+		case it.Err != nil:
+			continue
+		case it.Writes():
+			added = append(added, it.Target.DisplayName)
+		case it.Action == mcpconnect.ActionPresent:
+			present = append(present, it.Target.DisplayName)
+		case it.Action == mcpconnect.ActionManual:
+			manual = append(manual, it.Target.DisplayName)
+			continue
+		default:
+			continue
+		}
+		if it.Target.Name == "claude_code" {
+			claudeCode = true
+		}
+	}
+	var line string
+	switch {
+	case len(added) > 0:
+		line = "Beacon Cloud MCP added to " + strings.Join(added, ", ")
+		if len(present) > 0 {
+			line += " (already in " + strings.Join(present, ", ") + ")"
+		}
+	case len(present) > 0:
+		line = "Beacon Cloud MCP is already set up in " + strings.Join(present, ", ")
+	}
+	switch {
+	case line == "" && len(manual) == 0:
+		fmt.Fprintln(out, "Beacon Cloud MCP was not added to any app; run `beacon mcp connect` to see why.")
+	case line == "":
+	case opts.TokenEnv != "":
+		fmt.Fprintf(out, "%s; each reads a personal MCP token from $%s.\n", line, opts.TokenEnv)
+	case claudeCode:
+		fmt.Fprintf(out, "%s; sign in to %s once in each app (Claude Code: /mcp in a new session).\n", line, mcpconnect.ServerName)
+	default:
+		fmt.Fprintf(out, "%s; sign in to %s once in each app.\n", line, mcpconnect.ServerName)
+	}
+	if len(manual) > 0 {
+		fmt.Fprintf(out, "To use Beacon Cloud MCP in %s, add it by hand: `beacon mcp connect --dry-run` prints the steps.\n", strings.Join(manual, ", "))
 	}
 }
 

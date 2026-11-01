@@ -78,6 +78,9 @@ type HarnessInfo struct {
 	Version        string `json:"version,omitempty"`
 	ExecutablePath string `json:"executable_path,omitempty"`
 	ConfigPath     string `json:"config_path,omitempty"`
+	// Profile names the runtime profile the event came from, for runtimes that keep separate
+	// configuration and state per profile on one host.
+	Profile string `json:"profile,omitempty"`
 	// CollectionMethod records the mechanism that carried this event off the runtime.
 	// See the CollectionMethod* constants in provenance.go. Empty for events Beacon emits
 	// about itself, which no harness collected.
@@ -182,6 +185,44 @@ type CommandInfo struct {
 	// reports it. Same history as FileInfo.Diff: Cursor's afterShellExecution hook
 	// has always written `command.output`, and this struct has always dropped it.
 	Output string `json:"output,omitempty"`
+	// ParsedCommands is Command read as a bash command line, for the threat-rules engine only:
+	// the commands it runs, so a rule can tell `curl ... | sudo bash` from the same text inside
+	// a quoted string or a here-document. It is never written or read; the engine fills it on
+	// its own copy of each event, as it does GenAIToolCallInfo.ResultText. See
+	// threatrules.ParsedCommands.
+	ParsedCommands []ParsedCommand `json:"-" cel:"parsed_commands"`
+}
+
+// ParsedCommand is one command of a command line, as the threat-rules engine presents it to
+// rules (e.command.parsed_commands). It is never serialized; the cel tags are the names a rule
+// uses. threatrules.ParsedCommands says how each field is derived.
+type ParsedCommand struct {
+	// Name is the base name of the command after its wrappers (sudo, env, exec, ...): rm for
+	// `sudo /bin/rm -rf x`. Empty when it is unknown.
+	Name string `cel:"name"`
+	// Argv are the command's words as the shell passes them, wrappers included; a word whose
+	// value the parse cannot know (a parameter, substitution, glob or leading tilde) is "".
+	Argv []string `cel:"argv"`
+	// ArgvRaw are the same words as written, quotes and expansions included ($HOME, /*).
+	ArgvRaw []string `cel:"argv_raw"`
+	// Env are the NAME=value assignments before the command; an unknown value is "".
+	Env map[string]string `cel:"env"`
+	// FileEffects are the files the command evidently writes, and how.
+	FileEffects []ParsedFileEffect `cel:"file_effects"`
+	// Pipeline identifies the command's pipeline: the stages of one pipeline share it. Stage
+	// is the 0-based position in it (curl ... | sh: sh is stage 1).
+	Pipeline int `cel:"pipeline"`
+	Stage    int `cel:"stage"`
+	// Nested is true for a command inside a command or process substitution, or inside the
+	// script a shell runs with -c.
+	Nested bool `cel:"nested"`
+}
+
+// ParsedFileEffect is a file a parsed command evidently writes. Op is one of write, append,
+// touch, truncate, edit, delete, move_from, move_to, link.
+type ParsedFileEffect struct {
+	Path string `cel:"path"`
+	Op   string `cel:"op"`
 }
 
 type MCPMethodInfo struct {
@@ -223,9 +264,49 @@ type PolicyInfo struct {
 	Reason      string `json:"reason,omitempty"`
 }
 
+// PromptInfo describes the user prompt an event belongs to.
+//
+// Text is set only on the prompt itself. ID is set on every event the prompt led to, from the
+// prompt through the agent's response until the next prompt, so one value selects a whole turn.
+// It is the runtime's own identifier, normalized from its spelling by PromptIDKeys; a present
+// prompt object therefore no longer means the event is a prompt -- Text, or the prompt category,
+// says that.
 type PromptInfo struct {
+	ID   string `json:"id,omitempty"`
 	Text string `json:"text,omitempty"`
 }
+
+// SystemContextInfo says what a session.context event recorded when the runtime gave the model
+// context of its own, outside the conversation: which kind it was, where Beacon read it, and for a
+// skill index, which skills it listed. The text itself is in gen_ai.system_instructions. This block
+// is metadata, so it stays on an event whose text is removed, as metadata-only forwarding does.
+type SystemContextInfo struct {
+	Kind   string         `json:"kind"`
+	Source string         `json:"source,omitempty"`
+	Skills []SkillRefInfo `json:"skills,omitempty"`
+}
+
+// SkillRefInfo names one skill. The fields are spelled and SkillNameHash is computed the way the
+// configuration inventory records a skill it found on disk, so a skill the model was shown joins
+// to the SKILL.md it came from.
+type SkillRefInfo struct {
+	SkillName     string `json:"skill_name,omitempty"`
+	SkillNameHash string `json:"skill_name_hash,omitempty"`
+}
+
+// SystemContextInfo.Kind values.
+const (
+	// SystemContextSkillListing is a skill index: each skill's name and description, which the
+	// runtime lists so the model can choose one. A skill's body is not part of it.
+	SystemContextSkillListing = "skill_listing"
+)
+
+// SystemContextInfo.Source values: where the runtime exposed the context to Beacon. With
+// harness.name they say exactly which reader produced an event.
+const (
+	SystemContextSourceSystemPrompt = "system_prompt"
+	SystemContextSourceTranscript   = "transcript"
+)
 
 // ContentInfo marks how an event's retained raw content was handled. Hash and
 // Bytes describe the original content before redaction/truncation, so events
@@ -331,6 +412,16 @@ type GenAIToolCallInfo struct {
 	Arguments interface{} `json:"arguments,omitempty"`
 	ID        string      `json:"id,omitempty"`
 	Result    interface{} `json:"result,omitempty"`
+	// ResultText is Result as plain text, for the threat-rules engine only. Result is
+	// interface{} (a runtime may report a string, an object or a list of content
+	// blocks), and CEL cannot address an interface{} field, so without this no rule
+	// could match on what a file read, a web fetch or an MCP tool returned.
+	//
+	// It is never written or read: `json:"-"` keeps it off the wire, so the JSONL
+	// contract is unchanged and a log line cannot assert it. The engine fills it on
+	// its own copy of each event, from the retained Result, just before evaluation.
+	// See threatrules.ToolResultText for exactly which events get a value.
+	ResultText string `json:"-" cel:"result_text"`
 }
 
 type GenAIToolInfo struct {
@@ -341,8 +432,90 @@ type GenAIToolInfo struct {
 	Type        string             `json:"type,omitempty"`
 }
 
+// GenAIUsageCacheCreationInfo is the prompt-cache write count.
+//
+// InputTokens is every token written to the cache. Ephemeral1hInputTokens is the subset of those
+// written with a one-hour TTL, which Anthropic bills at twice the input rate against 1.25x for the
+// default five-minute TTL. It is a breakdown, never a parallel count: like reasoning inside output,
+// it is already inside InputTokens and must not be added to any total. The name mirrors Anthropic's
+// own usage.cache_creation.ephemeral_1h_input_tokens. Only sources that report the split set it, so
+// absent means "not reported", not "no one-hour writes". Build it with NewCacheCreationUsage so it
+// cannot exceed InputTokens.
 type GenAIUsageCacheCreationInfo struct {
-	InputTokens *int64 `json:"input_tokens,omitempty"`
+	InputTokens            *int64 `json:"input_tokens,omitempty"`
+	Ephemeral1hInputTokens *int64 `json:"ephemeral_1h_input_tokens,omitempty"`
+}
+
+// NewCacheCreationUsage builds a cache-creation block from a write count and, when the source
+// reports it, the one-hour subset. The subset is clamped to [0, inputTokens]: a breakdown larger
+// than the count it breaks down is a malformed record, not extra writes.
+func NewCacheCreationUsage(inputTokens int64, ephemeral1h *int64) *GenAIUsageCacheCreationInfo {
+	out := &GenAIUsageCacheCreationInfo{InputTokens: &inputTokens}
+	if ephemeral1h != nil {
+		v := clampCacheSubset(*ephemeral1h, inputTokens)
+		out.Ephemeral1hInputTokens = &v
+	}
+	return out
+}
+
+// OneHourInputTokens is the one-hour subset clamped to the write count, and zero when the source
+// did not report it. Readers use this rather than the raw field, so a log line written by
+// something other than Beacon cannot claim more one-hour writes than writes.
+func (c *GenAIUsageCacheCreationInfo) OneHourInputTokens() int64 {
+	if c == nil || c.Ephemeral1hInputTokens == nil {
+		return 0
+	}
+	var total int64
+	if c.InputTokens != nil {
+		total = *c.InputTokens
+	}
+	return clampCacheSubset(*c.Ephemeral1hInputTokens, total)
+}
+
+// Minus is what c adds over an already-counted snapshot prior of the same usage, for callers
+// that difference repeated or cumulative records field by field. Both counts are differenced and
+// floored at zero, and the one-hour subset stays clamped to the differenced write count, so a
+// delta can never carry more one-hour writes than writes. A nil prior counts as nothing counted.
+func (c *GenAIUsageCacheCreationInfo) Minus(prior *GenAIUsageCacheCreationInfo) *GenAIUsageCacheCreationInfo {
+	if c == nil {
+		return nil
+	}
+	if prior == nil {
+		prior = &GenAIUsageCacheCreationInfo{}
+	}
+	sub := func(next, counted *int64) *int64 {
+		if next == nil {
+			return nil
+		}
+		v := *next
+		if counted != nil {
+			v -= *counted
+		}
+		if v < 0 {
+			v = 0
+		}
+		return &v
+	}
+	out := &GenAIUsageCacheCreationInfo{InputTokens: sub(c.InputTokens, prior.InputTokens)}
+	if oneHour := sub(c.Ephemeral1hInputTokens, prior.Ephemeral1hInputTokens); oneHour != nil {
+		var total int64
+		if out.InputTokens != nil {
+			total = *out.InputTokens
+		}
+		v := clampCacheSubset(*oneHour, total)
+		out.Ephemeral1hInputTokens = &v
+	}
+	return out
+}
+
+func clampCacheSubset(subset, total int64) int64 {
+	switch {
+	case subset < 0 || total < 0:
+		return 0
+	case subset > total:
+		return total
+	}
+	return subset
 }
 
 type GenAIUsageCacheReadInfo struct {
@@ -408,10 +581,15 @@ type GenAIInfo struct {
 	Response           *GenAIResponseInfo     `json:"response,omitempty"`
 	Retrieval          *GenAIRetrievalInfo    `json:"retrieval,omitempty"`
 	SystemInstructions interface{}            `json:"system_instructions,omitempty"`
-	Token              *GenAITokenInfo        `json:"token,omitempty"`
-	Tool               *GenAIToolInfo         `json:"tool,omitempty"`
-	Usage              *GenAIUsageInfo        `json:"usage,omitempty"`
-	Workflow           *GenAIWorkflowInfo     `json:"workflow,omitempty"`
+	// SystemInstructionsText is SystemInstructions as plain text, for the threat-rules
+	// engine only, for the same reason as GenAIToolCallInfo.ResultText: CEL cannot address
+	// the interface{} semconv value. It is never written or read; the engine fills it on its
+	// own copy of each event. See threatrules.SystemInstructionsText.
+	SystemInstructionsText string             `json:"-" cel:"system_instructions_text"`
+	Token                  *GenAITokenInfo    `json:"token,omitempty"`
+	Tool                   *GenAIToolInfo     `json:"tool,omitempty"`
+	Usage                  *GenAIUsageInfo    `json:"usage,omitempty"`
+	Workflow               *GenAIWorkflowInfo `json:"workflow,omitempty"`
 }
 
 type DestinationInfo struct {
@@ -433,12 +611,15 @@ type UserAgentInfo struct {
 // VCSInfo is version-control context in the OpenTelemetry VCS semantic convention shape
 // (vcs.ref.head.revision, vcs.ref.head.name, vcs.ref.head.type, vcs.repository.url.full).
 // Attribution is Beacon's own and has no semconv equivalent: on a session.commit_linked event it
-// records how the commit was matched to the session. Everything here is metadata -- identifiers and
-// counts, never file contents or commit messages -- so it survives metadata-only retention.
+// records how the commit was matched to the session. Hook is Beacon's own too: on a
+// git.hook_budget_exceeded event it records a git hook run that ran out of time. Everything here is
+// metadata -- identifiers, names and counts, never file contents or commit messages -- so it
+// survives metadata-only retention.
 type VCSInfo struct {
 	Ref         *VCSRefInfo         `json:"ref,omitempty"`
 	Repository  *VCSRepositoryInfo  `json:"repository,omitempty"`
 	Attribution *VCSAttributionInfo `json:"attribution,omitempty"`
+	Hook        *VCSHookInfo        `json:"hook,omitempty"`
 }
 
 type VCSRefInfo struct {
@@ -470,6 +651,22 @@ type VCSAttributionInfo struct {
 	Method       string `json:"method,omitempty"`
 	ChangedFiles int    `json:"changed_files,omitempty"`
 	MatchedFiles int    `json:"matched_files,omitempty"`
+}
+
+// VCSHookInfo is one run of a Beacon git hook that ran past its time budget. Name is the hook
+// (post-commit, post-rewrite, pre-push) and Phase the step it was in when its time ran out.
+// ElapsedMS is the whole run, PhaseElapsedMS the part of it spent in Phase, and GitSpawns how many
+// git processes the run started. CutShort is true when running out of time left the hook's work
+// undone (for post-commit, a commit left unlinked or a link event unrecorded); false means the
+// work finished, late.
+type VCSHookInfo struct {
+	Name           string `json:"name,omitempty"`
+	Phase          string `json:"phase,omitempty"`
+	BudgetMS       int64  `json:"budget_ms,omitempty"`
+	ElapsedMS      int64  `json:"elapsed_ms,omitempty"`
+	PhaseElapsedMS int64  `json:"phase_elapsed_ms,omitempty"`
+	GitSpawns      int64  `json:"git_spawns,omitempty"`
+	CutShort       bool   `json:"cut_short,omitempty"`
 }
 
 type HealthInfo struct {
@@ -510,6 +707,7 @@ type Event struct {
 	Run           *RunInfo               `json:"run,omitempty"`
 	Session       *SessionInfo           `json:"session,omitempty"`
 	Handoff       *HandoffInfo           `json:"handoff,omitempty"`
+	Share         *ShareInfo             `json:"share,omitempty"`
 	Trace         *TraceInfo             `json:"trace,omitempty"`
 	JSONRPC       *JSONRPCInfo           `json:"jsonrpc,omitempty"`
 	Network       *NetworkInfo           `json:"network,omitempty"`
@@ -522,6 +720,7 @@ type Event struct {
 	Approval      *ApprovalInfo          `json:"approval,omitempty"`
 	Policy        *PolicyInfo            `json:"policy,omitempty"`
 	Prompt        *PromptInfo            `json:"prompt,omitempty"`
+	SystemContext *SystemContextInfo     `json:"system_context,omitempty"`
 	Content       *ContentInfo           `json:"content,omitempty"`
 	Destination   *DestinationInfo       `json:"destination,omitempty"`
 	Health        *HealthInfo            `json:"health,omitempty"`

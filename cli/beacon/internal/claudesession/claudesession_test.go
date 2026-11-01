@@ -4,10 +4,13 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/schema"
+	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve"
 )
 
 func TestListFindsClaudeSessionsAndSubagents(t *testing.T) {
@@ -76,49 +79,115 @@ func TestMapClaudeTranscriptProducesEndpointEvents(t *testing.T) {
 	}
 }
 
-func TestCollectOnceUsesCursorAndPrintDoesNotAdvance(t *testing.T) {
+// The skill_listing line is a Claude Code 2.1.291 transcript entry recorded by a beacon-oracle
+// c01-presence run, trimmed to two skills: the index is one string in `content`, and `rendered`
+// is the system-role text the model was sent.
+func TestMapSkillListingAttachmentAsSystemContext(t *testing.T) {
+	const session = "2cf4b751-7e9a-420d-81c6-99a7dd772fab"
+	ref := SessionRef{ID: session, Path: "/tmp/" + session + ".jsonl", ProjectPath: "/home/agent/project"}
+	listing := "- oracle-index: Lists the repository conventions. Skill index marker BCN-3WH4ST-C01I.\n- oracle-probe: Runs the repository probe procedure."
+	records := decodeFixture(t, []string{
+		`{"type":"attachment","attachment":{"type":"environment","snapshot":{"workingDirectory":"/home/agent/project"}},"uuid":"a0","timestamp":"2026-10-06T20:20:49.000Z","sessionId":"` + session + `","cwd":"/home/agent/project"}`,
+		`{"parentUuid":"cb3d1f0e-5d1b-44c8-8ed1-60b2e7922da2","isSidechain":false,"attachment":{"type":"skill_listing","content":"- oracle-index: Lists the repository conventions. Skill index marker BCN-3WH4ST-C01I.\n- oracle-probe: Runs the repository probe procedure.","skillCount":2,"isInitial":true,"names":["oracle-index","oracle-probe"]},"type":"attachment","uuid":"f9b0a9f9-1240-4592-b7f7-3a0654c21ed4","timestamp":"2026-10-06T20:20:49.170Z","rendered":[{"content":"<system-reminder>\nThe following skills are available for use with the Skill tool:\n\n- oracle-index: Lists the repository conventions. Skill index marker BCN-3WH4ST-C01I.\n- oracle-probe: Runs the repository probe procedure.\n</system-reminder>"}],"renderedRole":"system","userType":"external","entrypoint":"sdk-cli","cwd":"/home/agent/project","sessionId":"` + session + `","version":"2.1.291","gitBranch":"master"}`,
+		`{"type":"user","isMeta":true,"message":{"role":"user","content":"skill body"},"uuid":"u1","timestamp":"2026-10-06T20:20:50.000Z","sessionId":"` + session + `"}`,
+	})
+
+	mapped := MapSession(ref, records, MapOptions{})
+	if got, want := strings.Join(actions(mapped), ","), "session.started,session.context"; got != want {
+		t.Fatalf("actions = %q, want %q", got, want)
+	}
+	ev := findAction(t, mapped, "session.context")
+	if ev.GenAI == nil {
+		t.Fatal("session.context carries no gen_ai block")
+	}
+	parts := asymptoteobserve.GenAIText(ev.GenAI.SystemInstructions, "", asymptoteobserve.GenAIPartTypeText)
+	if want := strings.Split(listing, "\n"); !slices.Equal(parts, want) {
+		t.Fatalf("gen_ai.system_instructions parts = %q, want one per skill %q", parts, want)
+	}
+	if ev.Prompt != nil || ev.GenAI.Input != nil {
+		t.Fatalf("the listing was recorded as operator input: prompt=%+v gen_ai.input=%+v", ev.Prompt, ev.GenAI.Input)
+	}
+	wantContext := &schema.SystemContextInfo{
+		Kind:   asymptoteobserve.SystemContextSkillListing,
+		Source: asymptoteobserve.SystemContextSourceTranscript,
+		Skills: []schema.SkillRefInfo{
+			{SkillName: "oracle-index", SkillNameHash: asymptoteobserve.SkillNameHash("oracle-index")},
+			{SkillName: "oracle-probe", SkillNameHash: asymptoteobserve.SkillNameHash("oracle-probe")},
+		},
+	}
+	if !reflect.DeepEqual(ev.SystemContext, wantContext) {
+		t.Fatalf("system_context = %+v, want %+v", ev.SystemContext, wantContext)
+	}
+	if ev.Content == nil || !ev.Content.Included || ev.Content.Bytes != len(listing) {
+		t.Fatalf("content = %+v, want the retained listing's marker", ev.Content)
+	}
+	provenance, _ := ev.Raw["claude_attachment"].(map[string]interface{})
+	if provenance["type"] != "skill_listing" || provenance["is_initial"] != true || provenance["skill_count"] != float64(2) {
+		t.Fatalf("raw.claude_attachment = %#v, want the attachment's type, isInitial and skillCount", ev.Raw["claude_attachment"])
+	}
+	if err := ev.Validate(); err != nil {
+		t.Fatalf("context event failed validation: %v", err)
+	}
+}
+
+// A subagent transcript starts its events with gen_ai.agent already set, so the listing has to be
+// recorded alongside it; and a listing written as text blocks, without names, reads the same as a
+// string.
+func TestMapSkillListingOnSubagentTranscriptWithBlockContent(t *testing.T) {
+	ref := SessionRef{ID: "agent-a", Path: "/tmp/sess-1/subagents/agent-a.jsonl", ProjectPath: "/tmp/repo", IsSidechain: true, ParentSessionID: "sess-1"}
+	records := decodeFixture(t, []string{
+		`{"type":"attachment","isSidechain":true,"attachment":{"type":"skill_listing","content":[{"type":"text","text":"- deploy: Deploy applications."},{"type":"text","text":"- review: Review a diff."}]},"uuid":"a1","timestamp":"2026-09-19T22:00:01.000Z","sessionId":"sess-1","cwd":"/tmp/repo"}`,
+	})
+
+	ev := findAction(t, MapSession(ref, records, MapOptions{}), "session.context")
+	if ev.GenAI == nil || ev.GenAI.Agent == nil {
+		t.Fatalf("gen_ai = %+v, want the subagent's agent info", ev.GenAI)
+	}
+	want := []string{"- deploy: Deploy applications.", "- review: Review a diff."}
+	if got := asymptoteobserve.GenAIText(ev.GenAI.SystemInstructions, "", asymptoteobserve.GenAIPartTypeText); !slices.Equal(got, want) {
+		t.Fatalf("subagent gen_ai.system_instructions = %q, want %q", got, want)
+	}
+	if ev.SystemContext == nil || len(ev.SystemContext.Skills) != 2 {
+		t.Fatalf("subagent system_context = %+v, want both skills named", ev.SystemContext)
+	}
+}
+
+// `beacon endpoint claude sync --print` runs the collector with Print, an Out writer and nothing
+// to write or save. The collector has to hand Print to its sink: without it the sweep maps every
+// event and prints none, and the dry run a user runs to see what sync would ship shows nothing.
+func TestPrintSweepShowsEveryEventAndLeavesTheSessionForSync(t *testing.T) {
 	dir := t.TempDir()
 	projects := filepath.Join(dir, "projects")
-	sessionPath := filepath.Join(projects, "-tmp-repo", "sess-1.jsonl")
-	writeFile(t, sessionPath, userLine("sess-1", "u1", "first")+"\n")
-	statePath := filepath.Join(dir, "state", "claude.json")
-	logPath := filepath.Join(dir, "runtime.jsonl")
+	writeFile(t, filepath.Join(projects, "-tmp-repo", "sess-1.jsonl"), userLine("sess-1", "u1", "first")+"\n")
 
-	opts := CollectOptions{ProjectsDir: projects, StatePath: statePath, LogPath: logPath, Write: true, UserMode: true}
-	first, err := CollectOnce(opts)
-	if err != nil {
-		t.Fatalf("first CollectOnce: %v", err)
-	}
-	if first.EventsEmitted == 0 {
-		t.Fatal("first sweep emitted no events")
-	}
-	before := readLog(t, logPath)
-	second, err := CollectOnce(opts)
-	if err != nil {
-		t.Fatalf("second CollectOnce: %v", err)
-	}
-	if second.EventsEmitted != 0 {
-		t.Fatalf("second sweep emitted %d events, want 0", second.EventsEmitted)
-	}
-	if after := readLog(t, logPath); len(after) != len(before) {
-		t.Fatalf("log grew from %d to %d events with unchanged cursor", len(before), len(after))
-	}
-
-	writeFile(t, sessionPath, userLine("sess-1", "u1", "first")+"\n"+userLine("sess-1", "u2", "second")+"\n")
 	var printed strings.Builder
-	printSummary, err := CollectOnce(CollectOptions{ProjectsDir: projects, Print: true, Out: &printed})
+	summary, err := CollectOnce(CollectOptions{ProjectsDir: projects, Print: true, Out: &printed})
 	if err != nil {
 		t.Fatalf("print CollectOnce: %v", err)
 	}
-	if printSummary.EventsEmitted == 0 || printed.Len() == 0 {
-		t.Fatalf("print sweep emitted nothing: summary=%+v output=%q", printSummary, printed.String())
+	lines := strings.Split(strings.TrimSpace(printed.String()), "\n")
+	if summary.EventsEmitted == 0 || printed.Len() == 0 || len(lines) != summary.EventsEmitted {
+		t.Fatalf("printed %d lines for %d events:\n%s", len(lines), summary.EventsEmitted, printed.String())
 	}
-	realSummary, err := CollectOnce(opts)
+	var sawPrompt bool
+	for _, line := range lines {
+		var ev schema.Event
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatalf("print output is not one event per line: %v\n%s", err, line)
+		}
+		sawPrompt = sawPrompt || (ev.Event.Action == "prompt.submitted" && ev.Prompt != nil && ev.Prompt.Text == "first")
+	}
+	if !sawPrompt {
+		t.Fatalf("print output has no prompt.submitted for the session's prompt:\n%s", printed.String())
+	}
+
+	logPath := filepath.Join(dir, "runtime.jsonl")
+	real, err := CollectOnce(CollectOptions{ProjectsDir: projects, StatePath: filepath.Join(dir, "state", "claude.json"), LogPath: logPath, Write: true, UserMode: true})
 	if err != nil {
-		t.Fatalf("real CollectOnce after print: %v", err)
+		t.Fatalf("sync after print: %v", err)
 	}
-	if realSummary.EventsEmitted == 0 {
-		t.Fatal("--print advanced the cursor; real sweep had nothing left")
+	if real.EventsEmitted != summary.EventsEmitted || len(readLog(t, logPath)) != summary.EventsEmitted {
+		t.Fatalf("sync after --print wrote %d events, want the %d the dry run showed", real.EventsEmitted, summary.EventsEmitted)
 	}
 }
 
@@ -208,4 +277,95 @@ func boolString(v bool) string {
 		return "true"
 	}
 	return "false"
+}
+
+func TestListUsesRecordedWorkspaceWhenIndexDoesNotNameIt(t *testing.T) {
+	for _, tc := range []struct{ name, cwd, indexed, want string }{
+		{"recorded hyphenated workspace", "/work/my-project", "", "/work/my-project"},
+		{"index remains authoritative", "/work/my-project", "/indexed/project", "/indexed/project"},
+		{"older record without cwd", "", "", filepath.FromSlash("/work/my/project")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			project := filepath.Join(root, "-work-my-project")
+			path := filepath.Join(project, "sess-1.jsonl")
+			row := map[string]interface{}{"type": "user", "sessionId": "sess-1", "uuid": "u1", "message": map[string]interface{}{"role": "user", "content": "Review the project."}}
+			if tc.cwd != "" {
+				row["cwd"] = tc.cwd
+			}
+			data, err := json.Marshal(row)
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeFile(t, path, `{ "type":"file-history-snapshot", "snapshot":{} }`+"\n"+string(data)+"\n")
+			if tc.indexed != "" {
+				index, err := json.Marshal(map[string]interface{}{"version": 1, "entries": []interface{}{map[string]interface{}{"sessionId": "sess-1", "fullPath": path, "projectPath": tc.indexed}}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				writeFile(t, filepath.Join(project, "sessions-index.json"), string(index))
+			}
+			store, err := NewStore(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			refs, err := store.List()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(refs) != 1 || refs[0].ProjectPath != tc.want {
+				t.Fatalf("refs=%+v, want workspace %q", refs, tc.want)
+			}
+		})
+	}
+}
+
+func TestDefaultProjectsDirFollowsClaudeConfigDir(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	got, err := DefaultProjectsDir()
+	if err != nil {
+		t.Fatalf("DefaultProjectsDir: %v", err)
+	}
+	if want := filepath.Join(home, ".claude", "projects"); got != want {
+		t.Fatalf("default projects dir = %q, want %q", got, want)
+	}
+
+	config := filepath.Join(t.TempDir(), "claude-alt")
+	t.Setenv("CLAUDE_CONFIG_DIR", config)
+	got, err = DefaultProjectsDir()
+	if err != nil {
+		t.Fatalf("DefaultProjectsDir with CLAUDE_CONFIG_DIR: %v", err)
+	}
+	if want := filepath.Join(config, "projects"); got != want {
+		t.Fatalf("projects dir with CLAUDE_CONFIG_DIR = %q, want %q", got, want)
+	}
+
+	// An explicit directory still wins over the environment.
+	explicit := t.TempDir()
+	store, err := NewStore(explicit)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if store.ProjectsDir != explicit {
+		t.Fatalf("explicit dir = %q, want %q", store.ProjectsDir, explicit)
+	}
+
+	// With no explicit directory the store reads sessions from the relocated config directory.
+	project := filepath.Join(config, "projects", "-tmp-repo")
+	writeFile(t, filepath.Join(project, "sess-1.jsonl"), userLine("sess-1", "u1", "ship it")+"\n")
+	store, err = NewStore("")
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	refs, err := store.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(refs) != 1 || refs[0].ID != "sess-1" {
+		t.Fatalf("List under CLAUDE_CONFIG_DIR = %+v, want sess-1", refs)
+	}
 }

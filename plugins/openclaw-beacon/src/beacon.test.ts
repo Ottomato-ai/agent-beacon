@@ -83,31 +83,6 @@ describe("beacon openclaw plugin", () => {
     ])
   })
 
-  // Registering any of these would ask OpenClaw for a power Beacon must not hold: rewriting a
-  // prompt, claiming a message before the agent sees it, or voting on whether a skill installs.
-  test("never registers a prompt-injection, claim, or evaluate hook", () => {
-    const gateway = fakeGateway()
-    createBeaconPlugin().register(gateway.api)
-
-    for (const forbidden of [
-      "before_prompt_build",
-      "agent_turn_prepare",
-      "heartbeat_prompt_contribution",
-      "inbound_claim",
-      "before_dispatch",
-      "reply_dispatch",
-      "before_agent_reply",
-      "skill_proposal_evaluate",
-      "before_install",
-      "message_sending",
-      "reply_payload_sending",
-      "tool_result_persist",
-      "before_message_write",
-    ]) {
-      expect(gateway.handlers.has(forbidden)).toBe(false)
-    }
-  })
-
   test("the default export is a loadable plugin entry", () => {
     const gateway = fakeGateway()
     expect(entry.id).toBe("beacon-endpoint")

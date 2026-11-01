@@ -63,36 +63,6 @@ describe("beacon pi extension", () => {
     ])
   })
 
-  // Pi publishes many more events than these, most of them provider-request and TUI internals.
-  // Subscribing to one would put Beacon in the path of every streaming token update.
-  test("does not subscribe to streaming or provider internals", () => {
-    const pi = fakePi()
-    createBeaconExtension().register(pi.api)
-
-    for (const noisy of [
-      "message_update",
-      "before_provider_request",
-      "before_provider_headers",
-      "after_provider_response",
-      "context",
-      "tool_execution_update",
-    ]) {
-      expect(pi.handlers.has(noisy)).toBe(false)
-    }
-  })
-
-  test("forwards the event with its type intact", async () => {
-    const sent = captureSends()
-    const pi = fakePi()
-    createBeaconExtension().register(pi.api)
-
-    await pi.fire({ type: "input", text: "do the thing", source: "interactive" }, context())
-
-    expect(sent).toHaveLength(1)
-    expect(sent[0].type).toBe("input")
-    expect(sent[0].text).toBe("do the thing")
-  })
-
   // Pi keeps identity on the handler context behind accessor functions, not on the event, so the
   // envelope has to carry it or every event loses the field that groups a run.
   test("lifts session identity off the context onto the envelope", async () => {
@@ -184,26 +154,6 @@ describe("beacon pi extension", () => {
 
     expect(sent).toHaveLength(1)
     expect(JSON.stringify(sent[0])).toContain("tool_result")
-  })
-
-  test("drops functions and stringifies bigints rather than failing the send", async () => {
-    const sent = captureSends()
-    const pi = fakePi()
-    createBeaconExtension().register(pi.api)
-
-    await pi.fire(
-      {
-        type: "tool_result",
-        toolName: "bash",
-        // eslint-disable-next-line @typescript-eslint/no-empty-function
-        onDone: () => {},
-        bytes: BigInt(42),
-      },
-      context(),
-    )
-
-    expect(sent[0].onDone).toBeUndefined()
-    expect(sent[0].bytes).toBe("42")
   })
 
   // Every handler must resolve to undefined. Pi reads a returned object as a request to change

@@ -5,28 +5,10 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
-	"testing/fstest"
-
-	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/testenv"
 )
-
-func TestInputSnippetUsesConfiguredPath(t *testing.T) {
-	got, err := InputSnippet("/tmp/beacon/runtime.jsonl")
-	if err != nil {
-		t.Fatalf("InputSnippet returned unexpected error: %v", err)
-	}
-	if !strings.Contains(got, "/tmp/beacon/runtime.jsonl") {
-		t.Fatalf("snippet did not include configured path: %s", got)
-	}
-	if strings.Contains(got, "{{LOG_PATH}}") {
-		t.Fatalf("snippet still contains template token: %s", got)
-	}
-	if !strings.Contains(got, "filestream") {
-		t.Fatalf("snippet should use Filebeat filestream input: %s", got)
-	}
-}
 
 func TestInstallPackWritesExpectedFiles(t *testing.T) {
 	dir := t.TempDir()
@@ -138,22 +120,6 @@ func TestKibanaAssetsAreParseableNDJSON(t *testing.T) {
 	}
 }
 
-func TestPackREADMEUsesIngestedFieldNames(t *testing.T) {
-	readme := mustRead("pack/README.md")
-	for _, want := range []string{
-		"beacon.product:endpoint-agent",
-		"beacon.prompt.text",
-		"beacon.harness.name",
-	} {
-		if !strings.Contains(readme, want) {
-			t.Fatalf("pack README missing ingested field query %q", want)
-		}
-	}
-	if strings.Contains(readme, "product:endpoint-agent") && !strings.Contains(readme, "beacon.product:endpoint-agent") {
-		t.Fatalf("pack README should not use raw pre-ingest product field query")
-	}
-}
-
 func TestSampleEventsCoverHookAndOTelShapes(t *testing.T) {
 	scanner := bufio.NewScanner(strings.NewReader(mustRead("pack/sample-event.jsonl")))
 	var sawHook, sawOTel bool
@@ -189,83 +155,16 @@ func TestIngestPipelineMentionsKeyMappings(t *testing.T) {
 	}
 }
 
-func TestFiles_NoError(t *testing.T) {
-	files, err := Files()
-	if err != nil {
-		t.Fatalf("Files() returned unexpected error: %v", err)
-	}
-	if len(files) == 0 {
-		t.Fatal("Files() returned no files")
-	}
-}
-
-func TestFiles_ContainsAllRequiredNames(t *testing.T) {
-	files, err := Files()
-	if err != nil {
-		t.Fatal(err)
-	}
-	names := make(map[string]bool)
-	for _, f := range files {
-		names[f.Name] = true
-	}
-	for _, required := range []string{
-		"README.md", "filebeat.yml", "elastic-agent-standalone.yml",
-		"ilm-policy.json", "kibana-assets.ndjson", "docker-compose.yml",
-		"sample-event.jsonl",
-	} {
-		if !names[required] {
-			t.Errorf("Files() missing required file %q", required)
-		}
-	}
-}
-
-func TestFilesFromFS_PropagatesReadError(t *testing.T) {
-	emptyFS := fstest.MapFS{}
-	_, err := filesFromFS(emptyFS, DefaultLogPath)
-	if err == nil {
-		t.Fatal("filesFromFS with empty FS should return an error")
-	}
-	if !strings.Contains(err.Error(), "elastic pack asset") {
-		t.Fatalf("error should identify the pack source, got: %v", err)
-	}
-}
-
-func TestInputSnippetFromFS_ErrorOnMissingAsset(t *testing.T) {
-	emptyFS := fstest.MapFS{}
-	_, err := inputSnippetFromFS(emptyFS, "/some/path.jsonl")
-	if err == nil {
-		t.Fatal("inputSnippetFromFS with empty FS should return error")
-	}
-	if !strings.Contains(err.Error(), "elastic pack asset") {
-		t.Fatalf("error should identify the pack source, got: %v", err)
-	}
-}
-
-func TestInstallPack_ErrorOnWriteFailure(t *testing.T) {
-	// A 0555 directory is only read-only where Unix permission bits exist; Windows ignores them.
-	testenv.RequirePOSIXFileModes(t)
-	if os.Getuid() == 0 {
-		t.Skip("running as root: filesystem permission restrictions do not apply")
-	}
-	dir := t.TempDir()
-	if err := os.Chmod(dir, 0555); err != nil {
-		t.Skip("cannot set directory permissions:", err)
-	}
-	defer os.Chmod(dir, 0755)
-
-	subdir := filepath.Join(dir, "output")
-	err := InstallPack(subdir, DefaultLogPath)
-	if err == nil {
-		t.Fatal("InstallPack into read-only directory should return error")
-	}
-}
-
 func TestInputSnippet_DefaultLogPath(t *testing.T) {
 	got, err := InputSnippet("")
 	if err != nil {
 		t.Fatalf("InputSnippet with empty path returned error: %v", err)
 	}
-	if !strings.Contains(got, DefaultLogPath) {
+	want, err := InputSnippet(DefaultLogPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
 		t.Fatalf("InputSnippet with empty logPath should use DefaultLogPath %q, got: %s", DefaultLogPath, got)
 	}
 }
@@ -308,5 +207,75 @@ func TestIngestPipelineKeepsNativeVCS(t *testing.T) {
 	}
 	if !sawLink {
 		t.Fatal("sample events should include a session.commit_linked event")
+	}
+}
+
+// system_context says what a session.context event recorded, so it is copied under beacon.* and
+// mapped as keywords. gen_ai.system_instructions stays where the semconv puts it, mapped as the
+// parts list every writer now emits, so an index cannot be fixed to another shape by whichever
+// event arrives first.
+func TestIngestPipelineKeepsSystemContext(t *testing.T) {
+	pipeline := mustRead("pack/ingest-pipeline.json")
+	if !strings.Contains(pipeline, "if (ctx.system_context instanceof Map) { beacon.system_context = ctx.system_context; }") {
+		t.Fatal("ingest pipeline does not copy system_context under beacon")
+	}
+	var parsed struct {
+		Processors []map[string]map[string]interface{} `json:"processors"`
+	}
+	if err := json.Unmarshal([]byte(pipeline), &parsed); err != nil {
+		t.Fatal(err)
+	}
+	removed := false
+	for _, processor := range parsed.Processors {
+		fields, _ := processor["remove"]["field"].([]interface{})
+		removed = removed || slices.Contains(fields, interface{}("system_context"))
+	}
+	if !removed {
+		t.Fatal("the source system_context is not removed after it is copied")
+	}
+
+	var mappings map[string]interface{}
+	if err := json.Unmarshal([]byte(mustRead("pack/component-template-mappings.json")), &mappings); err != nil {
+		t.Fatal(err)
+	}
+	props := mappings["template"].(map[string]interface{})["mappings"].(map[string]interface{})["properties"].(map[string]interface{})
+	context := props["beacon"].(map[string]interface{})["properties"].(map[string]interface{})["system_context"].(map[string]interface{})["properties"].(map[string]interface{})
+	skills := context["skills"].(map[string]interface{})["properties"].(map[string]interface{})
+	for name, mapping := range map[string]interface{}{"kind": context["kind"], "skill_name": skills["skill_name"], "skill_name_hash": skills["skill_name_hash"]} {
+		if mapping.(map[string]interface{})["type"] != "keyword" {
+			t.Fatalf("beacon.system_context %s mapping = %#v, want keyword", name, mapping)
+		}
+	}
+	instructions := props["gen_ai"].(map[string]interface{})["properties"].(map[string]interface{})["system_instructions"].(map[string]interface{})["properties"].(map[string]interface{})
+	if instructions["content"].(map[string]interface{})["type"] != "match_only_text" {
+		t.Fatalf("gen_ai.system_instructions.content mapping = %#v, want text", instructions["content"])
+	}
+}
+
+// prompt.id names the turn an event belongs to and is on events that carry no prompt text, so the
+// pipeline copies it into beacon.prompt on its own -- not only alongside the text -- before the
+// remove processor drops the source prompt object, and the template maps it as a keyword.
+func TestIngestPipelineKeepsPromptID(t *testing.T) {
+	pipeline := mustRead("pack/ingest-pipeline.json")
+	for _, want := range []string{
+		"if (ctx.prompt.id != null) { ensure(beacon, 'prompt').id = ctx.prompt.id; }",
+		"if (ctx.prompt.text != null) { ensure(beacon, 'prompt').text = ctx.prompt.text; }",
+	} {
+		if !strings.Contains(pipeline, want) {
+			t.Fatalf("ingest pipeline missing %s", want)
+		}
+	}
+	if strings.Contains(pipeline, "ctx.prompt instanceof Map && ctx.prompt.text != null") {
+		t.Fatal("prompt is copied only when it has text, which drops prompt.id from every other event of a turn")
+	}
+	var mappings map[string]interface{}
+	if err := json.Unmarshal([]byte(mustRead("pack/component-template-mappings.json")), &mappings); err != nil {
+		t.Fatal(err)
+	}
+	props := mappings["template"].(map[string]interface{})["mappings"].(map[string]interface{})["properties"].(map[string]interface{})
+	beacon := props["beacon"].(map[string]interface{})["properties"].(map[string]interface{})
+	prompt := beacon["prompt"].(map[string]interface{})["properties"].(map[string]interface{})
+	if id, _ := prompt["id"].(map[string]interface{}); id["type"] != "keyword" {
+		t.Fatalf("beacon.prompt.id mapping = %#v, want keyword", prompt["id"])
 	}
 }

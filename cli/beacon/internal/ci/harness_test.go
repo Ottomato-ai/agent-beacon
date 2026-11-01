@@ -8,17 +8,51 @@ import (
 )
 
 func TestClaudeEnvIncludesDetailedToolAndPromptLogging(t *testing.T) {
-	env := strings.Join(ClaudeEnv([]string{"PATH=/bin", "OTEL_LOG_TOOL_DETAILS=0", "OTEL_LOG_USER_PROMPTS=0"}, "http://127.0.0.1:4317"), "\n")
-	for _, want := range []string{
-		"CLAUDE_CODE_ENABLE_TELEMETRY=1",
-		"OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317",
-		"OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=delta",
-		"OTEL_LOG_TOOL_DETAILS=1",
-		"OTEL_LOG_USER_PROMPTS=1",
+	env := claudeConfigEnv(t, []string{"PATH=/bin", "OTEL_LOG_TOOL_DETAILS=0", "OTEL_LOG_USER_PROMPTS=0"})
+	for key, want := range map[string]string{
+		"CLAUDE_CODE_ENABLE_TELEMETRY":                      "1",
+		"OTEL_EXPORTER_OTLP_ENDPOINT":                       "http://127.0.0.1:4317",
+		"OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE": "delta",
+		"OTEL_LOG_TOOL_DETAILS":                             "1",
+		"OTEL_LOG_USER_PROMPTS":                             "1",
 	} {
-		if !strings.Contains(env, want) {
-			t.Fatalf("ClaudeEnv missing %q in:\n%s", want, env)
+		if env[key] != want {
+			t.Fatalf("%s = %q, want %q in %v", key, env[key], want, env)
 		}
+	}
+}
+
+// claudeConfigEnv is what ci exec lays over base for a Claude session.
+func claudeConfigEnv(t *testing.T, base []string) map[string]string {
+	t.Helper()
+	cfg, err := BuildHarnessConfig(base, "claude", "http://127.0.0.1:4317", t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cfg.Env
+}
+
+// ci exec builds the child's env through BuildHarnessConfig and lays it over the caller's own, so a
+// value the caller set survives only if BuildHarnessConfig decides the overlay against that environment.
+func TestBuildHarnessConfigKeepsTheCallersClaudeDefaults(t *testing.T) {
+	base := []string{"OTEL_METRIC_EXPORT_INTERVAL=30000", "OTEL_LOG_RAW_API_BODIES=1", "SECRET_TOKEN=not-copied"}
+	cfg, err := BuildHarnessConfig(base, "claude", "http://127.0.0.1:4317", t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Env["OTEL_METRIC_EXPORT_INTERVAL"]; got != "30000" {
+		t.Fatalf("OTEL_METRIC_EXPORT_INTERVAL = %q, want the caller's 30000", got)
+	}
+	if got := cfg.Env["OTEL_BSP_SCHEDULE_DELAY"]; got != "1000" {
+		t.Fatalf("OTEL_BSP_SCHEDULE_DELAY = %q, want the default for a key the caller left unset", got)
+	}
+	if _, copied := cfg.Env["SECRET_TOKEN"]; copied {
+		t.Fatal("BuildHarnessConfig copied the caller's whole environment")
+	}
+	// Model-context capture is the caller's opt-in: ci exec neither sets nor clears it, so whatever
+	// the caller's environment says reaches the child.
+	if got, set := cfg.Env["OTEL_LOG_RAW_API_BODIES"]; set {
+		t.Fatalf("OTEL_LOG_RAW_API_BODIES = %q, want it left to the caller's environment", got)
 	}
 }
 
@@ -67,7 +101,7 @@ func TestNormalizeHarnessesSupportsClaudeAndCodexAliases(t *testing.T) {
 // five or ten, so without these nothing is exported on a timer and every event rides on the flush at
 // shutdown -- a race that three dispatched runs of the same commit lost twice.
 func TestClaudeEnvExportsOnATimerShorterThanASession(t *testing.T) {
-	env := envMap(ClaudeEnv(nil, "http://127.0.0.1:4317"))
+	env := claudeConfigEnv(t, nil)
 
 	for key, want := range map[string]string{
 		"OTEL_METRIC_EXPORT_INTERVAL": "5000",
@@ -90,7 +124,7 @@ func TestClaudeEnvDoesNotOverrideDeliberateExportTuning(t *testing.T) {
 		"OTEL_METRIC_EXPORT_INTERVAL": "30000",
 		"OTEL_BSP_SCHEDULE_DELAY":     "250",
 	})
-	env := envMap(ClaudeEnv(base, "http://127.0.0.1:4317"))
+	env := claudeConfigEnv(t, base)
 
 	if env["OTEL_METRIC_EXPORT_INTERVAL"] != "30000" {
 		t.Fatalf("OTEL_METRIC_EXPORT_INTERVAL = %q, want the caller's 30000", env["OTEL_METRIC_EXPORT_INTERVAL"])

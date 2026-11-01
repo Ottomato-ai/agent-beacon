@@ -10,7 +10,6 @@ import (
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/claudesession"
 	endpointconfig "github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/config"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/lifecycle"
-	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/writer"
 	"github.com/spf13/cobra"
 )
 
@@ -20,7 +19,7 @@ var endpointClaudeCmd = &cobra.Command{
 	Long: `Collect endpoint telemetry from Claude Code's local session transcripts.
 
 Beacon's normal Claude Code integration uses hooks and OpenTelemetry for live capture.
-This command reads Claude's committed JSONL session files under ~/.claude/projects so
+This command reads Claude's committed JSONL session files under $CLAUDE_CONFIG_DIR/projects (default ~/.claude/projects) so
 historical sessions and sessions that ran without Beacon hooks can still be represented
 in the local endpoint log. Every emitted event is marked harness.collection_method=poll:
 Beacon sees what Claude already wrote, so nothing here can hold or deny a tool call.`,
@@ -65,7 +64,7 @@ func init() {
 
 	for _, c := range []*cobra.Command{endpointClaudeSyncCmd, endpointClaudeStatusCmd} {
 		f := c.Flags()
-		f.StringVar(&endpointClaudeOpts.projectsDir, "projects-dir", "", "Claude projects directory (default ~/.claude/projects)")
+		f.StringVar(&endpointClaudeOpts.projectsDir, "projects-dir", "", "Claude projects directory (default $CLAUDE_CONFIG_DIR/projects, else ~/.claude/projects)")
 		f.StringVar(&endpointClaudeOpts.statePath, "state", "", "Collector cursor file (default ~/.beacon/endpoint/state/claude.json)")
 		f.BoolVar(&endpointOpts.jsonOutput, "json", false, "Print the result as JSON")
 		f.BoolVar(&endpointOpts.userMode, "user", true, "Use per-user endpoint paths")
@@ -77,16 +76,13 @@ func init() {
 	sync.BoolVar(&endpointClaudeOpts.print, "print", false, "Print mapped events as JSON without writing them or advancing the cursor (dry run)")
 	sync.BoolVar(&endpointClaudeOpts.watch, "watch", false, "Sweep continuously on --interval (default: one sweep then exit)")
 	sync.DurationVar(&endpointClaudeOpts.interval, "interval", time.Minute, "Sweep interval for --watch")
-	sync.Int64Var(&endpointClaudeOpts.rotateBytes, "rotate-bytes", 0,
-		"Rotate the runtime log at this many bytes while this sync writes it (default 10485760, the size every Beacon writer uses; must not be smaller)")
+	addSyncRotateBytesFlag(sync, &endpointClaudeOpts.rotateBytes)
 }
 
 // claudeSyncOptions turns the sync flags into collector options.
 func claudeSyncOptions(cmd *cobra.Command) (claudesession.CollectOptions, error) {
-	// Smaller than the shared size would only make this sync rotate more often than every other
-	// writer, shrinking what the log keeps for everyone.
-	if endpointClaudeOpts.rotateBytes != 0 && endpointClaudeOpts.rotateBytes < writer.DefaultRotateBytes {
-		return claudesession.CollectOptions{}, fmt.Errorf("--rotate-bytes must be at least %d, the size every Beacon writer rotates the runtime log at", writer.DefaultRotateBytes)
+	if err := checkSyncRotateBytes(endpointClaudeOpts.rotateBytes); err != nil {
+		return claudesession.CollectOptions{}, err
 	}
 	userMode := endpointUserMode()
 	opts := claudesession.CollectOptions{

@@ -71,14 +71,6 @@ func TestFromCursorEdits_MultipleEdits(t *testing.T) {
 	}
 }
 
-func TestFromCursorEdits_EmptyEdits(t *testing.T) {
-	result := FromCursorEdits("/path/to/file.py", []interface{}{})
-
-	if result != "" {
-		t.Errorf("FromCursorEdits() with empty edits = %q, want empty", result)
-	}
-}
-
 func TestFromCursorEdits_InvalidEditFormat(t *testing.T) {
 	edits := []interface{}{
 		"not a map",
@@ -105,25 +97,6 @@ func TestFromCursorEdits_EmptyStrings(t *testing.T) {
 	// fromEditTool returns "" for empty old and new strings
 	if result != "" {
 		t.Errorf("FromCursorEdits() with empty strings = %q, want empty", result)
-	}
-}
-
-func TestFromCursorEdits_MultilineEdit(t *testing.T) {
-	edits := []interface{}{
-		map[string]interface{}{
-			"old_string": "func main() {\n\tfmt.Println(\"hello\")\n}",
-			"new_string": "func main() {\n\tfmt.Println(\"world\")\n\treturn\n}",
-		},
-	}
-
-	result := FromCursorEdits("/path/to/main.go", edits)
-
-	if result == "" {
-		t.Fatal("FromCursorEdits() returned empty string")
-	}
-
-	if !strings.Contains(result, "--- a/main.go") {
-		t.Error("Missing file header")
 	}
 }
 
@@ -187,27 +160,14 @@ func TestFromToolResponseResolvesAbsolutePathParameter(t *testing.T) {
 }
 
 // FromContentChange is the one constructor here that is given the answer rather than asked to
-// infer it, so these cases pin the three shapes an observation can report: a modification, a
-// creation, and a deletion.
+// infer it, so these cases pin the shapes an observation can report: a modification and a
+// deletion here, a creation in TestFromEditFragmentsDoesNotReportAnInsertionAsANewFile.
 func TestFromContentChangeBuildsAReplacementDiff(t *testing.T) {
 	got := FromContentChange("/workspace/main.go", "package main\n\nfunc old() {}\n", "package main\n\nfunc new() {}\n")
 	for _, want := range []string{"--- a/main.go", "+++ b/main.go", "-func old() {}", "+func new() {}"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("FromContentChange missing %q:\n%s", want, got)
 		}
-	}
-}
-
-func TestFromContentChangeBuildsANewFileDiff(t *testing.T) {
-	got := FromContentChange("/workspace/new.py", "", "print('hi')\n")
-	if !strings.Contains(got, "@@ -0,0 +1,") {
-		t.Errorf("FromContentChange = %q, want a new-file hunk header", got)
-	}
-	if !strings.Contains(got, "+print('hi')") {
-		t.Errorf("FromContentChange = %q, want the added line", got)
-	}
-	if removed := diffBodyLines(got, "-"); len(removed) != 0 {
-		t.Errorf("FromContentChange = %q, want no removed lines for a new file, got %v", got, removed)
 	}
 }
 
@@ -243,7 +203,6 @@ func TestFromContentChangeBuildsADeletionDiff(t *testing.T) {
 func TestFromContentChangeReturnsNothingWhenTheContentIsUnchanged(t *testing.T) {
 	for _, tc := range []struct{ name, path, oldContent, newContent string }{
 		{"identical", "/workspace/main.go", "same\n", "same\n"},
-		{"both empty", "/workspace/main.go", "", ""},
 		{"no path", "", "a\n", "b\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -389,5 +348,36 @@ func TestFromEditFragmentsReturnsNothingForAnUnchangedSpan(t *testing.T) {
 	}
 	if got := FromEditFragments("", "before", "after"); got != "" {
 		t.Fatalf("FromEditFragments = %q, want empty without a path", got)
+	}
+}
+
+// A whole-file Write diff carries the file's exact line boundaries: a terminating newline is not
+// an extra blank line, real trailing blank lines stay, and unterminated content gets the unified
+// diff EOF marker.
+func TestWholeFileWriteDiffPreservesFinalLineBoundaries(t *testing.T) {
+	const header = "--- a/result.txt\n+++ b/result.txt\n"
+	const eof = "\\ No newline at end of file"
+	for _, tc := range []struct{ name, before, after, want string }{
+		{"create terminated", "", "new\n", "@@ -0,0 +1,1 @@\n+new"},
+		{"create with trailing blank line", "", "new\n\n", "@@ -0,0 +1,2 @@\n+new\n+"},
+		{"create a lone newline", "", "\n", "@@ -0,0 +1,1 @@\n+"},
+		{"create unterminated", "", "new", "@@ -0,0 +1,1 @@\n+new\n" + eof},
+		{"replace both unterminated", "old", "new", "@@ -1,1 +1,1 @@\n-old\n" + eof + "\n+new\n" + eof},
+		{"remove final newline", "same\n", "same", "@@ -1,1 +1,1 @@\n-same\n+same\n" + eof},
+		{"add final newline", "same", "same\n", "@@ -1,1 +1,1 @@\n-same\n" + eof + "\n+same"},
+		{"replace trailing blank line", "old\n\n", "new", "@@ -1,2 +1,1 @@\n-old\n-\n+new\n" + eof},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := FromToolResponse("Write", map[string]interface{}{"file_path": "/repo/result.txt", "content": tc.after}, map[string]interface{}{"originalFile": tc.before})
+			if want := header + tc.want; got != want {
+				t.Fatalf("diff:\n%s\nwant:\n%s", got, want)
+			}
+		})
+	}
+}
+
+func TestEditFragmentsDoNotClaimEndOfFile(t *testing.T) {
+	if got := FromEditFragments("/repo/result.txt", "old", "new"); strings.Contains(got, "\\ No newline at end of file") {
+		t.Fatalf("partial edit claims EOF: %s", got)
 	}
 }

@@ -57,7 +57,7 @@ maintainer asks otherwise.
 
 ## Development Setup
 
-Install Go 1.24 or newer. The repository has separate Go modules for the CLI,
+Install Go 1.27 or newer. The repository has separate Go modules for the CLI,
 hook adapter, and Collector exporter, so run Go commands from the module you are
 working in.
 
@@ -165,7 +165,10 @@ The browser extension's `npm test` builds the bundle and runs the Playwright
 replay e2e, which needs `openssl` on PATH and a one-time
 `npx playwright install chromium`. After editing a plugin or extension source
 under `plugins/`, run `bun run sync` in its directory so the copy embedded in
-`cli/beacon` matches; a Go test fails if the two drift.
+`cli/beacon` matches; a Go test fails if the two drift. The payload serializer
+the plugins share lives only in `plugins/shared/safe-clone.ts`: edit it there and
+run `bun run sync` in `plugins/shared`, which rewrites the generated copy in every
+plugin.
 
 If you cannot run a relevant check locally, mention that in the pull request and
 explain why.

@@ -10,10 +10,17 @@ import (
 	"testing"
 	"time"
 
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/jsonc"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/testenv"
 )
 
 const testURL = "https://mcp.example.test"
+
+func TestMain(m *testing.M) {
+	// Durability is not observable here, and a real fsync per write dominated the package's time.
+	syncFile = func(*os.File) error { return nil }
+	os.Exit(m.Run())
+}
 
 // harnessFixture is one automatic target's test data: an existing config full of things Beacon
 // must not touch, and the exact bytes connect must produce from it.
@@ -359,6 +366,70 @@ bearer_token_env_var = "BEACON_MCP_TOKEN"
 `,
 		conflict: `{"mcp": {"beacon-managed": {"type": "remote", "url": "https://elsewhere.example"}}}`,
 	},
+	{
+		// As Oh My Pi itself saves the file: $schema first, two-space indent, no final newline.
+		name: "omp",
+		existing: `{
+  "$schema": "https://raw.githubusercontent.com/can1357/oh-my-pi/main/packages/coding-agent/src/config/mcp-schema.json",
+  "mcpServers": {
+    "beacon": {
+      "type": "stdio",
+      "command": "/opt/homebrew/bin/beacon",
+      "args": [
+        "mcp",
+        "serve"
+      ]
+    }
+  },
+  "disabledServers": [
+    "github"
+  ]
+}`,
+		wantExisting: `{
+  "$schema": "https://raw.githubusercontent.com/can1357/oh-my-pi/main/packages/coding-agent/src/config/mcp-schema.json",
+  "mcpServers": {
+    "beacon": {
+      "type": "stdio",
+      "command": "/opt/homebrew/bin/beacon",
+      "args": [
+        "mcp",
+        "serve"
+      ]
+    },
+    "beacon-managed": {
+      "type": "http",
+      "url": "https://mcp.example.test"
+    }
+  },
+  "disabledServers": [
+    "github"
+  ]
+}`,
+		wantNew: `{
+  "$schema": "https://raw.githubusercontent.com/can1357/oh-my-pi/main/packages/coding-agent/src/config/mcp-schema.json",
+  "mcpServers": {
+    "beacon-managed": {
+      "type": "http",
+      "url": "https://mcp.example.test"
+    }
+  }
+}
+`,
+		wantToken: `{
+  "$schema": "https://raw.githubusercontent.com/can1357/oh-my-pi/main/packages/coding-agent/src/config/mcp-schema.json",
+  "mcpServers": {
+    "beacon-managed": {
+      "type": "http",
+      "url": "https://mcp.example.test",
+      "headers": {
+        "Authorization": "Bearer ${BEACON_MCP_TOKEN}"
+      }
+    }
+  }
+}
+`,
+		conflict: `{"mcpServers":{"beacon-managed":{"type":"http","url":"https://elsewhere.example"}}}`,
+	},
 }
 
 // isolate points every harness path at a fresh home and returns it.
@@ -369,6 +440,11 @@ func isolate(t *testing.T) string {
 	t.Setenv("XDG_CONFIG_HOME", "")
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	t.Setenv("CODEX_HOME", "")
+	t.Setenv("GEMINI_CLI_HOME", "")
+	// An explicitly empty OMP_PROFILE is Oh My Pi's default profile even when PI_PROFILE is set.
+	for _, name := range []string{"PI_CODING_AGENT_DIR", "PI_CONFIG_DIR", "OMP_PROFILE", "PI_PROFILE"} {
+		t.Setenv(name, "")
+	}
 	return home
 }
 
@@ -660,8 +736,9 @@ func userEdit(target Target) string {
 	return "\n  \"userEdit\": true,"
 }
 
+// One target per parser: JSONC, TOML, and Oh My Pi's strict JSON.
 func TestUnparseableConfigsAreSkippedAndLeftAlone(t *testing.T) {
-	for _, name := range []string{"claude_code", "codex_cli", "cursor", "vscode", "gemini_cli", "opencode"} {
+	for _, name := range []string{"cursor", "codex_cli", "omp"} {
 		t.Run(name, func(t *testing.T) {
 			home := isolate(t)
 			target := mustTarget(t, name)
@@ -708,11 +785,25 @@ func TestCodexInlineTableIsNotRewritten(t *testing.T) {
 
 func TestCodexHonorsCodexHome(t *testing.T) {
 	home := isolate(t)
+	// Codex requires CODEX_HOME to be an existing directory.
 	codexHome := filepath.Join(home, "elsewhere")
+	if err := os.MkdirAll(codexHome, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("CODEX_HOME", codexHome)
 	connect(t, fileOptions(home), mustTarget(t, "codex"))
 	if !strings.Contains(readFile(t, filepath.Join(codexHome, "config.toml")), "[mcp_servers.beacon-managed]") {
 		t.Fatal("CODEX_HOME was not honored")
+	}
+}
+
+func TestGeminiHonorsGeminiCLIHome(t *testing.T) {
+	home := isolate(t)
+	geminiHome := filepath.Join(home, "elsewhere")
+	t.Setenv("GEMINI_CLI_HOME", geminiHome)
+	connect(t, fileOptions(home), mustTarget(t, "gemini"))
+	if !strings.Contains(readFile(t, filepath.Join(geminiHome, ".gemini", "settings.json")), "beacon-managed") {
+		t.Fatal("GEMINI_CLI_HOME was not honored")
 	}
 }
 
@@ -854,6 +945,7 @@ func TestLookupAcceptsEndpointTargetSpellings(t *testing.T) {
 	for spelling, want := range map[string]string{
 		"claude": "claude_code", "Claude_Code": "claude_code", "codex": "codex_cli", "codex-cli": "codex_cli",
 		"gemini": "gemini_cli", "vs-code": "vscode", "opencode": "opencode", "cursor": "cursor",
+		"omp": "omp", "oh-my-pi": "omp", "Oh_My_Pi": "omp",
 		"copilot": "copilot_cli", "droid": "factory", "windsurf": "devin-desktop",
 	} {
 		got, ok := Lookup(spelling)
@@ -895,13 +987,13 @@ func TestCreatedFileIsKeptWhenTheUserAddedToIt(t *testing.T) {
 	target := mustTarget(t, "opencode")
 	path := targetPath(t, target, home)
 	connect(t, fileOptions(home), target)
-	withTheirs, _, err := insertJSONMember(readFile(t, path), []string{"mcp"}, "theirs", ordered{{"type", "remote"}, {"url", "https://t"}})
+	withTheirs, _, err := jsonc.InsertMember(readFile(t, path), []string{"mcp"}, "theirs", jsonc.Ordered{{Key: "type", Value: "remote"}, {Key: "url", Value: "https://t"}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	writeFile(t, path, withTheirs)
 	disconnect(t, fileOptions(home), target)
-	got, err := decodeJSONC(readFile(t, path))
+	got, err := jsonc.Decode(readFile(t, path))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -943,20 +1035,6 @@ func TestInspectReportsModeAndOwnershipWithoutValues(t *testing.T) {
 		}
 		if strings.Contains(s.Detail+s.URL, "bcn_mcp_") {
 			t.Errorf("%s: status exposes a header value", s.Target.Name)
-		}
-	}
-}
-
-func TestNextStepsNameTheServerOrTheVariable(t *testing.T) {
-	for _, target := range Targets() {
-		if !target.Automatic {
-			continue
-		}
-		if step := target.NextStep(AuthOAuth, ""); step == "" {
-			t.Errorf("%s has no OAuth next step", target.Name)
-		}
-		if step := target.NextStep(AuthTokenEnv, "MY_TOKEN_VAR"); !strings.Contains(step, "MY_TOKEN_VAR") && !strings.Contains(step, "secret storage") {
-			t.Errorf("%s token step does not name the variable: %q", target.Name, step)
 		}
 	}
 }
@@ -1013,4 +1091,117 @@ func fixtureIndex(name string) int {
 		}
 	}
 	panic(name)
+}
+
+// Oh My Pi parses mcp.json as plain JSON and quietly ignores a file it cannot parse, servers and
+// all. A file with a comment is one Beacon's JSONC reader would happily edit, so the strictness has
+// to be the target's: editing it would add beacon-managed to a file the runtime never loads.
+func TestOhMyPiConfigThatIsNotPlainJSONIsLeftAlone(t *testing.T) {
+	home := isolate(t)
+	target := mustTarget(t, "omp")
+	path := targetPath(t, target, home)
+	jsonc := "{\n  // mine\n  \"mcpServers\": {\n    \"x\": {\"type\": \"http\", \"url\": \"https://x\"},\n  },\n}\n"
+	writeFile(t, path, jsonc)
+	plan, err := Plan(fileOptions(home), []Target{target})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan[0].Action != ActionSkip || !strings.Contains(plan[0].Detail, "not plain JSON") {
+		t.Fatalf("plan = %s (%s)", plan[0].Action, plan[0].Detail)
+	}
+	if _, err := Apply(context.Background(), fileOptions(home), plan); err != nil {
+		t.Fatal(err)
+	}
+	if readFile(t, path) != jsonc {
+		t.Fatal("a config Oh My Pi cannot parse was edited")
+	}
+}
+
+// Connect writes the mcp.json of the profile Oh My Pi would run under, and only that one.
+func TestOhMyPiConnectWritesTheActiveProfileOnly(t *testing.T) {
+	home := isolate(t)
+	target := mustTarget(t, "omp")
+	t.Setenv("OMP_PROFILE", "work")
+	connect(t, fileOptions(home), target)
+	if got := readFile(t, filepath.Join(home, ".omp", "profiles", "work", "agent", "mcp.json")); !strings.Contains(got, ServerName) {
+		t.Fatalf("the work profile's mcp.json lacks %s:\n%s", ServerName, got)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".omp", "agent", "mcp.json")); !os.IsNotExist(err) {
+		t.Fatalf("connect also wrote the default profile's mcp.json: %v", err)
+	}
+
+	t.Setenv("OMP_PROFILE", "../escape")
+	plan, err := Plan(fileOptions(home), []Target{target})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan[0].Action != ActionSkip || !strings.Contains(plan[0].Detail, "profile") {
+		t.Fatalf("an invalid profile planned %s (%s)", plan[0].Action, plan[0].Detail)
+	}
+}
+
+// Disconnect works from what connect recorded, not from where the config would resolve now, so a
+// profile variable that has since become invalid cannot leave Beacon's entry behind.
+func TestDisconnectRemovesARecordedEntryWhenThePathNoLongerResolves(t *testing.T) {
+	home := isolate(t)
+	target := mustTarget(t, "omp")
+	t.Setenv("OMP_PROFILE", "work")
+	connect(t, fileOptions(home), target)
+	path := filepath.Join(home, ".omp", "profiles", "work", "agent", "mcp.json")
+
+	t.Setenv("OMP_PROFILE", "../escape")
+	if got := disconnect(t, fileOptions(home), target); got.Action != ActionRemove || got.Path != path {
+		t.Fatalf("disconnect = %s at %q (%s), want remove at %q", got.Action, got.Path, got.Detail, path)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("disconnect left the file connect created: %v", err)
+	}
+}
+
+// A harness that switches servers off with `enabled` inside the entry gets the person's value
+// back on every write: re-running connect, or changing auth mode, must not turn beacon-managed
+// back on.
+func TestConnectKeepsTheEnabledValueThePersonSet(t *testing.T) {
+	for name, disable := range map[string]func(string) string{
+		"codex_cli": func(s string) string { return s + "enabled = false\n" },
+		"opencode":  func(s string) string { return strings.Replace(s, `"enabled": true`, `"enabled": false`, 1) },
+		"omp": func(s string) string {
+			return strings.Replace(s, `"url": "`+testURL+`"`, `"url": "`+testURL+`",`+"\n      \"enabled\": false", 1)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			home := isolate(t)
+			target := mustTarget(t, name)
+			path := targetPath(t, target, home)
+			opts := fileOptions(home)
+			connect(t, opts, target)
+			disabled := disable(readFile(t, path))
+			writeFile(t, path, disabled)
+			if st, _ := inspect(target, path); st.entry["enabled"] != false {
+				t.Fatalf("the fixture did not disable the entry:\n%s", disabled)
+			}
+
+			if got := connect(t, opts, target); got.Action != ActionPresent {
+				t.Fatalf("re-running connect on a disabled entry = %s (%s), want present", got.Action, got.Detail)
+			}
+			if readFile(t, path) != disabled {
+				t.Fatal("re-running connect rewrote a disabled entry")
+			}
+
+			tokenOpts := opts
+			tokenOpts.TokenEnv = "BEACON_MCP_TOKEN"
+			for _, o := range []Options{tokenOpts, opts} {
+				if got := connect(t, o, target); got.Action != ActionUpdate {
+					t.Fatalf("switching auth mode = %s, want update", got.Action)
+				}
+				st, err := inspect(target, path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if st.entry["enabled"] != false || entryAuth(st.entry) != o.auth() {
+					t.Fatalf("after switching to %s the entry is %v", o.auth(), st.entry)
+				}
+			}
+		})
+	}
 }

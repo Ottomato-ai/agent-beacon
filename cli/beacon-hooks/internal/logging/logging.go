@@ -2,8 +2,10 @@ package logging
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	osuser "os/user"
 	"path/filepath"
@@ -11,11 +13,15 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"testing"
 	"time"
 
 	"github.com/asymptote-labs/agent-beacon/cli/beacon-hooks/internal/config"
 	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve"
+	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve/activesession"
 	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve/filelock"
+	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve/localingest"
+	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve/shareauto"
 )
 
 // endpointSequence numbers the endpoint events emitted by this hook process, in the order
@@ -25,8 +31,22 @@ var endpointSequence asymptoteobserve.Sequencer
 const (
 	defaultEndpointRotateBytes    = 10 * 1024 * 1024
 	defaultEndpointRotateArchives = 5
-	endpointRuntimeFileMode       = 0666
+	// endpointRuntimeFileMode is the shared (system-mode) log's mode. A log inside the current
+	// user's home is private instead; asymptoteobserve.RuntimeLogModes decides, identically in all
+	// three writers.
+	endpointRuntimeFileMode = asymptoteobserve.SharedRuntimeLogFileMode
 )
+
+// endpointEventsSuppressed stops this process writing endpoint events. A hook sets it when another
+// hook of Beacon's records the same event, as when Cursor runs Beacon's Claude Code hooks next to
+// its own.
+var endpointEventsSuppressed bool
+
+// SuppressEndpointEvents turns endpoint event writes off (true) or back on (false) for the rest of
+// this process.
+func SuppressEndpointEvents(suppress bool) {
+	endpointEventsSuppressed = suppress
+}
 
 // Logger provides structured JSON logging for hook events
 type Logger struct {
@@ -115,6 +135,9 @@ func (l *Logger) EndpointEvent(action, category, severity, message string, field
 // approval from a pre-tool notification, for instance -- so those events are distinguishable from
 // the ones a runtime actually reported.
 func (l *Logger) EndpointEventWithFidelity(action, category, severity, message, fidelity string, fields map[string]interface{}) error {
+	if endpointEventsSuppressed {
+		return nil
+	}
 	path := endpointLogPath()
 	if path == "" {
 		return nil
@@ -136,7 +159,88 @@ func (l *Logger) EndpointEventWithFidelity(action, category, severity, message, 
 		reportEndpointWriteFailure(os.Stderr, l.platform, path, err)
 		return err
 	}
+	recordActiveSession(event)
+	l.requestShareOnce(event)
 	return nil
+}
+
+// ShareSettingsPath locates the user's share settings. It is never taken from the environment,
+// which a repository can supply; tests replace it.
+var ShareSettingsPath = shareauto.HookPath
+
+// requestShareOnce writes one session.share_requested event for the event's session when the person
+// turned auto-share on for its working directory (`beacon share auto enable`). It is the first event
+// of the session the hooks see -- SessionStart where the runtime has one -- and never more than one
+// per session, deduplicated under a lock in the active-session record.
+//
+// The event is only written to the local runtime log. Beacon Cloud forwarding ships it like any
+// other line, and beacon.sh publishes the session when it receives it; without forwarding it is an
+// inert record. Nothing here touches the network. It is event.fidelity=inferred because Beacon
+// originated it: no runtime reported a share request.
+func (l *Logger) requestShareOnce(event map[string]interface{}) {
+	info, _ := event["event"].(map[string]interface{})
+	if action, _ := info["action"].(string); action == asymptoteobserve.ActionShareRequested {
+		return
+	}
+	session, _ := event["session"].(map[string]interface{})
+	harness, _ := event["harness"].(map[string]interface{})
+	if session == nil || harness == nil {
+		return
+	}
+	id, _ := session["id"].(string)
+	dir, _ := session["working_directory"].(string)
+	name, _ := harness["name"].(string)
+	if id == "" || dir == "" || name == "" {
+		return
+	}
+	decision := shareauto.ForHook(ShareSettingsPath(), dir)
+	if !decision.Enabled {
+		return
+	}
+	recordPath := activesession.DefaultPath()
+	markedAt := time.Now()
+	first, err := activesession.MarkShareRequested(recordPath, name, id, markedAt)
+	if err != nil || !first {
+		return
+	}
+	fields := map[string]interface{}{
+		"session": map[string]interface{}{"id": id, "working_directory": dir},
+	}
+	if visibility := decision.Visibility; visibility == "public" || visibility == "direct" || visibility == "private" {
+		fields["share"] = map[string]interface{}{"visibility": visibility}
+	}
+	if repo, _ := event["repository"].(string); repo != "" {
+		fields["repository"] = repo
+	}
+	if branch, _ := event["branch"].(string); branch != "" {
+		fields["branch"] = branch
+	}
+	if err := l.EndpointEventWithFidelity(asymptoteobserve.ActionShareRequested, "session", "info", "Auto-share requested for this session", asymptoteobserve.FidelityInferred, fields); err != nil {
+		// The request was not written (a read-only log, a sandbox): take the mark back so the next
+		// hook of the session asks again, rather than leave the session marked and never requested.
+		// Like the rest of this path it stays silent and never fails the hook.
+		_ = activesession.UnmarkShareRequested(recordPath, name, id, markedAt)
+	}
+}
+
+// recordActiveSession notes the event's session as the one its runtime is running in its working
+// directory, for `beacon share --current`. It is a local file write and never fails the hook: the
+// record is a convenience, the event above is what matters. Nothing here touches the network.
+func recordActiveSession(event map[string]interface{}) {
+	session, _ := event["session"].(map[string]interface{})
+	harness, _ := event["harness"].(map[string]interface{})
+	if session == nil || harness == nil {
+		return
+	}
+	id, _ := session["id"].(string)
+	dir, _ := session["working_directory"].(string)
+	name, _ := harness["name"].(string)
+	if id == "" || dir == "" || name == "" {
+		return
+	}
+	// Silent on failure: stderr is shown to the person on some runtimes, and a missing record
+	// only means `beacon share --current` falls back to the newest session in the directory.
+	_ = activesession.Record(activesession.DefaultPath(), name, id, dir, time.Now())
 }
 
 // reportedWriteFailures remembers which runtime log paths this process has already explained a
@@ -388,8 +492,13 @@ func firstEnv(keys ...string) string {
 	return ""
 }
 
-func writeEndpointJSON(path string, event map[string]interface{}) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+// writeEndpointJSON appends one endpoint event to the runtime log. A variable so a test can make one
+// write fail.
+var writeEndpointJSON = writeEndpointJSONFile
+
+func writeEndpointJSONFile(path string, event map[string]interface{}) error {
+	_, dirMode, _ := asymptoteobserve.RuntimeLogModes(path)
+	if err := os.MkdirAll(filepath.Dir(path), dirMode); err != nil {
 		return err
 	}
 	data, err := json.Marshal(sanitizeEndpointMap(event))
@@ -428,7 +537,45 @@ func writeEndpointJSON(path string, event map[string]interface{}) error {
 	if data, err = withEndpointEventID(event, data); err != nil {
 		return err
 	}
-	return appendEndpointJSONL(path, append(data, '\n'), defaultEndpointRotateBytes, defaultEndpointRotateArchives)
+	return deliverEndpointLine(path, data)
+}
+
+// EndpointIngest delivers to the system log through the collector when the endpoint is in the
+// restricted log access mode. Tests point it at a socket and spool of their own; nothing else
+// changes it.
+var EndpointIngest = defaultEndpointIngest()
+
+// defaultEndpointIngest is the real socket and the account's spool, except in a test binary, where
+// a test writing a system log as an ordinary account must never reach the machine's collector or
+// leave lines in the developer's own spool.
+func defaultEndpointIngest() localingest.Deliverer {
+	if !testing.Testing() {
+		return localingest.Deliverer{}
+	}
+	dir := filepath.Join(os.TempDir(), fmt.Sprintf("beacon-hooks-test-%d", os.Getpid()))
+	socket := filepath.Join(dir, "no-collector.sock")
+	if runtime.GOOS == "windows" {
+		socket = fmt.Sprintf(`\\.\pipe\beacon-hooks-test-%d-none`, os.Getpid())
+	}
+	return localingest.Deliverer{
+		Client: localingest.Client{SocketPath: socket},
+		Spool:  localingest.Spool{Dir: filepath.Join(dir, "spool")},
+	}
+}
+
+// deliverEndpointLine writes one finished line to the runtime log at path.
+//
+// A hook writing the system log as an ordinary account hands the line to the collector over the
+// local ingest socket when the endpoint has one (the restricted log access mode, in which the log
+// is not writable by this account at all), and otherwise appends directly, as hooks always have.
+// Only a direct append the log refuses -- a restricted endpoint whose collector is restarting --
+// puts the line in this account's private spool, and it reaches the log with a later event
+// instead of being lost. Root and per-user logs are always written directly. See
+// localingest.Deliverer.Write.
+func deliverEndpointLine(path string, data []byte) error {
+	return EndpointIngest.Write(path, data, func(line []byte) error {
+		return appendEndpointJSONL(path, append(line[:len(line):len(line)], '\n'), defaultEndpointRotateBytes, defaultEndpointRotateArchives)
+	})
 }
 
 // withEndpointEventID fills event.id on an event assembled as a map and returns
@@ -514,6 +661,13 @@ func minimalEndpointEvent(event map[string]interface{}) map[string]interface{} {
 	return out
 }
 
+// EndpointLogConfigured reports whether this process has a runtime log to write to. Without one,
+// EndpointEvent records nothing and returns nil, so a caller reporting what it recorded checks this
+// rather than reading a nil error as a write.
+func EndpointLogConfigured() bool {
+	return endpointLogPath() != ""
+}
+
 func endpointLogPath() string {
 	if path := firstEnv("BEACON_ENDPOINT_LOG", "BEACON_CLOUD_LOG_PATH", "BEACON_LOG_PATH", "BEACON_RUNTIME_LOG"); path != "" {
 		return path
@@ -526,10 +680,6 @@ func endpointLogPath() string {
 		return ""
 	}
 	return filepath.Join(home, ".beacon", "endpoint", "logs", "runtime.jsonl")
-}
-
-func redactEndpointString(value string) string {
-	return asymptoteobserve.RedactString(value)
 }
 
 func sanitizeEndpointMap(input map[string]interface{}) map[string]interface{} {
@@ -550,12 +700,13 @@ func truncateEndpoint(value string, limit int) string {
 	return asymptoteobserve.TruncateString(value, limit)
 }
 
-// Keep this rotation contract mirrored with the endpoint CLI and beaconjson exporter.
+// Keep this rotation and file-mode contract mirrored with the endpoint CLI and beaconjson exporter.
 func appendEndpointJSONL(path string, line []byte, rotateBytes int64, rotateArchives int) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	_, dirMode, _ := asymptoteobserve.RuntimeLogModes(path)
+	if err := os.MkdirAll(filepath.Dir(path), dirMode); err != nil {
 		return err
 	}
-	lock, err := openEndpointRuntimeFile(path+".lock", os.O_CREATE|os.O_RDWR)
+	lock, err := openEndpointRuntimeFileAs(path+".lock", path, os.O_CREATE|os.O_RDWR)
 	if err != nil {
 		return err
 	}
@@ -570,7 +721,13 @@ func appendEndpointJSONL(path string, line []byte, rotateBytes int64, rotateArch
 	if asymptoteobserve.IsDuplicateEndpointEvent(path, line, asymptoteobserve.EndpointDuplicateWindow) {
 		return nil
 	}
-	if err := rotateEndpointLogIfNeeded(path, rotateBytes, rotateArchives, int64(len(line))); err != nil {
+	// A hook usually runs as the person at the keyboard, and on a system-mode log it may not rename
+	// or delete anything in the directory: the directory is root-owned 0755 on POSIX, and on Windows
+	// its ACL gives ordinary users no right to add, rename or delete entries -- the rights that would
+	// let one redirect a SYSTEM write. Rotation is the privileged writers' job there. The refusal
+	// comes at the first step, so nothing has moved, and the event is appended past the size limit
+	// rather than lost; the collector rotates at its next write.
+	if err := rotateEndpointLogIfNeeded(path, rotateBytes, rotateArchives, int64(len(line))); err != nil && !errors.Is(err, fs.ErrPermission) {
 		return err
 	}
 	f, err := openEndpointRuntimeFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY)
@@ -583,22 +740,15 @@ func appendEndpointJSONL(path string, line []byte, rotateBytes int64, rotateArch
 }
 
 func openEndpointRuntimeFile(path string, flag int) (*os.File, error) {
-	existed := true
-	if _, err := os.Stat(path); err != nil {
-		if !os.IsNotExist(err) {
-			return nil, err
-		}
-		existed = false
-	}
-	f, err := os.OpenFile(path, flag, endpointRuntimeFileMode)
-	if err != nil {
-		return nil, err
-	}
-	if err := os.Chmod(path, endpointRuntimeFileMode); err != nil && !existed {
-		_ = f.Close()
-		return nil, err
-	}
-	return f, nil
+	return openEndpointRuntimeFileAs(path, path, flag)
+}
+
+// openEndpointRuntimeFileAs opens path (the log or its lock) with the mode logPath calls for, and
+// settles its mode through asymptoteobserve.OpenRuntimeLogFile: a new file gets that mode
+// whatever the umask, an existing one is only ever narrowed toward it, by its owner, and root never
+// follows a symlink or opens anything but a regular file there.
+func openEndpointRuntimeFileAs(path, logPath string, flag int) (*os.File, error) {
+	return asymptoteobserve.OpenRuntimeLogFile(path, logPath, flag)
 }
 
 func rotateEndpointLogIfNeeded(path string, maxSize int64, archives int, nextWriteBytes int64) error {
@@ -628,7 +778,11 @@ func rotateEndpointLogIfNeeded(path string, maxSize int64, archives int, nextWri
 			return err
 		}
 	}
-	return os.Rename(path, path+".1")
+	if err := os.Rename(path, path+".1"); err != nil {
+		return err
+	}
+	asymptoteobserve.SettleRuntimeLogArchives(path, archives)
+	return nil
 }
 
 func removeOverflowEndpointArchives(path string, archives int) error {

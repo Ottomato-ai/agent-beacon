@@ -38,10 +38,14 @@ const (
 	// tokens (`beacon mcp token create`). The sign-in page lists it, and beacon.sh
 	// approves the sign-in only when the permissions it showed match these.
 	ScopeMCPTokenCreate = "mcp:token:create"
+	// ScopeTracesWrite lets the account token upload shared traces (`beacon share`) to
+	// /v1/traces on the sign-in's API (api.beacon.sh for a beacon.sh sign-in; see
+	// ShareAPIBaseURL). A session from an older `beacon login` lacks it.
+	ScopeTracesWrite = "traces:write"
 )
 
 // LoginScopes are the permissions every `beacon login` asks for.
-var LoginScopes = []string{ScopeProfileRead, ScopeDeviceEnroll, ScopeMCPTokenCreate}
+var LoginScopes = []string{ScopeProfileRead, ScopeDeviceEnroll, ScopeMCPTokenCreate, ScopeTracesWrite}
 
 type LoginOptions struct {
 	BaseURL     string
@@ -172,6 +176,7 @@ func Login(ctx context.Context, opts LoginOptions) (*Session, error) {
 		return nil, err
 	}
 	callback.SetSuccessPage("Signed in to Beacon", "Return to your terminal to finish setting up this machine.")
+	callback.SetSuccessLink("Go to dashboard", auth.DashboardHomeURL(baseURL))
 	defer callback.Shutdown()
 	callback.Start()
 

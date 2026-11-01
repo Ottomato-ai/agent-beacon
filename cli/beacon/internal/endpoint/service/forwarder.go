@@ -112,11 +112,14 @@ func (m ForwarderManager) WriteUnit(vectorBin, configPath string) (string, error
 	if err := ensureDir(path); err != nil {
 		return "", err
 	}
-	var content string
-	if m.resolvedKind() == KindSystemd {
-		content = forwarderUnitFile(vectorBin, configPath, m.UserMode)
-	} else {
-		content = forwarderPlist(ForwarderLabel, vectorBin, configPath)
+	if m.resolvedKind() == KindLaunchd {
+		if err := ensureLaunchdLogDir(m.UserMode, ForwarderLabel); err != nil {
+			return "", err
+		}
+	}
+	content, err := m.unitContent(vectorBin, configPath)
+	if err != nil {
+		return "", err
 	}
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		return "", err
@@ -127,6 +130,36 @@ func (m ForwarderManager) WriteUnit(vectorBin, configPath string) (string, error
 		}
 	}
 	return path, nil
+}
+
+// UnitCurrent reports whether the installed unit is the one WriteUnit would write now. Reconcile
+// rewrites one that is not, so a unit an earlier release wrote, such as one logging to /tmp, is
+// brought up to date by an upgrade rather than only by a fresh connect.
+func (m ForwarderManager) UnitCurrent(vectorBin, configPath string) (bool, error) {
+	path, err := m.UnitPath()
+	if err != nil {
+		return false, err
+	}
+	installed, err := os.ReadFile(path)
+	if err != nil {
+		return false, err
+	}
+	want, err := m.unitContent(vectorBin, configPath)
+	if err != nil {
+		return false, err
+	}
+	return string(installed) == want, nil
+}
+
+func (m ForwarderManager) unitContent(vectorBin, configPath string) (string, error) {
+	if m.resolvedKind() == KindSystemd {
+		return forwarderUnitFile(vectorBin, configPath, m.UserMode), nil
+	}
+	stdout, stderr, err := launchdLogPaths(m.UserMode, ForwarderLabel)
+	if err != nil {
+		return "", err
+	}
+	return forwarderPlist(ForwarderLabel, vectorBin, configPath, stdout, stderr), nil
 }
 
 // Load registers and starts the forwarder. An already-loaded launchd job is re-bootstrapped so a
@@ -255,7 +288,7 @@ func forwarderUnitFile(vectorBin, configPath string, userMode bool) string {
 }
 
 // forwarderPlist renders the launchd job: resident, restarted by launchd, started at load.
-func forwarderPlist(label, vectorBin, configPath string) string {
+func forwarderPlist(label, vectorBin, configPath, stdoutPath, stderrPath string) string {
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -275,12 +308,12 @@ func forwarderPlist(label, vectorBin, configPath string) string {
   <key>ThrottleInterval</key>
   <integer>10</integer>
   <key>StandardOutPath</key>
-  <string>/tmp/%s.out</string>
+  <string>%s</string>
   <key>StandardErrorPath</key>
-  <string>/tmp/%s.err</string>
+  <string>%s</string>
 </dict>
 </plist>
-`, xmlEscape(label), xmlEscape(vectorBin), xmlEscape(configPath), xmlEscape(label), xmlEscape(label))
+`, xmlEscape(label), xmlEscape(vectorBin), xmlEscape(configPath), xmlEscape(stdoutPath), xmlEscape(stderrPath))
 }
 
 func xmlEscape(s string) string {

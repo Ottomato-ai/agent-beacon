@@ -7,7 +7,12 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/claudesession"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/codexsession"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/harness"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/hooks"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/hermessession"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/jsonc"
 )
 
 // ServerName is the name Beacon registers the Beacon Cloud MCP server under in every harness.
@@ -20,6 +25,11 @@ const TokenPage = "beacon.sh → Dashboard → MCP Access"
 
 // vscodeInputID names the VS Code input variable that holds a token in token mode.
 const vscodeInputID = "beacon-managed-token"
+
+// ompMCPSchema is the $schema Oh My Pi writes at the top of every mcp.json it creates or saves.
+// A file Beacon creates starts with the same line, so it reads as one Oh My Pi made, and a later
+// save by Oh My Pi leaves nothing behind that disconnect would not recognize as Beacon's.
+const ompMCPSchema = "https://raw.githubusercontent.com/can1357/oh-my-pi/main/packages/coding-agent/src/config/mcp-schema.json"
 
 // AuthMode is how a harness authenticates to Beacon Cloud MCP.
 type AuthMode string
@@ -60,13 +70,19 @@ type Target struct {
 	format    configFormat
 	path      func(home string) (string, error)
 	container []string // path to the object holding servers, e.g. ["mcpServers"]
-	entry     func(url, tokenEnv string) ordered
+	entry     func(url, tokenEnv string) jsonc.Ordered
 	// skeleton is the content of a config Beacon creates, besides the server entry.
-	skeleton ordered
+	skeleton jsonc.Ordered
 	// cli names a CLI whose own `mcp add`/`mcp remove` Beacon prefers when it is on PATH.
 	cli string
 	// vscodeInputs is set for VS Code, whose token mode uses a prompted input.
 	vscodeInputs bool
+	// strictJSON is set for a harness that parses its config as plain JSON and ignores a file
+	// with comments or trailing commas: Beacon neither edits such a file nor writes one.
+	strictJSON bool
+	// switchable is set for a harness that turns a server off with an `enabled` key inside its
+	// entry. That key is the person's: connect keeps its value whenever it writes the entry.
+	switchable bool
 
 	oauthNext string
 	tokenNext string // may contain %s for the variable name
@@ -82,10 +98,10 @@ func Targets() []Target {
 			Name: "claude_code", DisplayName: "Claude Code", Aliases: []string{"claude", "claude-code"},
 			Automatic: true, format: formatJSON, path: claudeConfigPath, container: []string{"mcpServers"},
 			cli: "claude",
-			entry: func(url, tokenEnv string) ordered {
-				e := ordered{{"type", "http"}, {"url", url}}
+			entry: func(url, tokenEnv string) jsonc.Ordered {
+				e := jsonc.Ordered{{Key: "type", Value: "http"}, {Key: "url", Value: url}}
 				if tokenEnv != "" {
-					e = append(e, field{"headers", ordered{{"Authorization", "Bearer ${" + tokenEnv + "}"}}})
+					e = append(e, jsonc.Field{Key: "headers", Value: jsonc.Ordered{{Key: "Authorization", Value: "Bearer ${" + tokenEnv + "}"}}})
 				}
 				return e
 			},
@@ -95,10 +111,11 @@ func Targets() []Target {
 		{
 			Name: "codex_cli", DisplayName: "Codex CLI", Aliases: []string{"codex", "codex-cli"},
 			Automatic: true, format: formatTOML, path: codexConfigPath, container: []string{"mcp_servers"},
-			entry: func(url, tokenEnv string) ordered {
-				e := ordered{{"url", url}}
+			switchable: true,
+			entry: func(url, tokenEnv string) jsonc.Ordered {
+				e := jsonc.Ordered{{Key: "url", Value: url}}
 				if tokenEnv != "" {
-					e = append(e, field{"bearer_token_env_var", tokenEnv})
+					e = append(e, jsonc.Field{Key: "bearer_token_env_var", Value: tokenEnv})
 				}
 				return e
 			},
@@ -108,10 +125,10 @@ func Targets() []Target {
 		{
 			Name: "cursor", DisplayName: "Cursor", Aliases: []string{"cursor"},
 			Automatic: true, format: formatJSON, path: homePath(".cursor", "mcp.json"), container: []string{"mcpServers"},
-			entry: func(url, tokenEnv string) ordered {
-				e := ordered{{"url", url}}
+			entry: func(url, tokenEnv string) jsonc.Ordered {
+				e := jsonc.Ordered{{Key: "url", Value: url}}
 				if tokenEnv != "" {
-					e = append(e, field{"headers", ordered{{"Authorization", "Bearer ${env:" + tokenEnv + "}"}}})
+					e = append(e, jsonc.Field{Key: "headers", Value: jsonc.Ordered{{Key: "Authorization", Value: "Bearer ${env:" + tokenEnv + "}"}}})
 				}
 				return e
 			},
@@ -122,10 +139,10 @@ func Targets() []Target {
 			Name: "vscode", DisplayName: "VS Code", Aliases: []string{"vscode", "vs-code", "code"},
 			Automatic: true, format: formatJSON, path: vscodeMCPPath, container: []string{"servers"},
 			vscodeInputs: true,
-			entry: func(url, tokenEnv string) ordered {
-				e := ordered{{"type", "http"}, {"url", url}}
+			entry: func(url, tokenEnv string) jsonc.Ordered {
+				e := jsonc.Ordered{{Key: "type", Value: "http"}, {Key: "url", Value: url}}
 				if tokenEnv != "" {
-					e = append(e, field{"headers", ordered{{"Authorization", "Bearer ${input:" + vscodeInputID + "}"}}})
+					e = append(e, jsonc.Field{Key: "headers", Value: jsonc.Ordered{{Key: "Authorization", Value: "Bearer ${input:" + vscodeInputID + "}"}}})
 				}
 				return e
 			},
@@ -134,11 +151,11 @@ func Targets() []Target {
 		},
 		{
 			Name: "gemini_cli", DisplayName: "Gemini CLI", Aliases: []string{"gemini", "gemini-cli"},
-			Automatic: true, format: formatJSON, path: homePath(".gemini", "settings.json"), container: []string{"mcpServers"},
-			entry: func(url, tokenEnv string) ordered {
-				e := ordered{{"url", url}, {"type", "http"}}
+			Automatic: true, format: formatJSON, path: func(home string) (string, error) { return harness.GeminiSettingsPath(home), nil }, container: []string{"mcpServers"},
+			entry: func(url, tokenEnv string) jsonc.Ordered {
+				e := jsonc.Ordered{{Key: "url", Value: url}, {Key: "type", Value: "http"}}
 				if tokenEnv != "" {
-					e = append(e, field{"headers", ordered{{"Authorization", "Bearer ${" + tokenEnv + "}"}}})
+					e = append(e, jsonc.Field{Key: "headers", Value: jsonc.Ordered{{Key: "Authorization", Value: "Bearer ${" + tokenEnv + "}"}}})
 				}
 				return e
 			},
@@ -148,16 +165,32 @@ func Targets() []Target {
 		{
 			Name: "opencode", DisplayName: "OpenCode", Aliases: []string{"opencode", "open-code"},
 			Automatic: true, format: formatJSON, path: opencodeConfigPath, container: []string{"mcp"},
-			skeleton: ordered{{"$schema", "https://opencode.ai/config.json"}},
-			entry: func(url, tokenEnv string) ordered {
-				e := ordered{{"type", "remote"}, {"url", url}, {"enabled", true}}
+			switchable: true,
+			skeleton:   jsonc.Ordered{{Key: "$schema", Value: "https://opencode.ai/config.json"}},
+			entry: func(url, tokenEnv string) jsonc.Ordered {
+				e := jsonc.Ordered{{Key: "type", Value: "remote"}, {Key: "url", Value: url}, {Key: "enabled", Value: true}}
 				if tokenEnv != "" {
-					e = append(e, field{"oauth", false}, field{"headers", ordered{{"Authorization", "Bearer {env:" + tokenEnv + "}"}}})
+					e = append(e, jsonc.Field{Key: "oauth", Value: false}, jsonc.Field{Key: "headers", Value: jsonc.Ordered{{Key: "Authorization", Value: "Bearer {env:" + tokenEnv + "}"}}})
 				}
 				return e
 			},
 			oauthNext: "Run `opencode mcp auth " + ServerName + "`.",
 			tokenNext: "Set %s in the environment OpenCode starts from.",
+		},
+		{
+			Name: "omp", DisplayName: "Oh My Pi", Aliases: []string{"omp", "oh-my-pi", "ohmypi"},
+			Automatic: true, format: formatJSON, path: ompMCPConfigPath, container: []string{"mcpServers"},
+			skeleton:   jsonc.Ordered{{Key: "$schema", Value: ompMCPSchema}},
+			strictJSON: true, switchable: true,
+			entry: func(url, tokenEnv string) jsonc.Ordered {
+				e := jsonc.Ordered{{Key: "type", Value: "http"}, {Key: "url", Value: url}}
+				if tokenEnv != "" {
+					e = append(e, jsonc.Field{Key: "headers", Value: jsonc.Ordered{{Key: "Authorization", Value: "Bearer ${" + tokenEnv + "}"}}})
+				}
+				return e
+			},
+			oauthNext: "In Oh My Pi, run /mcp reauth " + ServerName + " and sign in. Until then it reports " + ServerName + " as failing to connect.",
+			tokenNext: "Set %s in the environment Oh My Pi starts from.",
 		},
 
 		// Manual targets: no MCP OAuth support Beacon has confirmed, so Beacon writes nothing
@@ -172,28 +205,28 @@ func Targets() []Target {
 			Name: "cline", DisplayName: "Cline", Aliases: []string{"cline"},
 			manual: func(url string) string {
 				return "In Cline → MCP Servers → Configure, add to cline_mcp_settings.json:\n" +
-					jsonSnippet("mcpServers", ordered{{"type", "streamableHttp"}, {"url", url}, {"headers", bearerPlaceholder()}})
+					jsonSnippet("mcpServers", jsonc.Ordered{{Key: "type", Value: "streamableHttp"}, {Key: "url", Value: url}, {Key: "headers", Value: bearerPlaceholder()}})
 			},
 		},
 		{
 			Name: "kiro", DisplayName: "Kiro", Aliases: []string{"kiro", "kiro-ide", "kiro-cli"},
 			manual: func(url string) string {
 				return "Add to ~/.kiro/settings/mcp.json:\n" +
-					jsonSnippet("mcpServers", ordered{{"url", url}, {"headers", bearerPlaceholder()}})
+					jsonSnippet("mcpServers", jsonc.Ordered{{Key: "url", Value: url}, {Key: "headers", Value: bearerPlaceholder()}})
 			},
 		},
 		{
 			Name: "devin-desktop", DisplayName: "Devin Desktop", Aliases: []string{"devin-desktop", "windsurf"},
 			manual: func(url string) string {
 				return "Add to ~/.codeium/windsurf/mcp_config.json:\n" +
-					jsonSnippet("mcpServers", ordered{{"serverUrl", url}, {"headers", bearerPlaceholder()}})
+					jsonSnippet("mcpServers", jsonc.Ordered{{Key: "serverUrl", Value: url}, {Key: "headers", Value: bearerPlaceholder()}})
 			},
 		},
 		{
 			Name: "qwen_code", DisplayName: "Qwen Code", Aliases: []string{"qwen", "qwen-code"},
 			manual: func(url string) string {
 				return "Add to ~/.qwen/settings.json:\n" +
-					jsonSnippet("mcpServers", ordered{{"httpUrl", url}, {"headers", bearerPlaceholder()}})
+					jsonSnippet("mcpServers", jsonc.Ordered{{Key: "httpUrl", Value: url}, {Key: "headers", Value: bearerPlaceholder()}})
 			},
 		},
 		{
@@ -205,7 +238,7 @@ func Targets() []Target {
 		{
 			Name: "hermes", DisplayName: "Hermes Agent", Aliases: []string{"hermes", "hermes-agent"},
 			manual: func(url string) string {
-				return "Add to ~/.hermes/config.yaml:\n" +
+				return "Add to " + hermesConfigHint() + ":\n" +
 					"mcp_servers:\n  " + ServerName + ":\n    url: " + url + "\n    headers:\n      Authorization: \"Bearer <token>\""
 			},
 		},
@@ -219,19 +252,19 @@ func Targets() []Target {
 			Name: "antigravity_cli", DisplayName: "Antigravity CLI", Aliases: []string{"antigravity", "antigravity-cli"},
 			manual: func(url string) string {
 				return "Add to ~/.gemini/antigravity/mcp_config.json:\n" +
-					jsonSnippet("mcpServers", ordered{{"serverUrl", url}, {"headers", bearerPlaceholder()}})
+					jsonSnippet("mcpServers", jsonc.Ordered{{Key: "serverUrl", Value: url}, {Key: "headers", Value: bearerPlaceholder()}})
 			},
 		},
 	}
 }
 
-func bearerPlaceholder() ordered {
-	return ordered{{"Authorization", "Bearer <token>"}}
+func bearerPlaceholder() jsonc.Ordered {
+	return jsonc.Ordered{{Key: "Authorization", Value: "Bearer <token>"}}
 }
 
-func jsonSnippet(container string, entry ordered) string {
-	doc := ordered{{container, ordered{{ServerName, entry}}}}
-	return strings.TrimRight(renderJSONDocument(doc, jsonStyle{unit: "  ", eol: "\n"}), "\n")
+func jsonSnippet(container string, entry jsonc.Ordered) string {
+	doc := jsonc.Ordered{{Key: container, Value: jsonc.Ordered{{Key: ServerName, Value: entry}}}}
+	return strings.TrimRight(jsonc.NewDocument(doc, ""), "\n")
 }
 
 // NormalizeKey folds a harness spelling the way `beacon endpoint` target names are folded.
@@ -272,21 +305,34 @@ func homePath(parts ...string) func(string) (string, error) {
 	}
 }
 
-// claudeConfigPath is the file `claude mcp add --scope user` writes: ~/.claude.json, or
-// .claude.json inside CLAUDE_CONFIG_DIR when that is set.
+// claudeConfigPath is the file `claude mcp add --scope user` writes: claudesession.StateFile.
 func claudeConfigPath(home string) (string, error) {
-	if dir := strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR")); dir != "" {
-		return filepath.Join(dir, ".claude.json"), nil
+	path := claudesession.StateFile(home)
+	if path == "" {
+		return "", errors.New("home directory is empty")
 	}
-	return filepath.Join(home, ".claude.json"), nil
+	return path, nil
 }
 
-// codexConfigPath honors CODEX_HOME, as Codex does.
+// codexConfigPath resolves CODEX_HOME exactly as Codex and Beacon's session reader do.
 func codexConfigPath(home string) (string, error) {
-	if dir := strings.TrimSpace(os.Getenv("CODEX_HOME")); dir != "" {
-		return filepath.Join(dir, "config.toml"), nil
+	dir, err := codexsession.HomeDir(home)
+	if err != nil {
+		return "", err
 	}
-	return filepath.Join(home, ".codex", "config.toml"), nil
+	return filepath.Join(dir, "config.toml"), nil
+}
+
+// hermesConfigHint names the config.yaml a plain `hermes` reads, resolved through HERMES_HOME and
+// the active profile as Hermes does. When that fails, it says why instead of naming a file Hermes
+// would not read.
+func hermesConfigHint() string {
+	home, _ := os.UserHomeDir()
+	dir, err := hermessession.HomeDir(home)
+	if err != nil {
+		return "config.yaml in your Hermes home (" + err.Error() + ")"
+	}
+	return filepath.Join(dir, "config.yaml")
 }
 
 // vscodeMCPPath is the user-profile mcp.json, next to the settings.json VS Code discovery uses.
@@ -302,17 +348,26 @@ func vscodeMCPPath(string) (string, error) {
 // existing opencode.json, else an existing opencode.jsonc, else a new opencode.jsonc. (Checked
 // against opencode 1.18: with both files present it writes opencode.json.)
 func opencodeConfigPath(home string) (string, error) {
-	base := strings.TrimSpace(os.Getenv("XDG_CONFIG_HOME"))
-	if base == "" {
-		base = filepath.Join(home, ".config")
+	dir, err := hooks.OpenCodeConfigDir(home)
+	if err != nil {
+		return "", err
 	}
-	dir := filepath.Join(base, "opencode")
 	for _, name := range []string{"opencode.json", "opencode.jsonc"} {
 		if info, err := os.Stat(filepath.Join(dir, name)); err == nil && !info.IsDir() {
 			return filepath.Join(dir, name), nil
 		}
 	}
 	return filepath.Join(dir, "opencode.jsonc"), nil
+}
+
+// ompMCPConfigPath is the user-level mcp.json of the active Oh My Pi profile, the file its own
+// `/mcp add` writes at user level.
+func ompMCPConfigPath(home string) (string, error) {
+	dir, err := hooks.OmpAgentDirForHome(home)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "mcp.json"), nil
 }
 
 // NextStep is what the person does after connect for an automatic target.

@@ -2,6 +2,8 @@ import { SpanStatusCode } from "@opentelemetry/api";
 import { InMemorySpanExporter } from "@opentelemetry/sdk-trace-base";
 import { readFileSync } from "node:fs";
 import { createServer, type IncomingMessage } from "node:http";
+import { Readable, Writable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
@@ -10,9 +12,7 @@ import {
   ATTR_BEACON_HARNESS_NAME,
   ATTR_BEACON_ORIGIN,
   ATTR_BEACON_PROMPT_TEXT,
-  Observe,
   flush,
-  getTracer,
   initialize,
   initializeAsymptoteInstrumentations,
   isInitialized,
@@ -27,6 +27,7 @@ const envKeys = [
   "ASYMPTOTE_API_KEY",
   "ASYMPTOTE_BASE_URL",
   "OTEL_EXPORTER_OTLP_ENDPOINT",
+  "OTEL_SERVICE_NAME",
 ];
 
 describe("resolveExporterConfig", () => {
@@ -54,6 +55,17 @@ describe("resolveExporterConfig", () => {
 
     expect(config.mode).toBe("hosted");
     expect(config.observeUrl).toBe("https://observe.example/v1/observe");
+    expect(config.headers.authorization).toBe("Bearer env-key");
+  });
+
+  it("treats an empty ASYMPTOTE_BASE_URL as unset", () => {
+    process.env.ASYMPTOTE_API_KEY = "env-key";
+    process.env.ASYMPTOTE_BASE_URL = "";
+
+    const config = resolveExporterConfig();
+
+    expect(config.mode).toBe("hosted");
+    expect(config.observeUrl).toBe("https://api.asymptotelabs.ai/v1/observe");
     expect(config.headers.authorization).toBe("Bearer env-key");
   });
 
@@ -94,6 +106,93 @@ describe("resolveExporterConfig", () => {
     expect(config.observeUrl).toBe("http://127.0.0.1:9999/v1/observe");
   });
 
+  it("does not send the api key to a foreign OTLP endpoint from env", () => {
+    process.env.ASYMPTOTE_API_KEY = "secret-key";
+    process.env.OTEL_EXPORTER_OTLP_ENDPOINT = "http://collector.example:4318";
+
+    const config = resolveExporterConfig();
+
+    expect(config.mode).toBe("otlp");
+    expect(config.observeUrl).toBe("http://collector.example:4318/v1/observe");
+    expect(config.headers.authorization).toBeUndefined();
+    expect(JSON.stringify(config.headers)).not.toContain("secret-key");
+  });
+
+  it("does not treat a different port or scheme as the Asymptote origin", () => {
+    expect(
+      resolveExporterConfig({ apiKey: "k", otlpEndpoint: "https://api.asymptotelabs.ai:8443" }).headers.authorization,
+    ).toBeUndefined();
+    expect(
+      resolveExporterConfig({ apiKey: "k", otlpEndpoint: "http://api.asymptotelabs.ai" }).headers.authorization,
+    ).toBeUndefined();
+  });
+
+  it("sends the api key to an OTLP endpoint on the Asymptote origin", () => {
+    const config = resolveExporterConfig({ apiKey: "test-key", otlpEndpoint: "https://api.asymptotelabs.ai:443/v1/observe" });
+
+    expect(config.mode).toBe("otlp");
+    expect(config.headers.authorization).toBe("Bearer test-key");
+  });
+
+  it("sends the api key to an OTLP endpoint on a configured base URL origin", () => {
+    process.env.ASYMPTOTE_BASE_URL = "https://observe.example";
+    process.env.OTEL_EXPORTER_OTLP_ENDPOINT = "https://observe.example/";
+
+    const config = resolveExporterConfig({ apiKey: "test-key" });
+
+    expect(config.mode).toBe("otlp");
+    expect(config.headers.authorization).toBe("Bearer test-key");
+  });
+
+  it("refuses to send the api key over http to a non-loopback base URL", () => {
+    expect(() => resolveExporterConfig({ apiKey: "test-key", baseUrl: "http://observe.example" })).toThrow(
+      /refuses to send ASYMPTOTE_API_KEY over http/,
+    );
+  });
+
+  it("refuses an insecure base URL from env when the key would be sent", () => {
+    process.env.ASYMPTOTE_API_KEY = "env-key";
+    process.env.ASYMPTOTE_BASE_URL = "http://observe.example";
+
+    expect(() => resolveExporterConfig()).toThrow(/https/);
+  });
+
+  it("ignores an insecure base URL when the key goes nowhere", () => {
+    process.env.ASYMPTOTE_BASE_URL = "http://observe.example";
+
+    const config = resolveExporterConfig({ apiKey: "k", otlpEndpoint: "http://127.0.0.1:4318" });
+
+    expect(config.headers.authorization).toBeUndefined();
+  });
+
+  it("allows the api key over http to loopback base URLs", () => {
+    for (const baseUrl of ["http://127.0.0.1:4318", "http://localhost:4318", "http://[::1]:4318"]) {
+      const config = resolveExporterConfig({ apiKey: "test-key", baseUrl });
+
+      expect(config.mode).toBe("hosted");
+      expect(config.headers.authorization).toBe("Bearer test-key");
+    }
+  });
+
+  it("preserves a caller-supplied authorization header", () => {
+    const hosted = resolveExporterConfig({ apiKey: "test-key", headers: { Authorization: "Basic custom" } });
+    expect(hosted.headers).toEqual({ Authorization: "Basic custom" });
+
+    const foreign = resolveExporterConfig({
+      apiKey: "test-key",
+      otlpEndpoint: "http://collector.example:4318",
+      headers: { authorization: "Bearer collector-token" },
+    });
+    expect(foreign.headers).toEqual({ authorization: "Bearer collector-token" });
+  });
+
+  it("does not attach the api key in custom mode", () => {
+    const config = resolveExporterConfig({ apiKey: "test-key", disableDefaultExporter: true });
+
+    expect(config.mode).toBe("custom");
+    expect(config.headers.authorization).toBeUndefined();
+  });
+
   it("throws when neither hosted credentials nor explicit OTLP are configured", () => {
     expect(() => resolveExporterConfig()).toThrow(/ASYMPTOTE_API_KEY/);
   });
@@ -120,10 +219,6 @@ describe("sessionAttributes", () => {
       "gen_ai.conversation.id": "session-42",
       "beacon.session.working_directory": "/srv/agent",
     });
-  });
-
-  it("is exposed on the Observe facade", () => {
-    expect(Observe.sessionAttributes("session-42")).toEqual(sessionAttributes("session-42"));
   });
 });
 
@@ -163,6 +258,17 @@ describe("Asymptote Observe SDK", () => {
     expect(spans[0].attributes["asymptote.observe.input.count"]).toBe(1);
     expect(spans[0].attributes["asymptote.observe.output.type"]).toBe("string");
     expect(spans[0].resource.attributes["telemetry.sdk.version"]).toBe(packageVersion());
+  });
+
+  it("falls back to the default service name when OTEL_SERVICE_NAME is empty", async () => {
+    process.env.OTEL_SERVICE_NAME = "";
+    const exporter = new InMemorySpanExporter();
+    initialize({ spanExporter: exporter, disableDefaultExporter: true, disableBatch: true });
+
+    observe({ name: "agent.step" }, () => "ok")();
+    await flush();
+
+    expect(exporter.getFinishedSpans()[0].resource.attributes["service.name"]).toBe("asymptote-app");
   });
 
   it("respects observe input/output suppression", async () => {
@@ -260,42 +366,95 @@ describe("Asymptote Observe SDK", () => {
     expect(span.attributes[ATTR_BEACON_PROMPT_TEXT]).toBe("explain memoization");
   });
 
-  it("keeps Claude async iterable spans open until consumed", async () => {
+  it("preserves stream control methods and their original receiver", async () => {
     const exporter = new InMemorySpanExporter();
     initialize({ spanExporter: exporter, disableDefaultExporter: true, disableBatch: true });
-    const query = wrapClaudeAgentQuery(async function* (_prompt: string) {
-      yield { type: "message", text: "one" };
-      yield { type: "message", text: "two" };
-    });
-
-    const messages = [];
-    for await (const message of query("stream please")) {
-      messages.push(message);
+    class Stream {
+      #interrupted = false;
+      #sent = false;
+      async interrupt() { this.#interrupted = true; }
+      get interrupted() { return this.#interrupted; }
+      async next(): Promise<IteratorResult<string>> {
+        if (this.#interrupted || this.#sent) return { value: undefined, done: true };
+        this.#sent = true;
+        return { value: "message", done: false };
+      }
+      [Symbol.asyncIterator]() { return this; }
     }
+    const original = new Stream();
+    const query = wrapClaudeAgentQuery(() => original);
+    const stream = query();
+    expect(stream.interrupt).toBe(stream.interrupt);
+    await stream.interrupt();
+    expect(original.interrupted).toBe(true);
+    expect(stream.interrupted).toBe(true);
+    const messages = [];
+    for await (const message of stream) messages.push(message);
+    expect(messages).toEqual([]);
     await flush();
-
-    expect(messages).toHaveLength(2);
     expect(exporter.getFinishedSpans()).toHaveLength(1);
   });
 
-  it("provides a tracer compatible with Vercel-style telemetry hooks", async () => {
+  it("keeps direct iterator methods traced when a control closes the real source", async () => {
     const exporter = new InMemorySpanExporter();
     initialize({ spanExporter: exporter, disableDefaultExporter: true, disableBatch: true });
-
-    await fakeGenerateText({
-      experimental_telemetry: {
-        isEnabled: true,
-        tracer: Observe.getTracer(),
-      },
-    });
+    let cleaned = false;
+    const source = (async function* () {
+      try { yield "first"; yield "second"; } finally { cleaned = true; }
+    })();
+    const interrupt = async () => { await source.return(); };
+    const original = Object.assign(source, { interrupt, stop: interrupt });
+    Object.defineProperty(original, "stop", { value: original.interrupt, configurable: false, writable: false });
+    const stream = wrapClaudeAgentQuery(() => original)();
+    expect(stream[Symbol.asyncIterator]()).toBe(stream);
+    expect(await stream.next()).toEqual({ value: "first", done: false });
+    await stream.stop();
+    expect(cleaned).toBe(true);
+    expect(await stream.next()).toEqual({ value: undefined, done: true });
     await flush();
-
-    const [span] = exporter.getFinishedSpans();
-    expect(span.name).toBe("ai.generateText");
-    expect(span.attributes[ATTR_BEACON_HARNESS_NAME]).toBe("vercel_ai_sdk");
-    expect(span.attributes[ATTR_BEACON_EVENT_ACTION]).toBe("prompt.submitted");
+    expect(exporter.getFinishedSpans()).toHaveLength(1);
   });
 
+  it("traces explicit iterator throw and preserves source cleanup", async () => {
+    const exporter = new InMemorySpanExporter();
+    initialize({ spanExporter: exporter, disableDefaultExporter: true, disableBatch: true });
+    let cleaned = false;
+    const original = (async function* () {
+      try { yield "first"; } finally { cleaned = true; }
+    })();
+    const stream = wrapClaudeAgentQuery(() => original)();
+    await stream.next();
+    const failure = new Error("consumer failed");
+    await expect(stream.throw(failure)).rejects.toBe(failure);
+    expect(cleaned).toBe(true);
+    await flush();
+    expect(exporter.getFinishedSpans()).toHaveLength(1);
+    expect(exporter.getFinishedSpans()[0]?.status.code).toBe(SpanStatusCode.ERROR);
+  });
+
+  // An iterable with its own reading API is returned untouched: a wrapper would see only for-await,
+  // so reading it any other way would leave the span open and never export it.
+  it.each([
+    ["ReadableStream.getReader()", () => new ReadableStream({ start(c) { c.enqueue("x"); c.close(); } }), async (s: ReadableStream) => {
+      expect(s).toBeInstanceOf(ReadableStream);
+      await s.getReader().read();
+    }],
+    ["Readable.pipe()", () => Readable.from(["x"]), async (s: Readable) => {
+      expect(s).toBeInstanceOf(Readable);
+      await pipeline(s, new Writable({ write(_chunk, _encoding, done) { done(); } }));
+    }],
+  ])("returns an async iterable that is not an iterator as a value (%s)", async (_name, make, consume) => {
+    const exporter = new InMemorySpanExporter();
+    initialize({ spanExporter: exporter, disableDefaultExporter: true, disableBatch: true });
+    const original = make();
+    const sync = observe({ name: "sync" }, () => original)();
+    const promised = await observe({ name: "promised" }, async () => make())();
+    expect(sync).toBe(original);
+    await consume(sync as never);
+    await consume(promised as never);
+    await flush();
+    expect(exporter.getFinishedSpans().map(span => span.name).sort()).toEqual(["promised", "sync"]);
+  });
   it("exports OTLP over HTTP with hosted auth headers", async () => {
     const requests: CapturedRequest[] = [];
     const server = createServer(async (req, res) => {
@@ -351,24 +510,6 @@ function clearEnv(): void {
 function packageVersion(): string {
   const packageJSON = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string };
   return packageJSON.version;
-}
-
-async function fakeGenerateText(options: { experimental_telemetry?: { isEnabled?: boolean; tracer?: ReturnType<typeof getTracer> } }): Promise<void> {
-  if (!options.experimental_telemetry?.isEnabled || !options.experimental_telemetry.tracer) {
-    return;
-  }
-  options.experimental_telemetry.tracer.startActiveSpan(
-    "ai.generateText",
-    {
-      attributes: {
-        [ATTR_BEACON_HARNESS_NAME]: "vercel_ai_sdk",
-        [ATTR_BEACON_EVENT_ACTION]: "prompt.submitted",
-      },
-    },
-    span => {
-      span.end();
-    },
-  );
 }
 
 function readRequestBody(req: IncomingMessage): Promise<Buffer> {

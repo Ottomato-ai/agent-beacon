@@ -11,9 +11,9 @@ import {
 } from '../../src/shared/permissions.js';
 
 const HOSTS = [
-  '*://claude.ai/*',
-  '*://chatgpt.com/*',
-  '*://chat.openai.com/*',
+  'https://claude.ai/*',
+  'https://chatgpt.com/*',
+  'https://chat.openai.com/*',
   'http://127.0.0.1/*',
   'http://localhost/*',
 ];
@@ -73,8 +73,8 @@ describe('missingOrigins', () => {
   });
 
   it('lists only the withheld hosts, in manifest order', async () => {
-    const { api } = fakeApi(['*://claude.ai/*', 'http://127.0.0.1/*']);
-    expect(await missingOrigins(api)).toEqual(['*://chatgpt.com/*', '*://chat.openai.com/*', 'http://localhost/*']);
+    const { api } = fakeApi(['https://claude.ai/*', 'http://127.0.0.1/*']);
+    expect(await missingOrigins(api)).toEqual(['https://chatgpt.com/*', 'https://chat.openai.com/*', 'http://localhost/*']);
   });
 
   it('treats a failing check as missing rather than hiding a gap', async () => {
@@ -98,7 +98,7 @@ describe('missingOrigins', () => {
 
 describe('describeOrigin', () => {
   it('reduces a match pattern to its host', () => {
-    expect(describeOrigin('*://claude.ai/*')).toBe('claude.ai');
+    expect(describeOrigin('https://claude.ai/*')).toBe('claude.ai');
     expect(describeOrigin('http://127.0.0.1/*')).toBe('127.0.0.1');
     expect(describeOrigin('<all_urls>')).toBe('<all_urls>');
   });
@@ -115,7 +115,7 @@ describe('mountPermissionBanner', () => {
 
   it('shows the not-granted state naming the missing sites', async () => {
     const { doc, els } = fakeDoc();
-    mountPermissionBanner(fakeApi(['*://claude.ai/*']).api, doc);
+    mountPermissionBanner(fakeApi(['https://claude.ai/*']).api, doc);
     await settle();
     expect(els['perm-missing'].hidden).toBe(false);
     expect(els['perm-missing'].dataset.state).toBe('missing');
@@ -124,7 +124,7 @@ describe('mountPermissionBanner', () => {
 
   it('requests exactly the missing hosts synchronously on click, then hides once granted', async () => {
     const { doc, els } = fakeDoc();
-    const { api, request } = fakeApi(['*://claude.ai/*'], { grantOnRequest: true });
+    const { api, request } = fakeApi(['https://claude.ai/*'], { grantOnRequest: true });
     mountPermissionBanner(api, doc);
     await settle();
     els['perm-grant'].click!();
@@ -173,6 +173,29 @@ describe('mountPermissionBanner', () => {
     listeners.forEach((fn) => fn());
     await settle();
     expect(els['perm-missing'].hidden).toBe(true);
+  });
+
+  it.each([false, true])('keeps the newest permission state when an older check finishes late (latest granted=%s)', async (latestGranted) => {
+    const { doc, els } = fakeDoc();
+    const { api } = fakeApi([]);
+    const oldReads: Array<(granted: boolean) => void> = [];
+    let firstCheck = true;
+    let changed: (() => void) | undefined;
+    api.permissions.contains = () => firstCheck
+      ? new Promise<boolean>(resolve => oldReads.push(resolve))
+      : Promise.resolve(latestGranted);
+    api.permissions.onRemoved = { addListener: fn => { changed = fn; } };
+    mountPermissionBanner(api, doc);
+    await settle();
+    expect(oldReads).toHaveLength(HOSTS.length);
+    firstCheck = false;
+    changed!();
+    await settle();
+    expect(els['perm-missing'].hidden).toBe(latestGranted);
+    oldReads.forEach(resolve => resolve(!latestGranted));
+    await settle();
+    expect(els['perm-missing'].hidden).toBe(latestGranted);
+    expect(els['perm-missing'].dataset.state).toBe(latestGranted ? 'granted' : 'missing');
   });
 
   it('does nothing on a page without the banner markup', () => {

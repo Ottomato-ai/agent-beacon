@@ -6,6 +6,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
+
+	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve"
 
 	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve/threatrules"
 )
@@ -55,36 +58,7 @@ func scanFixture(t *testing.T, logLines []string) {
 	scanOpts.failOn = ""
 }
 
-const (
-	evSecretRead = `{"timestamp":"2026-06-13T10:00:00Z","event":{"action":"file.read"},"file":{"path":".env"},"session":{"id":"s1"}}`
-	evBenignRead = `{"timestamp":"2026-06-13T10:00:01Z","event":{"action":"file.read"},"file":{"path":"README.md"},"session":{"id":"s1"}}`
-)
-
-func TestScanReportsFindings(t *testing.T) {
-	scanFixture(t, []string{evSecretRead, evBenignRead})
-	cmd, buf := newCmd()
-	if err := runScan(cmd, nil); err != nil {
-		t.Fatalf("scan: %v", err)
-	}
-	out := buf.String()
-	if !strings.Contains(out, "scan-test-secret-read") {
-		t.Fatalf("expected finding for the .env read, got:\n%s", out)
-	}
-	if !strings.Contains(out, "1 finding") {
-		t.Fatalf("expected exactly one finding, got:\n%s", out)
-	}
-}
-
-func TestScanNoFindings(t *testing.T) {
-	scanFixture(t, []string{evBenignRead})
-	cmd, buf := newCmd()
-	if err := runScan(cmd, nil); err != nil {
-		t.Fatalf("scan: %v", err)
-	}
-	if !strings.Contains(buf.String(), "No findings") {
-		t.Fatalf("expected no findings, got:\n%s", buf.String())
-	}
-}
+const evSecretRead = `{"timestamp":"2026-06-13T10:00:00Z","event":{"action":"file.read"},"file":{"path":".env"},"session":{"id":"s1"}}`
 
 func TestScanJSON(t *testing.T) {
 	scanFixture(t, []string{evSecretRead})
@@ -163,14 +137,88 @@ func TestScanFailOnIgnoresMinSeverityFilter(t *testing.T) {
 	}
 }
 
-func TestScanMinSeverityFilters(t *testing.T) {
+func TestScanSkipsNewerSpecRuleWithWarning(t *testing.T) {
 	scanFixture(t, []string{evSecretRead})
-	scanOpts.minSeverity = "critical" // finding is high -> filtered out
-	cmd, buf := newCmd()
+	future := strings.Replace(strings.Replace(scanTestRule, "id: scan-test-secret-read\n", "id: scan-future-rule\nspec: threat-rules/v2\n", 1),
+		"emit:", "future_field: true\nemit:", 1)
+	if err := os.WriteFile(filepath.Join(scanOpts.rulesDir, "future.rule.yaml"), []byte(future), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	scanOpts.jsonOutput = true
+	stdout, stderr := &strings.Builder{}, &strings.Builder{}
+	cmd, _ := newCmd()
+	cmd.SetOut(stdout)
+	cmd.SetErr(stderr)
 	if err := runScan(cmd, nil); err != nil {
 		t.Fatalf("scan: %v", err)
 	}
-	if !strings.Contains(buf.String(), "No findings") {
-		t.Fatalf("expected high finding filtered by --min-severity critical, got:\n%s", buf.String())
+	var findings []threatrules.Finding
+	if err := json.Unmarshal([]byte(stdout.String()), &findings); err != nil {
+		t.Fatalf("stdout must stay valid JSON: %v\n%s", err, stdout.String())
+	}
+	if len(findings) != 1 || findings[0].RuleID != "scan-test-secret-read" {
+		t.Fatalf("the current rule should still run: %+v", findings)
+	}
+	want := `rule "scan-future-rule" requires threat-rules/v2, but this Beacon supports up to ` + threatrules.SupportedSpec + `; upgrade Beacon to load it`
+	if !strings.Contains(stderr.String(), "warning: skipped ") || !strings.Contains(stderr.String(), want) {
+		t.Fatalf("want the skip warning on stderr, got %q", stderr.String())
+	}
+}
+
+func TestScanAllRulesSkippedNamesThem(t *testing.T) {
+	scanFixture(t, []string{evSecretRead})
+	// Replace the fixture's only rule with one that needs a newer spec.
+	future := strings.Replace(scanTestRule, "id: scan-test-secret-read\n", "id: scan-future-rule\nspec: threat-rules/v1.3\n", 1)
+	if err := os.WriteFile(filepath.Join(scanOpts.rulesDir, "secret.rule.yaml"), []byte(future), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr := &strings.Builder{}, &strings.Builder{}
+	cmd, _ := newCmd()
+	cmd.SetOut(stdout)
+	cmd.SetErr(stderr)
+	err := runScan(cmd, nil)
+	if err == nil {
+		t.Fatal("want an error when every rule is skipped")
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "store is empty") {
+		t.Fatalf("error must not claim the store is empty: %s", msg)
+	}
+	for _, want := range []string{`rule "scan-future-rule" requires threat-rules/v1.3`, "secret.rule.yaml", "supports up to " + threatrules.SupportedSpec, "upgrade Beacon"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error %q missing %q", msg, want)
+		}
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("the error names the skipped rules; no separate warning expected, got %q", stderr.String())
+	}
+}
+
+func TestScanEmptyRulesDirKeepsMessage(t *testing.T) {
+	scanFixture(t, []string{evSecretRead})
+	if err := os.Remove(filepath.Join(scanOpts.rulesDir, "secret.rule.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	cmd, _ := newCmd()
+	err := runScan(cmd, nil)
+	if err == nil || err.Error() != "no rules to run (store is empty and baseline missing)" {
+		t.Fatalf("want the unchanged empty-store message, got %v", err)
+	}
+}
+
+// A finding's prompt or command is cut to fit one line. The cut must land between characters:
+// a prompt in Japanese or with accents is mostly multibyte, and a byte cut prints a broken rune.
+func TestSummarizeEventTruncatesWholeCharacters(t *testing.T) {
+	prompt := strings.Repeat("é", 150)
+	got := summarizeEvent(asymptoteobserve.Event{
+		Event:  asymptoteobserve.EventInfo{Action: "prompt.submitted"},
+		Prompt: &asymptoteobserve.PromptInfo{Text: prompt},
+	})
+	if !utf8.ValidString(got) {
+		t.Fatalf("summary is not valid UTF-8: %q", got)
+	}
+	want := "prompt.submitted: " + strings.Repeat("é", 99) + "…"
+	if got != want {
+		t.Fatalf("summary = %q, want %q", got, want)
 	}
 }

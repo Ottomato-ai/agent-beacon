@@ -27,7 +27,11 @@ agent transcripts under ~/.cursor/projects. Beacon reads those committed local
 records and converts them into endpoint events marked harness.collection_method=poll.
 
 Reading is local and offline. Run 'sync' on a schedule, or with --watch, to keep
-the runtime log current.`,
+the runtime log current.
+
+Cursor's local records carry no token counts. 'usage sync' collects Cursor's token
+usage and charges from the Cursor Admin API instead; it is the one Cursor command
+that uses the network, and only when you run it.`,
 }
 
 var endpointCursorSyncCmd = &cobra.Command{
@@ -52,6 +56,7 @@ var endpointCursorOpts struct {
 	print        bool
 	watch        bool
 	interval     time.Duration
+	rotateBytes  int64
 }
 
 func init() {
@@ -74,11 +79,16 @@ func init() {
 	sync.BoolVar(&endpointCursorOpts.print, "print", false, "Print mapped events as JSON without writing them or advancing the cursor (dry run)")
 	sync.BoolVar(&endpointCursorOpts.watch, "watch", false, "Sweep continuously on --interval (default: one sweep then exit)")
 	sync.DurationVar(&endpointCursorOpts.interval, "interval", time.Minute, "Sweep interval for --watch")
+	addSyncRotateBytesFlag(sync, &endpointCursorOpts.rotateBytes)
 }
 
 func runEndpointCursorSync(cmd *cobra.Command, args []string) error {
+	if err := checkSyncRotateBytes(endpointCursorOpts.rotateBytes); err != nil {
+		return err
+	}
 	userMode := endpointUserMode()
 	opts := cursorsession.CollectOptions{
+		RotateBytes:  endpointCursorOpts.rotateBytes,
 		GlobalDBPath: endpointCursorOpts.globalDBPath,
 		ProjectsDir:  endpointCursorOpts.projectsDir,
 		Print:        endpointCursorOpts.print,
@@ -131,6 +141,7 @@ func reportCursorSweep(cmd *cobra.Command, summary cursorsession.Summary) {
 	}
 	fmt.Fprintf(cmd.OutOrStdout(), "cursor sync: %d traces, %d changed, %d events, %d errors\n",
 		summary.Traces, summary.TracesChanged, summary.EventsEmitted, summary.Errors)
+	reportSyncRetention(cmd.OutOrStdout(), summary.Retention)
 }
 
 type cursorStatusRef struct {

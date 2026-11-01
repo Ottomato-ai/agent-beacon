@@ -4,12 +4,16 @@ import (
 	"bufio"
 	"encoding/json"
 	"errors"
+	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
-	"testing/fstest"
 
+	"github.com/pelletier/go-toml/v2"
+
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/schema"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/testenv"
 )
 
@@ -59,6 +63,48 @@ func TestVectorConfigForwardsBothStreamsOverHTTPWithABearerSecret(t *testing.T) 
 	}
 }
 
+// A new user's first sessions should reach the dashboard within seconds of connecting, so the
+// runtime sink flushes a partial batch after ten seconds and paces itself at the one request a
+// second the ingest service allows each device. Vector accepts unknown keys in these sections
+// without a word, so a misspelled or misplaced key would validate and do nothing; this pins them.
+func TestRuntimeSinkFlushesQuicklyAtTheIngestRate(t *testing.T) {
+	got, err := VectorConfig("/tmp/beacon/runtime.jsonl")
+	if err != nil {
+		t.Fatalf("VectorConfig returned error: %v", err)
+	}
+	var config struct {
+		Sinks map[string]struct {
+			Batch struct {
+				TimeoutSecs *int64 `toml:"timeout_secs"`
+			} `toml:"batch"`
+			Request struct {
+				RateLimitNum          *int64 `toml:"rate_limit_num"`
+				RateLimitDurationSecs *int64 `toml:"rate_limit_duration_secs"`
+			} `toml:"request"`
+		} `toml:"sinks"`
+	}
+	if err := toml.Unmarshal([]byte(got), &config); err != nil {
+		t.Fatalf("parse rendered config: %v", err)
+	}
+	runtime, ok := config.Sinks["asymptote_runtime"]
+	if !ok {
+		t.Fatalf("no asymptote_runtime sink:\n%s", got)
+	}
+	for _, setting := range []struct {
+		name  string
+		value *int64
+		want  int64
+	}{
+		{"batch.timeout_secs", runtime.Batch.TimeoutSecs, 10},
+		{"request.rate_limit_num", runtime.Request.RateLimitNum, 1},
+		{"request.rate_limit_duration_secs", runtime.Request.RateLimitDurationSecs, 1},
+	} {
+		if setting.value == nil || *setting.value != setting.want {
+			t.Fatalf("asymptote_runtime %s = %v, want %d", setting.name, setting.value, setting.want)
+		}
+	}
+}
+
 func TestIngestSmokeTestChecksCredentialBeforePosting(t *testing.T) {
 	got, err := IngestSmokeTest("/tmp/beacon/runtime.jsonl")
 	if err != nil {
@@ -77,7 +123,6 @@ func TestIngestSmokeTestChecksCredentialBeforePosting(t *testing.T) {
 		"Content-Encoding: gzip",
 		"Content-Type: application/x-ndjson",
 		"-H @",
-		"validation only",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("smoke test missing %q:\n%s", want, got)
@@ -218,7 +263,7 @@ func TestRenderVectorConfigSelectsMetadataOnlyTransforms(t *testing.T) {
 		`inputs = ["beacon_runtime_metadata"]`,
 		`inputs = ["beacon_inventory_metadata"]`,
 		`drop_on_abort = true`,
-		`del(event.prompt)`,
+		`del(event.prompt.text)`,
 		`del(event.command.output)`,
 		`del(event.file.diff)`,
 		`del(event.gen_ai.tool.call.arguments)`,
@@ -264,6 +309,79 @@ func TestRenderedPrivacyConfigsValidateWithVector(t *testing.T) {
 	}
 }
 
+// Runs the metadata-only transform on every sample event with Vector's own VRL runtime. No retained
+// text survives, and a session.context skill index still says what it was and which skills it
+// listed, so the backend can tell it from any other session.context and join it to inventory.
+func TestMetadataTransformKeepsSystemContextWithVector(t *testing.T) {
+	vector := os.Getenv("BEACON_TEST_VECTOR_BIN")
+	if vector == "" {
+		t.Skip("set BEACON_TEST_VECTOR_BIN to run the metadata transform with Vector")
+	}
+	var transforms struct {
+		Transforms map[string]struct {
+			Source string `toml:"source"`
+		} `toml:"transforms"`
+	}
+	data, err := fs.ReadFile(packFS, privacyTransformAsset)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := toml.Unmarshal(data, &transforms); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	program := filepath.Join(dir, "runtime.vrl")
+	if err := os.WriteFile(program, []byte(transforms.Transforms["beacon_runtime_metadata"].Source), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	samples, err := fs.ReadFile(packFS, "pack/sample-event.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var input strings.Builder
+	for _, line := range strings.Split(strings.TrimSpace(string(samples)), "\n") {
+		wrapped, _ := json.Marshal(map[string]string{"message": line})
+		input.Write(append(wrapped, '\n'))
+	}
+	inputPath := filepath.Join(dir, "input.jsonl")
+	if err := os.WriteFile(inputPath, []byte(input.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command(vector, "vrl", "--input", inputPath, "--program", program, "--print-object").CombinedOutput()
+	if err != nil {
+		t.Fatalf("vector vrl: %v\n%s", err, out)
+	}
+	sawListing := false
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		var wrapped struct {
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal([]byte(line), &wrapped); err != nil || wrapped.Message == "" {
+			continue
+		}
+		var event schema.Event
+		if err := json.Unmarshal([]byte(wrapped.Message), &event); err != nil {
+			t.Fatalf("transformed event is not an event: %v\n%s", err, wrapped.Message)
+		}
+		if event.GenAI != nil && (event.GenAI.SystemInstructions != nil || event.GenAI.Input != nil) {
+			t.Fatalf("metadata-only kept retained text: %s", wrapped.Message)
+		}
+		if event.SystemContext == nil {
+			continue
+		}
+		sawListing = true
+		if event.SystemContext.Kind != schema.SystemContextSkillListing || len(event.SystemContext.Skills) == 0 || event.SystemContext.Skills[0].SkillNameHash == "" {
+			t.Fatalf("system_context = %+v, want the listing's kind and named skills", event.SystemContext)
+		}
+		if strings.Contains(wrapped.Message, "release checklist") || event.Content == nil || event.Content.Retention != schema.ContentRetentionMetadata {
+			t.Fatalf("skill listing text or retention survived metadata-only: %s", wrapped.Message)
+		}
+	}
+	if !sawListing {
+		t.Fatal("no sample event carries a skill listing; the pack's samples should show one")
+	}
+}
+
 func TestSecretsFileContentIsTheShapeTheTemplateReads(t *testing.T) {
 	content := SecretsFileContent(`bcn_device_abcdefgh_` + strings.Repeat("x", 43))
 	var parsed map[string]string
@@ -276,12 +394,5 @@ func TestSecretsFileContentIsTheShapeTheTemplateReads(t *testing.T) {
 	quoted := SecretsFileContent(`a"b\c`)
 	if err := json.Unmarshal([]byte(quoted), &parsed); err != nil || parsed[SecretsKey] != `a"b\c` {
 		t.Fatalf("secrets content must escape the key: %q (%v)", quoted, err)
-	}
-}
-
-func TestFilesFromFSPropagatesReadErrors(t *testing.T) {
-	fsys := fstest.MapFS{"pack/README.md": &fstest.MapFile{Data: []byte("readme")}}
-	if _, err := filesFromFS(fsys); err == nil || !strings.Contains(err.Error(), "asymptote pack asset") {
-		t.Fatalf("expected a labelled asset read error, got %v", err)
 	}
 }

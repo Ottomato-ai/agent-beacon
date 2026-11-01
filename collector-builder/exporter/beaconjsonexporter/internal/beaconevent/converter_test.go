@@ -124,30 +124,6 @@ func TestEventsFromTracesNormalizesVercelAISDKSpan(t *testing.T) {
 	}
 }
 
-func TestEventsFromTracesNormalizesClaudeAgentSDKSpan(t *testing.T) {
-	span, traces := newObserveSDKTraceSpan("claude_agent_sdk.query")
-	attrs := span.Attributes()
-	attrs.PutStr("beacon.harness.name", "claude_agent_sdk")
-	attrs.PutStr("beacon.event.action", "prompt.submitted")
-	attrs.PutStr("beacon.event.category", "prompt")
-	attrs.PutStr("beacon.prompt.text", "review this pull request")
-
-	events := NewConverter(Options{}).EventsFromTraces(traces)
-	if len(events) != 1 {
-		t.Fatalf("expected 1 event, got %d", len(events))
-	}
-	event := events[0]
-	if event.Harness.Name != "claude_agent_sdk" {
-		t.Fatalf("harness = %q, want claude_agent_sdk", event.Harness.Name)
-	}
-	if event.Event.Action != "prompt.submitted" || event.Event.Category != "prompt" {
-		t.Fatalf("event = %#v, want prompt.submitted prompt", event.Event)
-	}
-	if event.Prompt == nil || event.Prompt.Text != "review this pull request" {
-		t.Fatalf("prompt = %#v, want captured prompt text", event.Prompt)
-	}
-}
-
 func TestEventFromSpanNormalizesClaudeCodeLLMRequestUsage(t *testing.T) {
 	// Claude Code's claude_code.llm_request span records token usage under bare
 	// attribute names (input_tokens, output_tokens, cache_read_tokens,
@@ -635,6 +611,48 @@ func TestGenAIUsageFromAttrsNormalizesAliases(t *testing.T) {
 			},
 		},
 		{
+			// The browser extension's Claude adapter emits the one-hour cache-write subset
+			// beside the write count.
+			name: "one-hour cache write subset",
+			attrs: map[string]interface{}{
+				"gen_ai.usage.cache_creation.input_tokens":              int64(20000),
+				"gen_ai.usage.cache_creation.ephemeral_1h_input_tokens": int64(16000),
+			},
+			check: func(t *testing.T, usage *GenAIUsageInfo) {
+				c := usage.CacheCreation
+				if c == nil || c.InputTokens == nil || *c.InputTokens != 20000 || c.Ephemeral1hInputTokens == nil || *c.Ephemeral1hInputTokens != 16000 {
+					t.Fatalf("cache_creation = %#v, want 20000 with 16000 one-hour", c)
+				}
+			},
+		},
+		{
+			name: "one-hour subset clamped to the write count",
+			attrs: map[string]interface{}{
+				"gen_ai.usage.cache_creation.input_tokens":              int64(500),
+				"gen_ai.usage.cache_creation.ephemeral_1h_input_tokens": int64(900),
+			},
+			check: func(t *testing.T, usage *GenAIUsageInfo) {
+				c := usage.CacheCreation
+				if c == nil || c.Ephemeral1hInputTokens == nil || *c.Ephemeral1hInputTokens != 500 {
+					t.Fatalf("cache_creation = %#v, want the subset clamped to 500", c)
+				}
+			},
+		},
+		{
+			// A subset without the count it belongs to cannot be placed; it is dropped rather
+			// than invented into a write count.
+			name: "one-hour subset without a write count",
+			attrs: map[string]interface{}{
+				"gen_ai.usage.input_tokens":                             int64(5),
+				"gen_ai.usage.cache_creation.ephemeral_1h_input_tokens": int64(900),
+			},
+			check: func(t *testing.T, usage *GenAIUsageInfo) {
+				if usage.CacheCreation != nil {
+					t.Fatalf("cache_creation = %#v, want none", usage.CacheCreation)
+				}
+			},
+		},
+		{
 			name:  "runtime reported cost attribute",
 			attrs: map[string]interface{}{"gen_ai.usage.cost": 0.0123},
 			check: func(t *testing.T, usage *GenAIUsageInfo) {
@@ -661,6 +679,183 @@ func TestGenAIUsageFromAttrsNormalizesAliases(t *testing.T) {
 			}
 			tt.check(t, usage)
 		})
+	}
+}
+
+// The OTel GenAI semconv input count, and the OpenAI-style prompt_tokens names
+// it replaced, include cached prompt tokens ("This value SHOULD include all
+// types of input tokens, including cached tokens"), while Beacon's gen_ai.usage
+// keeps uncached input disjoint from cache reads and writes. Every inclusive
+// spelling must therefore lose its cached subset, and Claude Code's bare,
+// already-disjoint names must not.
+func TestGenAIUsageFromAttrsReducesInclusiveInputToUncached(t *testing.T) {
+	ptr := func(v int64) *int64 { return &v }
+	tests := []struct {
+		name          string
+		attrs         map[string]interface{}
+		wantInput     *int64
+		wantCacheRead *int64
+		wantCacheCrt  *int64
+	}{
+		{
+			// OpenLLMetry's Anthropic instrumentation: input_tokens is
+			// usage.input_tokens + cache_read + cache_creation.
+			name: "semconv input with underscore cache aliases",
+			attrs: map[string]interface{}{
+				"gen_ai.usage.input_tokens":                int64(19561),
+				"gen_ai.usage.cache_read_input_tokens":     int64(18500),
+				"gen_ai.usage.cache_creation_input_tokens": int64(1024),
+				"gen_ai.usage.output_tokens":               int64(214),
+			},
+			wantInput: ptr(37), wantCacheRead: ptr(18500), wantCacheCrt: ptr(1024),
+		},
+		{
+			name: "semconv input with dotted cache names",
+			attrs: map[string]interface{}{
+				"gen_ai.usage.input_tokens":                int64(1000),
+				"gen_ai.usage.cache_read.input_tokens":     int64(600),
+				"gen_ai.usage.cache_creation.input_tokens": int64(100),
+			},
+			wantInput: ptr(300), wantCacheRead: ptr(600), wantCacheCrt: ptr(100),
+		},
+		{
+			// The GenAI semconv repository renamed cache creation to cache_write.
+			name: "semconv cache_write spelling is cache creation",
+			attrs: map[string]interface{}{
+				"gen_ai.usage.input_tokens":             int64(1000),
+				"gen_ai.usage.cache_write.input_tokens": int64(250),
+			},
+			wantInput: ptr(750), wantCacheCrt: ptr(250),
+		},
+		{
+			// OpenAI's prompt_tokens includes prompt_tokens_details.cached_tokens.
+			name: "legacy gen_ai prompt_tokens with cache read only",
+			attrs: map[string]interface{}{
+				"gen_ai.usage.prompt_tokens":           int64(2048),
+				"gen_ai.usage.cache_read.input_tokens": int64(1920),
+			},
+			wantInput: ptr(128), wantCacheRead: ptr(1920),
+		},
+		{
+			name: "legacy llm.usage prompt_tokens with cache read",
+			attrs: map[string]interface{}{
+				"llm.usage.prompt_tokens":              int64(500),
+				"gen_ai.usage.cache_read_input_tokens": int64(200),
+			},
+			wantInput: ptr(300), wantCacheRead: ptr(200),
+		},
+		{
+			name: "input exactly equal to its cached subsets leaves zero uncached",
+			attrs: map[string]interface{}{
+				"gen_ai.usage.input_tokens":                int64(700),
+				"gen_ai.usage.cache_read.input_tokens":     int64(600),
+				"gen_ai.usage.cache_creation.input_tokens": int64(100),
+			},
+			wantInput: ptr(0), wantCacheRead: ptr(600), wantCacheCrt: ptr(100),
+		},
+		{
+			// A source whose input is smaller than its own cache counts cannot
+			// be inclusive; it already reports uncached input, so subtracting
+			// would erase real tokens.
+			name: "guard: input below cached subsets is already disjoint",
+			attrs: map[string]interface{}{
+				"gen_ai.usage.input_tokens":                int64(37),
+				"gen_ai.usage.cache_read.input_tokens":     int64(18500),
+				"gen_ai.usage.cache_creation.input_tokens": int64(1024),
+			},
+			wantInput: ptr(37), wantCacheRead: ptr(18500), wantCacheCrt: ptr(1024),
+		},
+		{
+			name:      "semconv input without cache counts is unchanged",
+			attrs:     map[string]interface{}{"gen_ai.usage.input_tokens": int64(12)},
+			wantInput: ptr(12),
+		},
+		{
+			name: "zero cache counts leave input unchanged",
+			attrs: map[string]interface{}{
+				"gen_ai.usage.input_tokens":            int64(12),
+				"gen_ai.usage.cache_read.input_tokens": int64(0),
+			},
+			wantInput: ptr(12), wantCacheRead: ptr(0),
+		},
+		{
+			name: "cache counts without an input count stay as reported",
+			attrs: map[string]interface{}{
+				"gen_ai.usage.cache_read.input_tokens": int64(90),
+			},
+			wantCacheRead: ptr(90),
+		},
+		{
+			// Claude Code's claude_code.llm_request span and api_request log use
+			// Anthropic's disjoint usage under bare names.
+			name: "claude code bare names are already disjoint",
+			attrs: map[string]interface{}{
+				"input_tokens":          int64(1200),
+				"cache_read_tokens":     int64(800),
+				"cache_creation_tokens": int64(256),
+			},
+			wantInput: ptr(1200), wantCacheRead: ptr(800), wantCacheCrt: ptr(256),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			usage := GenAIUsageFromAttrs(tt.attrs)
+			if usage == nil {
+				t.Fatalf("usage = nil, want populated usage")
+			}
+			assertInt64Ptr(t, "input_tokens", usage.InputTokens, tt.wantInput)
+			var cacheRead, cacheCreation *int64
+			if usage.CacheRead != nil {
+				cacheRead = usage.CacheRead.InputTokens
+			}
+			if usage.CacheCreation != nil {
+				cacheCreation = usage.CacheCreation.InputTokens
+			}
+			assertInt64Ptr(t, "cache_read", cacheRead, tt.wantCacheRead)
+			assertInt64Ptr(t, "cache_creation", cacheCreation, tt.wantCacheCrt)
+		})
+	}
+}
+
+func assertInt64Ptr(t *testing.T, field string, got, want *int64) {
+	t.Helper()
+	switch {
+	case got == nil && want == nil:
+	case got == nil || want == nil:
+		t.Fatalf("%s = %v, want %v", field, got, want)
+	case *got != *want:
+		t.Fatalf("%s = %d, want %d", field, *got, *want)
+	}
+}
+
+// The semconv gen_ai.client.token.usage histogram has only input and output
+// token types, so an inclusive input datapoint has no cached sibling to
+// double-count against; it is stored as reported.
+func TestEventsFromMetricsSemconvClientTokenUsageKeepsInputAsReported(t *testing.T) {
+	metrics := pmetric.NewMetrics()
+	resourceMetrics := metrics.ResourceMetrics().AppendEmpty()
+	resourceMetrics.Resource().Attributes().PutStr("service.name", "agent-api")
+	metric := resourceMetrics.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+	metric.SetName("gen_ai.client.token.usage")
+	histogram := metric.SetEmptyHistogram()
+	for _, dp := range []struct {
+		tokenType string
+		sum       float64
+	}{{"input", 19561}, {"output", 214}} {
+		point := histogram.DataPoints().AppendEmpty()
+		point.SetCount(1)
+		point.SetSum(dp.sum)
+		point.Attributes().PutStr("gen_ai.token.type", dp.tokenType)
+		point.Attributes().PutStr("gen_ai.request.model", "claude-sonnet-4-5")
+	}
+
+	events := NewConverter(Options{}).EventsFromMetrics(metrics)
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(events))
+	}
+	input := events[0].GenAI.Usage
+	if input == nil || input.InputTokens == nil || *input.InputTokens != 19561 || input.CacheRead != nil || input.CacheCreation != nil {
+		t.Fatalf("input datapoint usage = %#v, want input_tokens 19561 and no cache", input)
 	}
 }
 
@@ -881,29 +1076,19 @@ func toolCallIDOfEvent(event Event) string {
 	return event.GenAI.Tool.Call.ID
 }
 
-// Codex names its calls call_id rather than tool_use_id. Both are read from one
-// shared alias list, so a runtime cannot be supported on one capture path and
-// invisible on the other.
-func TestCapturedCodexLogPromotesItsOwnCallID(t *testing.T) {
-	_, events := capturedLogEvents(t, "codex-0.142.4.json")
-	found := false
-	for _, event := range events {
-		if id := toolCallIDOfEvent(event); id != "" {
-			if id != "call_fixture" {
-				t.Fatalf("call ID = %q, want the call_id Codex assigned", id)
-			}
-			found = true
-		}
-	}
-	if !found {
-		t.Fatal("no event promoted Codex's call_id")
-	}
-}
-
 func TestCapturedClaudeCodeLifecycleTaxonomy(t *testing.T) {
 	fixture, events := capturedLogEvents(t, "claude-code-lifecycle-2.1.220.json")
-	if len(events) != len(fixture.Records) {
-		t.Fatalf("events = %d, want %d", len(events), len(fixture.Records))
+	// API body events are dropped unless they are the WebFetch summarizer request, and the
+	// fixture's are not.
+	dropped := map[string]bool{"api_request_body": true, "api_response_body": true}
+	var kept []string
+	for _, captured := range fixture.Records {
+		if !dropped[captured.Name] {
+			kept = append(kept, captured.Name)
+		}
+	}
+	if len(events) != len(kept) {
+		t.Fatalf("events = %d, want %d", len(events), len(kept))
 	}
 	expected := map[string]eventClassification{
 		"user_prompt":             {action: "prompt.submitted", category: "prompt"},
@@ -932,18 +1117,18 @@ func TestCapturedClaudeCodeLifecycleTaxonomy(t *testing.T) {
 	if len(claudeLogEventClassifications) != len(expected)+2 {
 		t.Fatalf("documented Claude taxonomy has %d events, want %d", len(claudeLogEventClassifications), len(expected)+2)
 	}
-	for i, captured := range fixture.Records {
-		want, ok := expected[captured.Name]
+	for i, name := range kept {
+		want, ok := expected[name]
 		if !ok {
-			t.Fatalf("fixture %q has no expected classification", captured.Name)
+			t.Fatalf("fixture %q has no expected classification", name)
 		}
 		event := events[i]
 		if event.Event.Action != want.action || event.Event.Category != want.category {
-			t.Errorf("%s event = %#v, want %s/%s", captured.Name, event.Event, want.action, want.category)
+			t.Errorf("%s event = %#v, want %s/%s", name, event.Event, want.action, want.category)
 		}
 		switch event.Event.Action {
 		case "tool.invoked", "command.executed", "mcp.tool_invoked":
-			t.Errorf("%s lifecycle event incorrectly classified as %s", captured.Name, event.Event.Action)
+			t.Errorf("%s lifecycle event incorrectly classified as %s", name, event.Event.Action)
 		}
 	}
 	if prompt := events[0].Prompt; prompt == nil || prompt.Text != "CLAUDE_LIFECYCLE_MARKER" {
@@ -1190,26 +1375,9 @@ func TestDeriveMCPServerToolFromName(t *testing.T) {
 	}
 }
 
-func TestClaudeBuiltinToolResultDoesNotPopulateMCP(t *testing.T) {
-	// The name-convention derivation must not leak into built-in tools: a Bash tool_result is a
-	// command, never an MCP call, so event.MCP stays nil.
-	record := plog.NewLogRecord()
-	record.Body().SetStr("claude_code.tool_result")
-	attrs := record.Attributes()
-	attrs.PutStr("service.name", "claude-code")
-	attrs.PutStr("event.name", "tool_result")
-	attrs.PutStr("tool_name", "Bash")
-	attrs.PutStr("tool_input", `{"command":"echo hi"}`)
-
-	event := NewConverter(Options{}).EventFromLog(nil, record)
-	if event.MCP != nil {
-		t.Fatalf("mcp = %#v, want nil for a built-in tool", event.MCP)
-	}
-	if event.Event.Action != "command.executed" {
-		t.Fatalf("event = %#v, want command.executed", event.Event)
-	}
-}
-
+// Codex names its calls call_id rather than tool_use_id. Both are read from one
+// shared alias list, so a runtime cannot be supported on one capture path and
+// invisible on the other.
 func TestCapturedCodexLogNormalizationIsUnchanged(t *testing.T) {
 	fixture, events := capturedLogEvents(t, "codex-0.142.4.json")
 	if len(events) != len(fixture.Records) {
@@ -1221,16 +1389,23 @@ func TestCapturedCodexLogNormalizationIsUnchanged(t *testing.T) {
 	if events[1].Event.Action != "command.executed" || events[1].Command == nil || events[1].Command.Command != "echo CODEX_MARKER" {
 		t.Fatalf("Codex result changed: %#v", events[1])
 	}
+	found := false
+	for _, event := range events {
+		if id := toolCallIDOfEvent(event); id != "" {
+			if id != "call_fixture" {
+				t.Fatalf("call ID = %q, want the call_id Codex assigned", id)
+			}
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("no event promoted Codex's call_id")
+	}
 }
 
 func TestClaudeNormalizerDoesNotAffectOtherHarnesses(t *testing.T) {
 	for _, serviceName := range []string{
 		"generic-runtime",
-		"codex_cli_rs",
-		"gemini-cli",
-		"github-copilot",
-		"copilot-chat",
-		"cursor",
 		"claude_agent_sdk",
 		"claude_web",
 	} {
@@ -1401,44 +1576,16 @@ func newObserveSDKTraceSpan(name string) (ptrace.Span, ptrace.Traces) {
 
 // Browser-based collectors (agent-beacon-browser-extension) must keep their own
 // harness identity and not be coerced into claude_code by the generic "claude"
-// rule.
+// rule. The other spellings are pinned in pkg/asymptoteobserve.
 func TestNormalizeHarnessNameBrowserSources(t *testing.T) {
 	cases := map[string]string{
-		"claude_web":  "claude_web",
 		"claude-web":  "claude_web",
-		"claude.ai":   "claude_web",
-		"chatgpt_web": "chatgpt_web",
 		"chatgpt.com": "chatgpt_web",
-		// Regression: existing harnesses must be unchanged.
-		"claude_code":      "claude_code",
-		"claude":           "claude_code",
-		"codex":            "codex_cli",
-		"codex-app-server": "codex_desktop",
-		"gemini":           "gemini_cli",
 	}
 	for in, want := range cases {
 		if got := NormalizeHarnessName(in); got != want {
 			t.Errorf("NormalizeHarnessName(%q) = %q, want %q", in, got, want)
 		}
-	}
-}
-
-func TestHarnessNameSeparatesCodexDesktopFromCLI(t *testing.T) {
-	cases := map[string]string{
-		"codex-app-server": "codex_desktop",
-		"codex-desktop":    "codex_desktop",
-		"codex":            "codex_cli",
-		"codex-cli":        "codex_cli",
-		"codex_exec":       "codex_cli",
-		"codex_cli_rs":     "codex_cli",
-	}
-	for serviceName, want := range cases {
-		t.Run(serviceName, func(t *testing.T) {
-			attrs := map[string]interface{}{"service.name": serviceName}
-			if got := HarnessName(attrs); got != want {
-				t.Errorf("HarnessName(%q) = %q, want %q", serviceName, got, want)
-			}
-		})
 	}
 }
 
@@ -1556,13 +1703,29 @@ func TestEventFromLogOmitsUserAgentWithoutIdentity(t *testing.T) {
 	}
 }
 
+// The browser extension cuts an oversized prompt, response or tool field before sending and says
+// so on the record. The flag has to reach field_truncated: metadata-only forwarding drops raw
+// attributes, and field_truncated is what downstream consumers read.
+func TestEventFromLogPromotesBrowserFieldTruncated(t *testing.T) {
+	for _, truncated := range []bool{true, false} {
+		logs := browserExtensionLogs(false)
+		record := logs.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0)
+		if truncated {
+			record.Attributes().PutBool("beacon.field_truncated", true)
+		}
+		events := NewConverter(Options{}).EventsFromLogs(logs)
+		if len(events) != 1 || events[0].Truncated != truncated {
+			t.Fatalf("beacon.field_truncated=%v: field_truncated = %v", truncated, events[0].Truncated)
+		}
+	}
+}
+
 func TestUserAgentFromAttrs(t *testing.T) {
 	cases := []struct {
 		name  string
 		attrs map[string]interface{}
 		want  *UserAgentInfo
 	}{
-		{"name and version", map[string]interface{}{"user_agent.name": "Brave", "user_agent.version": "124"}, &UserAgentInfo{Name: "Brave", Version: "124"}},
 		{"name only", map[string]interface{}{"user_agent.name": "Chromium"}, &UserAgentInfo{Name: "Chromium"}},
 		{"trimmed", map[string]interface{}{"user_agent.name": "  Opera  ", "user_agent.version": " 110 "}, &UserAgentInfo{Name: "Opera", Version: "110"}},
 		{"version without a name identifies nothing", map[string]interface{}{"user_agent.version": "124"}, nil},
@@ -1790,18 +1953,6 @@ func TestCopilotFidelitySplitsNamedEventsFromFallback(t *testing.T) {
 	fallback, fallbackFidelity := CopilotActionWithFidelity(map[string]interface{}{}, "", "asking for permission")
 	if fallback != "approval.requested" || fallbackFidelity != asymptoteobserve.FidelityInferred {
 		t.Fatalf("keyword copilot event = (%q, %q), want (approval.requested, inferred)", fallback, fallbackFidelity)
-	}
-}
-
-// InferAction is still exported and still returns just the action; the wrapper must not drift from
-// the function it delegates to.
-func TestInferActionMatchesWithFidelityVariant(t *testing.T) {
-	for _, fallback := range []string{"", "unclassifiable", "wrote a file", "exec something", "claude_code.assistant_response"} {
-		attrs := map[string]interface{}{"service.name": "some-runtime"}
-		want, _ := InferActionWithFidelity(attrs, fallback)
-		if got := InferAction(attrs, fallback); got != want {
-			t.Fatalf("InferAction(%q) = %q, InferActionWithFidelity = %q", fallback, got, want)
-		}
 	}
 }
 

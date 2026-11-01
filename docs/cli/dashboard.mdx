@@ -27,9 +27,21 @@ poll, and OTLP collection paths.
 
 - **Agent Activity Sessions:** browse grouped agent sessions with risk, prompt,
   harness, model, repository, duration, activity counts, and last-artifact
-  summaries.
+  summaries. The **All**, **Captured**, **Recurring**, and **Empty** tabs are
+  mutually exclusive views except that All contains every active session:
+  Captured has user-visible activity, Recurring is described below, and Empty
+  contains only lifecycle, metric, or internal events.
 - **Session detail:** open a session timeline with metadata, activity and severity
   summaries, event filters, raw JSON, and value inspectors.
+- **Sharing state:** a session shared with [`beacon share`](/cli/share) is marked
+  **Shared** in the session list and on its page, which links to the trace on
+  beacon.sh. It is marked **stale** when the session has activity newer than its
+  last share or refresh, and the page shows the `beacon share refresh …` command
+  to copy. The dashboard never shares or refreshes anything itself.
+- **Lenses:** add tabs to a session's page that show it from one angle: files
+  changed with diffs, an itemized token bill, a security review, approvals, or a
+  [lens you wrote](/concepts/lenses). Each lens runs in a sandboxed frame with no
+  network access.
 - **Agent Activity:** review aggregate local activity, risk signals, harnesses,
   models, repositories, MCP servers, and runtime inventory.
 - **Memory:** inspect read-only counts and tables for local evaluations, review
@@ -37,8 +49,8 @@ poll, and OTLP collection paths.
 - **Token Usage:** review runtime-reported token usage and cost where sources
   provide it.
 - **Detections:** browse the active [threat-rule](/detections) set that Beacon
-  would use for local scans, including rules installed in the local store or the
-  built-in baseline when no store is installed.
+  would use for local scans: rules installed in the local store plus the
+  built-in baseline rules the store does not replace by id.
 - **Findings:** run the active rules over the configured runtime log on demand and
   review matching evidence with severity and session filters.
 - **Agent Inventory:** inspect [Inventory Local Agent Runtimes](/guides/inventory)
@@ -52,6 +64,21 @@ The Detections and Findings screens mirror the same local rule resolution and sc
 
 The Memory screen is also read-only. Candidate approval, rejection, superseding,
 Jev evaluation, and Agent Skill installation stay in [`beacon memory`](/cli/memory).
+
+### Recurring sessions
+
+A session is recurring when at least two sessions owned by the same user have
+the same prompt, agent harness, and repository within the dashboard's selected
+date range. Beacon compares these values after trimming surrounding whitespace
+and converting them to lowercase; harness names also use Beacon's standard
+harness-name normalization. Missing harness and repository values compare
+consistently. Sessions without a non-blank captured prompt are never recurring.
+
+Every row in a recurring group shows **Recurring ×N**, where `N` is the number
+of matching sessions in the selected date range and user scope. Classification
+and this count are calculated before result limiting, so limiting the displayed
+rows does not change either value. Opening a recurring row still shows that
+individual session's timeline; Beacon does not merge the group.
 
 ## Flags
 

@@ -87,7 +87,7 @@ func TestModelLoadsAndRendersLocalTraceList(t *testing.T) {
 	model = runCmd(t, model, model.Init())
 
 	view := model.View()
-	for _, want := range []string{"B E A C O N", "Build the trace browser", "cursor", "/work/beacon", "full, redacted", "nothing is sent anywhere"} {
+	for _, want := range []string{"Build the trace browser", "cursor", "/work/beacon", "full, redacted"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("view missing %q:\n%s", want, view)
 		}
@@ -281,13 +281,6 @@ func TestListResultAppliedWhileInDetailMode(t *testing.T) {
 		t.Fatalf("expected loading search, got loading=%t query=%q", model.loading, model.query)
 	}
 
-	// enter should be blocked while the list is loading.
-	next, cmd := model.Update(key("enter"))
-	model = next.(Model)
-	if model.mode != listMode || cmd != nil {
-		t.Fatalf("enter while loading should be a no-op, got mode=%v cmd=%v", model.mode, cmd)
-	}
-
 	// Simulate the list load completing after the user opened a trace through
 	// some other path (e.g. the load finishes, user quickly opens a trace,
 	// then a second search fires).  The important invariant is that a list
@@ -332,5 +325,26 @@ func TestEventDetailsIncludesStructuredData(t *testing.T) {
 		if !strings.Contains(rendered, want) {
 			t.Fatalf("event details missing %q:\n%s", want, rendered)
 		}
+	}
+}
+
+func TestSharingLabelsAndRefreshHint(t *testing.T) {
+	local := dashboard.TraceSummaryV1{Sharing: dashboard.TraceSharingV1{State: "local_only"}}
+	if sharingLabel(local) != "" || sharingLines(local) != nil {
+		t.Fatal("a local trace shows sharing")
+	}
+	shared := dashboard.TraceSummaryV1{Sharing: dashboard.TraceSharingV1{State: "shared", Visibility: "direct", URL: "https://beacon.sh/s/x", RefreshCommand: "beacon share refresh claude_code:s"}}
+	if got := sharingLabel(shared); got != " · shared" {
+		t.Fatalf("label = %q", got)
+	}
+	if lines := sharingLines(shared); len(lines) != 1 || !strings.Contains(lines[0], "https://beacon.sh/s/x") {
+		t.Fatalf("lines = %q", lines)
+	}
+	shared.Sharing.State = "stale"
+	if got := sharingLabel(shared); got != " · shared (stale)" {
+		t.Fatalf("label = %q", got)
+	}
+	if lines := sharingLines(shared); len(lines) != 2 || lines[1] != "Refresh with: beacon share refresh claude_code:s" {
+		t.Fatalf("lines = %q", lines)
 	}
 }

@@ -100,7 +100,20 @@
             },
             "prompt": {
               "properties": {
+                "id": { "type": "keyword" },
                 "text": { "type": "match_only_text" }
+              }
+            },
+            "system_context": {
+              "properties": {
+                "kind": { "type": "keyword" },
+                "source": { "type": "keyword" },
+                "skills": {
+                  "properties": {
+                    "skill_name": { "type": "keyword" },
+                    "skill_name_hash": { "type": "keyword" }
+                  }
+                }
               }
             },
             "content": {
@@ -134,7 +147,8 @@
               "properties": {
                 "ref": { "properties": { "head": { "properties": { "revision": { "type": "keyword" }, "name": { "type": "keyword" }, "type": { "type": "keyword" } } } } },
                 "repository": { "properties": { "url": { "properties": { "full": { "type": "keyword" } } } } },
-                "attribution": { "properties": { "method": { "type": "keyword" }, "changed_files": { "type": "long" }, "matched_files": { "type": "long" } } }
+                "attribution": { "properties": { "method": { "type": "keyword" }, "changed_files": { "type": "long" }, "matched_files": { "type": "long" } } },
+                "hook": { "properties": { "name": { "type": "keyword" }, "phase": { "type": "keyword" }, "budget_ms": { "type": "long" }, "elapsed_ms": { "type": "long" }, "phase_elapsed_ms": { "type": "long" }, "git_spawns": { "type": "long" }, "cut_short": { "type": "boolean" } } }
               }
             },
             "otel": {
@@ -224,6 +238,12 @@
             "request": {
               "properties": {
                 "model": { "type": "keyword" }
+              }
+            },
+            "system_instructions": {
+              "properties": {
+                "type": { "type": "keyword" },
+                "content": { "type": "match_only_text" }
               }
             }
           }

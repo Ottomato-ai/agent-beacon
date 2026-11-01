@@ -23,6 +23,8 @@ var (
 	lookPath                        = exec.LookPath
 	currentExecutable               = os.Executable
 	discoverDefaultBinaryCandidates = defaultBinaryCandidates
+	// pollInterval is how often the readiness and port waits re-check; tests shorten it.
+	pollInterval = 250 * time.Millisecond
 )
 
 type Status struct {
@@ -128,6 +130,10 @@ func WriteConfig(cfg endpointconfig.Config) error {
 	return nil
 }
 
+// IngestExtension is the collector extension that serves the local ingest socket in the restricted
+// log access mode.
+const IngestExtension = "beacon_ingest"
+
 func ConfigYAML(cfg endpointconfig.Config) string {
 	endpointconfig.NormalizeDestinations(&cfg)
 	exporterNames := []string{"beaconjson"}
@@ -140,6 +146,13 @@ func ConfigYAML(cfg endpointconfig.Config) string {
 		exporterNames = append(exporterNames, "falcon_hec")
 	}
 	exporters := "[" + strings.Join(exporterNames, ", ") + "]"
+	// The direct HEC exporters send what they receive, so beacon_privacy redacts before the
+	// fanout. beaconjson redacts in its own writer; with no HEC exporter the processor would only
+	// repeat that on every record.
+	privacyYAML, privacyStep := "", ""
+	if len(exporterNames) > 1 {
+		privacyYAML, privacyStep = "  beacon_privacy: {}\n", "beacon_privacy, "
+	}
 	runtimeMetricsYAML := ""
 	if cfg.Collector.IncludeRuntimeMetrics {
 		runtimeMetricsYAML = "    include_runtime_metrics: true\n"
@@ -148,12 +161,32 @@ func ConfigYAML(cfg endpointconfig.Config) string {
 	if cfg.Collector.IncludeCodexSpans {
 		codexSpansYAML = "    include_codex_spans: true\n"
 	}
+	// The processor and the exporters each decide from their own config whether to keep anything
+	// from a Claude Code API body, so the opt-in is written to all of them.
+	modelContextYAML := ""
+	// Claude Code batches its log records into one gRPC export, and with raw API bodies on each
+	// model request adds a request and a response body of up to the content limit install sets.
+	// The receiver's 4 MiB default rejects a whole export over it, and with it every prompt and
+	// tool event in the batch. The receiver applies the limit before claude_api_body runs.
+	grpcLimitYAML := ""
+	if cfg.ClaudeCaptureModelContext {
+		modelContextYAML = "    capture_model_context: true\n"
+		grpcLimitYAML = "        max_recv_msg_size_mib: 32\n"
+	}
+	// The restricted log access mode makes the collector the only writer of the system log: hooks
+	// send their events to beacon_ingest over a local socket instead of appending, so the log can
+	// be 0640 root:beacon-log. Its rotation matches beaconjson's, since both append to one log.
+	ingestYAML, extensions := "", "[health_check]"
+	if cfg.RestrictedLogAccess() {
+		ingestYAML = fmt.Sprintf("  %s:\n    log_path: %q\n    rotate_bytes: 10485760\n    rotate_archives: 5\n", IngestExtension, cfg.LogPath)
+		extensions = "[health_check, " + IngestExtension + "]"
+	}
 	return fmt.Sprintf(`receivers:
   otlp:
     protocols:
       grpc:
         endpoint: 127.0.0.1:%d
-      http:
+%s      http:
         endpoint: 127.0.0.1:%d
 
 processors:
@@ -163,8 +196,9 @@ processors:
   batch:
     timeout: 5s
     send_batch_size: 128
-
-exporters:
+  claude_api_body:
+%s
+%sexporters:
   beaconjson:
     path: %q
     max_event_bytes: 65536
@@ -175,26 +209,26 @@ exporters:
 extensions:
   health_check:
     endpoint: 127.0.0.1:%d
-
+%s
 service:
   telemetry:
     metrics:
       level: none
-  extensions: [health_check]
+  extensions: %s
   pipelines:
     logs:
       receivers: [otlp]
-      processors: [memory_limiter, batch]
+      processors: [memory_limiter, claude_api_body, %sbatch]
       exporters: %s
     traces:
       receivers: [otlp]
-      processors: [memory_limiter, batch]
+      processors: [memory_limiter, %sbatch]
       exporters: %s
     metrics:
       receivers: [otlp]
-      processors: [memory_limiter, batch]
+      processors: [memory_limiter, %sbatch]
       exporters: %s
-`, cfg.Collector.GRPCPort, cfg.Collector.HTTPPort, cfg.LogPath, runtimeMetricsYAML+codexSpansYAML+splunkExporter+falconExporter, endpointconfig.HealthCheckPort(cfg.Collector), exporters, exporters, exporters)
+`, cfg.Collector.GRPCPort, grpcLimitYAML, cfg.Collector.HTTPPort, modelContextYAML, privacyYAML, cfg.LogPath, runtimeMetricsYAML+codexSpansYAML+modelContextYAML+splunkExporter+falconExporter, endpointconfig.HealthCheckPort(cfg.Collector), ingestYAML, extensions, privacyStep, exporters, privacyStep, exporters, privacyStep, exporters)
 }
 
 func splunkHECYAML(cfg endpointconfig.Config) string {
@@ -241,6 +275,9 @@ func falconHECYAML(cfg endpointconfig.Config) string {
 	}
 	if cfg.Collector.IncludeCodexSpans {
 		fmt.Fprintf(&b, "    include_codex_spans: true\n")
+	}
+	if cfg.ClaudeCaptureModelContext {
+		fmt.Fprintf(&b, "    capture_model_context: true\n")
 	}
 	if falcon.Source != "" {
 		fmt.Fprintf(&b, "    source: %q\n", falcon.Source)
@@ -296,7 +333,7 @@ func WaitUntilReady(cfg endpointconfig.Config, timeout time.Duration) error {
 			}
 			return fmt.Errorf("collector did not become ready before timeout")
 		}
-		time.Sleep(250 * time.Millisecond)
+		time.Sleep(pollInterval)
 	}
 }
 
@@ -330,7 +367,7 @@ func WaitForPortsAvailable(grpcPort, httpPort, healthPort int, timeout time.Dura
 			}
 			return fmt.Errorf("%s", strings.Join(busy, "; "))
 		}
-		time.Sleep(250 * time.Millisecond)
+		time.Sleep(pollInterval)
 	}
 }
 

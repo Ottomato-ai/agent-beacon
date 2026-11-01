@@ -56,7 +56,7 @@ page.
 
 By default, inventory is metadata- and hash-only. Beacon hashes config, hook, and `SKILL.md` files for change detection but does not retain file bodies, full MCP server definitions, or skill instruction bodies in inventory JSON, dashboard responses, or inventory snapshot events.
 
-Operators can opt into capturing full definitions with the `--contents` flag (CLI) or the `include_contents` config setting (snapshot telemetry). When enabled, configs, hooks, and skills gain a redacted `content` block and MCP servers gain a full `definition` block. Captured contents always pass through local secret redaction and a per-file size cap (64 KiB by default, configurable with `max_content_bytes`). Redaction replaces values under keys matching `TOKEN`, `SECRET`, `PASSWORD`, `KEY`, `AUTH`, or `CREDENTIAL` with `***REDACTED***`.
+Operators can opt into capturing full definitions with the `--contents` flag (CLI) or the `include_contents` config setting (snapshot telemetry). When enabled, configs, hooks, and skills gain a redacted `content` block and MCP servers gain a full `definition` block. Captured contents always pass through local secret redaction and a per-file size cap (64 KiB by default, configurable with `max_content_bytes`). Redaction is the one Beacon applies to session telemetry (recognizable credentials, `Authorization` header credentials, secret flag values, URL passwords, and values under a key with a word naming a secret, such as `token`, `key`, `auth`, `secret`, `password` or `credential`), each replaced with `[REDACTED]`.
 
 Inventory heartbeat telemetry uses a separate local JSONL file, `inventory_state.jsonl`, so `runtime.jsonl` stays scoped to agent runtime activity. A scheduled local job (every 6 hours, and once at install, boot, or upgrade) writes:
 
@@ -73,7 +73,7 @@ learning artifacts scoped to the resolved project:
 
 | Memory area | Data retained |
 |-------------|---------------|
-| Evaluations | Trace identity, project identity, bounded trace summary, Jev question results, evaluator model, usage metadata when returned, and evaluation timestamps |
+| Evaluations | Trace identity, project identity, bounded trace summary, Jev or SubQ question results, evaluator model, usage metadata when returned, and evaluation timestamps |
 | Candidates | Candidate title, body, kind, state, evidence pointers, source evaluation, project identity, and review transition metadata |
 | Approved memories | Approved title, body, kind, project identity, provenance, and review metadata |
 
@@ -84,10 +84,11 @@ to `.agents/skills/<slug>/SKILL.md`; Beacon hooks and the dashboard never instal
 skills or mutate memory review state.
 
 `beacon memory evaluations run` is the only command in this workflow that can call
-Jev. Dry runs do not make a network request. When evaluation is enabled, Beacon
-sends a bounded, redacted trace projection to the configured TypeSafe System One
-endpoint or a compatible internal endpoint. Normal endpoint capture, MCP reads,
-dashboard views, candidate review, and skill preview/install do not call Jev.
+an evaluator. Dry runs do not make a network request. When evaluation is enabled, Beacon
+sends a bounded, redacted trace projection to the configured System One endpoint:
+TypeSafe Jev by default, SubQ with `--evaluator subq`, or a compatible internal
+endpoint. Normal endpoint capture, MCP reads, dashboard views, candidate review, and
+skill preview/install do not call an evaluator.
 
 ## Required fields
 
@@ -110,7 +111,7 @@ dashboard views, candidate review, and skill preview/install do not call Jev.
 |--------|---------|---------------|
 | `endpoint` | Device and agent context | `hostname`, `os`, `agent_version` |
 | `user` | Local operating system user context | `name`, `uid` |
-| `harness` | Agent harness context | `name`, `version`, `executable_path`, `config_path` |
+| `harness` | Agent harness context | `name`, `version`, `executable_path`, `config_path`, `profile` |
 | `session` | Conversation or runtime session context | `id`, `working_directory` |
 | `tool` | Tool invocation context | `name`, `command`, `path` |
 | `file` | File activity context | `path`, `operation`, `language`, `diff_hash`, `diff_bytes` |

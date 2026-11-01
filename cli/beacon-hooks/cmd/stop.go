@@ -6,6 +6,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -54,13 +55,11 @@ func runStop(cmd *cobra.Command, args []string) {
 	logger := newHookLogger("stop", platformFlag, sessionID)
 
 	logger.Debug("Stop hook called", "session_id", sessionID, "has_transcript", transcriptPath != "", "platform", platformFlag)
-	// Kiro puts the agent's final reply on this payload and nowhere else. Recorded before the
+	// Kiro and Claude Code put the agent's final reply on this payload. Recorded before the
 	// completion event below and before the sessionID guard, because the reply happened before the
 	// turn ended and because a payload with no session id still carries real model output --
 	// dropping it there would lose the message to protect a field it does not need.
-	if platformFlag == kiroPlatform {
-		emitKiroAssistantResponse(logger, input, sessionID)
-	}
+	emitStopAssistantResponse(logger, input, sessionID)
 	if sessionID == "" {
 		if isDevinLikePlatform(platformFlag) {
 			logger.Info("stop completed")
@@ -76,16 +75,9 @@ func runStop(cmd *cobra.Command, args []string) {
 
 	config.RotateLogIfNeededForPlatform(platformFlag)
 	st := state.NewSessionState(sessionID, platformFlag)
-
-	// The public Beacon build is local-only. Clear any pending remote evaluations
-	// left over from older hook versions instead of polling a hosted service.
-	pendingEvals := st.GetPendingEvaluations()
-	if len(pendingEvals) > 0 {
-		if err := st.ClearEvaluations(); err != nil {
-			logger.Warn("Failed to clear stale remote evaluations in local-only build", "count", len(pendingEvals), "error", err.Error())
-		} else {
-			logger.Warn("Cleared stale remote evaluations in local-only build", "count", len(pendingEvals))
-		}
+	// Factory Droid's Stop payload carries no reply; its transcript does.
+	if platformFlag == "factory" {
+		emitFactoryTranscriptReply(logger, input, sessionID, transcriptPath, st)
 	}
 
 	elapsed := time.Since(start)
@@ -292,11 +284,13 @@ func extractMessagesFromCursorTranscript(transcriptPath string) []map[string]int
 // These tags are added by Cursor to wrap user input and context — they are not part
 // of the actual conversation content.
 // Known tags: <user_query>, <attached_files>, <git_diff_from_branch_to_main>
-var cursorXMLTagPattern = regexp.MustCompile(`</?(?:user_query|attached_files|git_diff_from_branch_to_main)>`)
+var cursorXMLTagPattern = sync.OnceValue(func() *regexp.Regexp {
+	return regexp.MustCompile(`</?(?:user_query|attached_files|git_diff_from_branch_to_main)>`)
+})
 
 // stripCursorXMLTags removes Cursor's wrapper tags from transcript text.
 func stripCursorXMLTags(text string) string {
-	text = cursorXMLTagPattern.ReplaceAllString(text, "")
+	text = cursorXMLTagPattern().ReplaceAllString(text, "")
 	return strings.TrimSpace(text)
 }
 
@@ -431,9 +425,11 @@ func isLocalCommandBlock(text string) bool {
 
 // systemInstructionPattern matches <system_instruction>...</system_instruction> and
 // <system-instruction>...</system-instruction> blocks including their content.
-var systemInstructionPattern = regexp.MustCompile(`(?s)<system[_-]instruction>.*?</system[_-]instruction>\s*`)
+var systemInstructionPattern = sync.OnceValue(func() *regexp.Regexp {
+	return regexp.MustCompile(`(?s)<system[_-]instruction>.*?</system[_-]instruction>\s*`)
+})
 
 // stripSystemInstructions removes system instruction blocks from user message text.
 func stripSystemInstructions(text string) string {
-	return strings.TrimSpace(systemInstructionPattern.ReplaceAllString(text, ""))
+	return strings.TrimSpace(systemInstructionPattern().ReplaceAllString(text, ""))
 }

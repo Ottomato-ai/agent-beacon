@@ -17,6 +17,7 @@ import (
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/auth"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/asymptote"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/lifecycle"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/service"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/managedprivacy"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/onboarding"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/version"
@@ -73,6 +74,7 @@ func init() {
 	endpointConnectCmd.Flags().StringVar(&connectOpts.dashboardURL, "dashboard-url", "", "Beacon service URL (defaults to "+auth.DefaultDashboardURL+", or "+auth.DashboardURLEnv+")")
 	endpointConnectCmd.Flags().BoolVar(&connectOpts.noBrowser, "no-browser", false, "System mode: print the device approval URL instead of opening a browser")
 	endpointConnectCmd.Flags().StringVar(&connectOpts.vectorBin, "vector-bin", "", "Vector binary to run (defaults to "+asymptote.VectorBinEnv+", "+asymptote.PackagedVectorPath+", Homebrew, then PATH)")
+	endpointConnectCmd.Flags().BoolVar(&endpointOpts.noBackfill, "no-backfill", false, "Do not upload the last 30 days of agent sessions read from their local session stores (also "+endpointBackfillEnv+"=0)")
 	endpointConnectCmd.Flags().StringVar(&connectOpts.privacyMode, "privacy-mode", "", "Beacon Cloud forwarding privacy: standard or metadata-only (defaults to onboarding choice)")
 	endpointDisconnectCmd.Flags().BoolVar(&connectOpts.keepCredentials, "keep-credentials", false, "Keep the enrollment record and device key so a later connect can reuse this device")
 	endpointCmd.AddCommand(endpointConnectCmd)
@@ -84,13 +86,21 @@ func runEndpointConnect(cmd *cobra.Command, args []string) error {
 	if !userMode && !lifecycle.HasSystemPrivileges() {
 		return fmt.Errorf("connecting a system endpoint needs root: rerun with sudo, or pass --user for a per-user install")
 	}
-	return connectEndpoint(cmd, userMode, loadOrDefaultConfig().LogPath)
+	return connectEndpoint(cmd, userMode, loadOrDefaultConfig().LogPath, false)
 }
 
 // connectEndpoint runs the enrollment and forwarder setup for the given mode and log
 // path, printing the outcome. `endpoint install --connect` and the onboarding offer
-// call it after a successful install; `endpoint connect` calls it directly.
-func connectEndpoint(cmd *cobra.Command, userMode bool, logPath string) error {
+// call it after a successful install; `endpoint connect` calls it directly. backfilled
+// says the caller has just run the session backfill, so connect only ships it.
+func connectEndpoint(cmd *cobra.Command, userMode bool, logPath string, backfilled bool) error {
+	return connectEndpointFor(cmd, userMode, logPath, backfilled, nil)
+}
+
+// connectEndpointFor is connectEndpoint for an install that closes on the wizard's short summary
+// when summary is non-nil: it says one line for the connection, then the install's backfill report,
+// and leaves the dashboard and what comes next to finishCloudSetup.
+func connectEndpointFor(cmd *cobra.Command, userMode bool, logPath string, backfilled bool, summary *cloudSummary) error {
 	hostname, _ := os.Hostname()
 	out := cmd.OutOrStdout()
 	if endpointOpts.jsonOutput {
@@ -105,7 +115,9 @@ func connectEndpoint(cmd *cobra.Command, userMode bool, logPath string) error {
 		LogPath:     logPath,
 		VectorBin:   connectOpts.vectorBin,
 		PrivacyMode: privacyMode,
+		Backfill:    endpointConnectBackfill(out, userMode, logPath, backfilled),
 		Out:         out,
+		Quiet:       summary != nil,
 		Enroll: asymptote.EnrollOptions{
 			DashboardURL: connectOpts.dashboardURL,
 			NoBrowser:    connectOpts.noBrowser,
@@ -118,6 +130,7 @@ func connectEndpoint(cmd *cobra.Command, userMode bool, logPath string) error {
 			},
 		},
 	}
+	signedInAs := ""
 	if userMode {
 		session, err := connectAccountLoad()
 		if err != nil {
@@ -141,6 +154,7 @@ func connectEndpoint(cmd *cobra.Command, userMode bool, logPath string) error {
 			BaseURL:     session.BaseURL,
 			AccessToken: session.AccessToken,
 		}
+		signedInAs = session.User.Email
 	}
 	result, err := connectManagedEndpoint(context.Background(), options)
 	if err != nil {
@@ -148,6 +162,15 @@ func connectEndpoint(cmd *cobra.Command, userMode bool, logPath string) error {
 	}
 	if endpointOpts.jsonOutput {
 		return json.NewEncoder(os.Stdout).Encode(result)
+	}
+	if summary != nil {
+		fmt.Fprintln(out, connectedSummaryLine(result.Enrollment, signedInAs))
+		_, _ = summary.backfill.WriteTo(out)
+		summary.dashboardURL = dashboardHomeURL(result.Enrollment.DashboardURL)
+		if result.Backfill != nil {
+			summary.uploading = result.Backfill.Events
+		}
+		return nil
 	}
 	fmt.Fprintf(out, "Connected to Beacon Cloud as device %s", result.Enrollment.DeviceID)
 	if result.Enrollment.OrganizationName != "" {
@@ -160,12 +183,35 @@ func connectEndpoint(cmd *cobra.Command, userMode bool, logPath string) error {
 	fmt.Fprintf(out, "Device key: %s (never printed; the Vector forwarder reads it)\n", result.SecretsFile)
 	// Close on what to do next rather than on more state. Setup is finished here,
 	// and this is the moment the user has the most intent and the least idea what
-	// happens now. Nothing is forwarded yet: the runtime source starts at the
-	// connection point, so the dashboard stays empty until an agent actually runs.
+	// happens now. The runtime source starts at the connection point, so apart from
+	// the staged session backfill the dashboard fills as agents run.
 	fmt.Fprintln(out)
+	if result.Backfill != nil && result.Backfill.Events > 0 {
+		fmt.Fprintf(out, "Uploading %d events of recent session history; they appear at %s within about 15 seconds.\n", result.Backfill.Events, dashboardHomeURL(result.Enrollment.DashboardURL))
+		fmt.Fprintln(out, "Next: keep using your agents as you normally would; new sessions appear within about 15 seconds of the activity.")
+		return nil
+	}
 	fmt.Fprintln(out, "Next: run any supported agent as you normally would.")
-	fmt.Fprintf(out, "Its sessions appear at %s within a minute of the activity.\n", dashboardHomeURL(result.Enrollment.DashboardURL))
+	fmt.Fprintf(out, "Its sessions appear at %s within about 15 seconds of the activity.\n", dashboardHomeURL(result.Enrollment.DashboardURL))
 	return nil
+}
+
+// connectedSummaryLine is the first line of the wizard's short closing: Beacon works, and where its
+// telemetry goes. The account is the one that authorized the device, falling back to the signed-in
+// session and then the organization.
+func connectedSummaryLine(enrollment asymptote.Enrollment, signedInAs string) string {
+	account := enrollment.Email
+	if account == "" {
+		account = signedInAs
+	}
+	if account == "" {
+		account = enrollment.OrganizationName
+	}
+	line := "Beacon is installed and connected to Beacon Cloud"
+	if account != "" {
+		line += " as " + account
+	}
+	return fmt.Sprintf("%s (device %s, %s privacy).", line, enrollment.DeviceID, managedprivacy.Label(enrollment.PrivacyMode))
 }
 
 func selectedManagedPrivacyMode(userMode bool) (string, error) {
@@ -264,6 +310,39 @@ func connectBrowserOpener(userMode bool) func(string) error {
 	}
 }
 
+// cloudStatusLine is the Beacon Cloud line of `beacon endpoint status`, or "" when it has nothing
+// to say.
+//
+// A connected or half-connected endpoint always gets the line. An unconnected one gets it only on a
+// per-user install that sends nowhere else: a system install is an MDM or package rollout, often
+// forwarding to the customer's own S3, GCS or Falcon, and its hint, a per-user
+// `beacon endpoint connect`, fails there for want of a personal sign-in. Admins read that line as
+// a step left undone.
+func cloudStatusLine(status asymptote.ManagedIngestStatus, userMode, ownForwarder bool) string {
+	if !status.Enabled && status.Message == "" && (!userMode || ownForwarder) {
+		return ""
+	}
+	return managedIngestStatusLine(status)
+}
+
+// scriptForwarderStatusLine renders one package-helper forwarder for `beacon endpoint status`.
+func scriptForwarderStatusLine(status service.Status) string {
+	name := status.Label
+	switch status.Label {
+	case "com.beacon.endpoint.s3-forwarder":
+		name = "S3 forwarder"
+	case "com.beacon.endpoint.gcs-forwarder":
+		name = "GCS forwarder"
+	case "com.beacon.endpoint.falcon-forwarder":
+		name = "Falcon LogScale forwarder"
+	}
+	line := fmt.Sprintf("%s: loaded=%t running=%t", name, status.Loaded, status.Running)
+	if !status.Loaded && status.Message != "" {
+		line += " (" + status.Message + ")"
+	}
+	return line
+}
+
 // managedIngestStatusLine renders the human status line for `beacon endpoint status`.
 // dashboardHomeURL turns the recorded service URL into the page a person can
 // actually open.
@@ -273,14 +352,7 @@ func connectBrowserOpener(userMode bool) func(string) error {
 // /dashboard/telemetry have no route behind them, so anything printed here has to
 // stop at the dashboard itself.
 func dashboardHomeURL(base string) string {
-	base = strings.TrimRight(strings.TrimSpace(base), "/")
-	if base == "" {
-		return auth.DefaultDashboardURL + "/dashboard"
-	}
-	if strings.HasSuffix(base, "/dashboard") {
-		return base
-	}
-	return base + "/dashboard"
+	return auth.DashboardHomeURL(base)
 }
 
 func managedIngestStatusLine(status asymptote.ManagedIngestStatus) string {

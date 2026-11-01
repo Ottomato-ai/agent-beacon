@@ -4,7 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"os"
-	"strings"
+
+	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve/hookcmd"
 )
 
 // settingsHookGroup and settingsHookRef model the shape Beacon writes into a runtime's shared
@@ -189,13 +190,29 @@ func (settings settingsHooksFile) marshal() ([]byte, error) {
 }
 
 func installSettingsEndpointHooks(path, platform string, endpointHooks map[string]settingsHookGroup) error {
+	groups := make(map[string][]settingsHookGroup, len(endpointHooks))
+	for eventName, group := range endpointHooks {
+		groups[eventName] = []settingsHookGroup{group}
+	}
+	return installSettingsEndpointHookGroups(path, platform, groups)
+}
+
+// installSettingsEndpointHookGroups is installSettingsEndpointHooks for events that carry more
+// than one Beacon group, such as two PreToolUse groups with different matchers. Beacon's existing
+// groups are removed once, up front, and every group for an event is appended after the user's
+// own, in the order given.
+func installSettingsEndpointHookGroups(path, platform string, endpointHooks map[string][]settingsHookGroup) error {
 	settings, err := readSettingsHooks(path)
 	if err != nil {
 		return err
 	}
 	removeSettingsEndpointHooksFromLoaded(&settings, platform)
-	for eventName, group := range endpointHooks {
-		settings.hooks[eventName] = mergeSettingsEndpointHook(settings.hooks[eventName], group, platform)
+	for eventName, groups := range endpointHooks {
+		if len(groups) == 0 {
+			continue
+		}
+		merged := mergeSettingsEndpointHook(settings.hooks[eventName], groups[0], platform)
+		settings.hooks[eventName] = append(merged, groups[1:]...)
 	}
 	data, err := settings.marshal()
 	if err != nil {
@@ -293,10 +310,10 @@ func isSettingsEndpointHookGroup(group settingsHookGroup, platform string) bool 
 }
 
 func isSettingsEndpointHookCommand(command, platform string) bool {
-	if platform != "" && !strings.Contains(command, "--platform "+platform) {
+	if platform != "" && !hookcmd.HasPlatform(command, platform) {
 		return false
 	}
-	return isEndpointHookCommand(command, platform)
+	return hookcmd.IsEndpointHook(command, platform)
 }
 
 func isSettingsEndpointInstalledAt(path, platform string) bool {

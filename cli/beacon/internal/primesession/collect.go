@@ -1,13 +1,14 @@
 package primesession
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"time"
 
-	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/schema"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/writer"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/sessionsync"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/sessionwindow"
 )
 
 type CollectOptions struct {
@@ -19,6 +20,19 @@ type CollectOptions struct {
 	UserMode     bool
 	Print        bool
 	Out          io.Writer
+	// Since, when set, limits the sweep to sessions modified at or after it, newest first. Older
+	// sessions are not read and their cursors do not move, so a later sync still collects them.
+	// The install-time backfill sets it; an ordinary sync leaves it zero.
+	Since time.Time
+	// Budget, when set, caps the bytes this sweep may append. The sweep stops at the first event
+	// that does not fit and returns writer.ErrBudgetSpent, with cursors past only what was written.
+	Budget *writer.Budget
+	// RotateBytes is the size the runtime log rotates at while this sweep writes it; zero is
+	// writer.DefaultRotateBytes.
+	RotateBytes int64
+
+	// guard keeps the sweep from rotating its own output out of the log; CollectOnce sets it.
+	guard *writer.RetentionGuard
 }
 
 type Summary struct {
@@ -27,6 +41,7 @@ type Summary struct {
 	EventsEmitted   int `json:"events_emitted"`
 	Errors          int `json:"errors"`
 	MalformedLines  int `json:"malformed_lines"`
+	sessionsync.Retention
 }
 
 func CollectOnce(opts CollectOptions) (summary Summary, err error) {
@@ -38,6 +53,7 @@ func CollectOnce(opts CollectOptions) (summary Summary, err error) {
 	if err != nil {
 		return summary, err
 	}
+	refs = sessionwindow.Recent(refs, opts.Since, func(r SessionRef) int64 { return r.ModTimeMS })
 	summary.Sessions = len(refs)
 	if len(refs) == 0 {
 		return summary, nil
@@ -53,8 +69,20 @@ func CollectOnce(opts CollectOptions) (summary Summary, err error) {
 	}()
 
 	var errs []error
+	opts.guard = sessionsync.NewRetentionGuard(opts.Print, opts.Write)
+	var stopErr error
 	for _, ref := range refs {
 		changed, collectErr := collectFile(store, ref, state, opts, &summary)
+		if sessionsync.Stopped(collectErr) {
+			// Not a failed session: this one and the rest are left for a later sync, with cursors
+			// that have not moved past anything that was not written.
+			if changed {
+				summary.SessionsChanged++
+			}
+			stopErr = collectErr
+			errs = append(errs, collectErr)
+			break
+		}
 		if collectErr != nil {
 			summary.Errors++
 			errs = append(errs, fmt.Errorf("Prime Agent session %s: %w", ref.Path, collectErr))
@@ -63,6 +91,9 @@ func CollectOnce(opts CollectOptions) (summary Summary, err error) {
 		if changed {
 			summary.SessionsChanged++
 		}
+	}
+	if rotatedOut := summary.Finish(opts.sink(), stopErr); rotatedOut != nil {
+		errs = append(errs, rotatedOut)
 	}
 	if len(errs) > 0 {
 		return summary, errors.Join(errs...)
@@ -91,7 +122,7 @@ func collectFile(store *Store, ref SessionRef, state *State, opts CollectOptions
 		return false, nil
 	}
 	for i, item := range mapped {
-		if err := emit(item.Event, opts); err != nil {
+		if err := opts.sink().Emit(item.Event); err != nil {
 			advancePartial(cursor, mapped, i, parent)
 			return true, err
 		}
@@ -134,20 +165,6 @@ func advancePartial(cursor *Cursor, mapped []MappedEvent, failedIdx int, parent 
 	cursor.SubagentOf = parent
 }
 
-func emit(event schema.Event, opts CollectOptions) error {
-	if opts.Print && opts.Out != nil {
-		data, err := json.Marshal(event)
-		if err != nil {
-			return err
-		}
-		if _, err := opts.Out.Write(append(data, '\n')); err != nil {
-			return err
-		}
-	}
-	if opts.Write {
-		if _, err := writer.AppendEvent(event, writer.Options{Path: opts.LogPath, UserMode: opts.UserMode}); err != nil {
-			return err
-		}
-	}
-	return nil
+func (o CollectOptions) sink() sessionsync.Sink {
+	return sessionsync.Sink{Print: o.Print, Out: o.Out, Write: o.Write, Log: writer.Options{Path: o.LogPath, UserMode: o.UserMode, RotateSize: o.RotateBytes, Budget: o.Budget, Guard: o.guard}}
 }

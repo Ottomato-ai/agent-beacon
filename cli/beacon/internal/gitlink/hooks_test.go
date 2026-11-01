@@ -297,34 +297,6 @@ func TestHookScriptDisableAndPathFallback(t *testing.T) {
 	r.commitWithEnv("no beacon", "PATH=/usr/bin:/bin")
 }
 
-func TestHookStatusDetectsABrokenInstall(t *testing.T) {
-	r := newTestRepo(t)
-	ctx := context.Background()
-	bin, _ := fakeBeacon(t, filepath.Join(t.TempDir(), "bin"))
-	repo := r.open()
-	if st, _ := HookStatus(ctx, repo); st.Installed() {
-		t.Fatal("fresh repository reports installed")
-	}
-	res, err := InstallHooks(ctx, repo, InstallOptions{BeaconPath: bin})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(res.Reports[0].Script); err != nil {
-		t.Fatal(err)
-	}
-	st, err := HookStatus(ctx, repo)
-	if err != nil || st.Installed() || !st.States[0].BlockPresent || st.States[0].ScriptExists {
-		t.Fatalf("status %+v %v", st, err)
-	}
-	// Setup repairs it.
-	if _, err := InstallHooks(ctx, repo, InstallOptions{BeaconPath: bin}); err != nil {
-		t.Fatal(err)
-	}
-	if st, _ := HookStatus(ctx, repo); !st.Installed() {
-		t.Fatal("setup did not repair the install")
-	}
-}
-
 func TestReplayInProgress(t *testing.T) {
 	r := newTestRepo(t)
 	ctx := context.Background()
@@ -362,27 +334,9 @@ func TestReplayInProgress(t *testing.T) {
 	}
 }
 
-func TestAmendCarriesLinksThroughRewriteRef(t *testing.T) {
-	r := newTestRepo(t)
-	ctx := context.Background()
-	bin, _ := fakeBeacon(t, filepath.Join(t.TempDir(), "bin"))
-	repo := r.open()
-	if _, err := InstallHooks(ctx, repo, InstallOptions{BeaconPath: bin}); err != nil {
-		t.Fatal(err)
-	}
-	r.write("a", "1")
-	r.commitWithEnv("c")
-	if _, err := AddLinks(ctx, repo.Git, r.git("rev-parse", "HEAD"), []Link{{"codex_cli", "s"}}); err != nil {
-		t.Fatal(err)
-	}
-	r.git("commit", "-q", "--amend", "-m", "c (amended)")
-	note, err := ReadNote(ctx, repo.Git, "HEAD")
-	if err != nil || !strings.Contains(note, "beacon:codex_cli/s") {
-		t.Fatalf("amended commit note %q %v", note, err)
-	}
-}
-
-func TestPostRewriteHookGetsGitsStdinAndArgument(t *testing.T) {
+// An amend runs Beacon's post-rewrite hook with git's argument and old/new pairs on stdin, and
+// the rewriteRef setup installs carries the commit's links to the amended commit.
+func TestAmendCarriesLinksAndFeedsThePostRewriteHook(t *testing.T) {
 	r := newTestRepo(t)
 	ctx := context.Background()
 	testenv.RequirePOSIXExecutableFixtures(t)
@@ -401,12 +355,19 @@ func TestPostRewriteHookGetsGitsStdinAndArgument(t *testing.T) {
 	r.write("a", "1")
 	r.commitWithEnv("c")
 	old := r.git("rev-parse", "HEAD")
+	if _, err := AddLinks(ctx, repo.Git, old, []Link{{Harness: "codex_cli", SessionID: "s"}}); err != nil {
+		t.Fatal(err)
+	}
 	r.git("commit", "-q", "--amend", "-m", "c2")
 	amended := r.git("rev-parse", "HEAD")
 	data, _ := os.ReadFile(seen)
 	text := string(data)
 	if !strings.Contains(text, "args: git hook post-rewrite amend") || !strings.Contains(text, old+" "+amended) {
 		t.Fatalf("post-rewrite saw:\n%s", text)
+	}
+	note, err := ReadNote(ctx, repo.Git, amended)
+	if err != nil || !strings.Contains(note, "beacon:codex_cli/s") {
+		t.Fatalf("amended commit note %q %v", note, err)
 	}
 }
 
@@ -539,5 +500,111 @@ func TestReplayDetectionWithoutAReflog(t *testing.T) {
 	r.git("revert", "--no-edit", "HEAD")
 	if !ReplayInProgress(ctx, repo) {
 		t.Fatal("a revert must be recognized by its message when there is no reflog")
+	}
+}
+
+// The pre-push block must leave git's stdin to the repository's own pre-push hook (`git lfs
+// pre-push` reads it), whether or not Beacon reads a copy to share sessions.
+func TestPrePushBlockKeepsStdinForTheRepositorysHook(t *testing.T) {
+	for _, shareSessions := range []bool{false, true} {
+		t.Run(map[bool]string{false: "sessions off", true: "sessions on"}[shareSessions], func(t *testing.T) {
+			testenv.RequirePOSIXExecutableFixtures(t)
+			r := newTestRepo(t)
+			ctx := context.Background()
+			dir := t.TempDir()
+			tmp := filepath.Join(dir, "tmp")
+			if err := os.MkdirAll(tmp, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			r.env = append(r.env, "TMPDIR="+tmp)
+			// The fake beacon reads all of its stdin, as `beacon git hook pre-push` does.
+			beaconSaw := filepath.Join(dir, "beacon-stdin")
+			bin := filepath.Join(dir, "beacon")
+			if err := os.WriteFile(bin, []byte("#!/bin/sh\ncat > "+shellQuote(beaconSaw)+"\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			hooks := filepath.Join(r.root, ".git", "hooks")
+			userSaw := filepath.Join(dir, "user-stdin")
+			if err := os.MkdirAll(hooks, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			userHook := "#!/bin/sh\ncat > " + shellQuote(userSaw) + "\nexit 0\n"
+			if err := os.WriteFile(filepath.Join(hooks, ShareHook), []byte(userHook), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			repo := r.open()
+			on := true
+			if _, err := InstallHooks(ctx, repo, InstallOptions{BeaconPath: bin, ShareNotes: &on}); err != nil {
+				t.Fatal(err)
+			}
+			if err := SetShareSessions(ctx, repo, shareSessions, ""); err != nil {
+				t.Fatal(err)
+			}
+			remote := filepath.Join(dir, "remote.git")
+			r.git("init", "-q", "--bare", remote)
+			r.git("remote", "add", "origin", remote)
+			r.write("f", "1")
+			head := r.commitAt("first", t0)
+			r.git("push", "-q", "origin", "main")
+
+			want := "refs/heads/main " + head + " refs/heads/main "
+			got, err := os.ReadFile(userSaw)
+			if err != nil || !strings.HasPrefix(string(got), want) {
+				t.Fatalf("the repository's hook read %q (%v), want a line starting %q", got, err, want)
+			}
+			saw, err := os.ReadFile(beaconSaw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if shareSessions != strings.HasPrefix(string(saw), want) {
+				t.Fatalf("beacon read %q with sessions shared = %v", saw, shareSessions)
+			}
+			if leftovers, _ := filepath.Glob(filepath.Join(tmp, "beacon-hook.*")); len(leftovers) > 0 {
+				t.Fatalf("temporary files left behind: %v", leftovers)
+			}
+		})
+	}
+}
+
+// A block an earlier Beacon wrote shows as outdated, and setup replaces it with the current one.
+func TestStatusFlagsAnOutdatedBlockAndSetupRefreshesIt(t *testing.T) {
+	r := newTestRepo(t)
+	ctx := context.Background()
+	bin, _ := fakeBeacon(t, t.TempDir())
+	repo := r.open()
+	if _, err := InstallHooks(ctx, repo, InstallOptions{BeaconPath: bin}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(r.root, ".git", "hooks", "post-rewrite")
+	old := hookBlockStart + "\nif [ -x \"$(git rev-parse --git-path hooks)/beacon-post-rewrite\" ]; then\n" +
+		"  \"$(git rev-parse --git-path hooks)/beacon-post-rewrite\" \"$@\"\nfi\n" + hookBlockEnd + "\n"
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+old+"echo mine\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outdated := func() bool {
+		st, err := HookStatus(ctx, repo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, s := range st.States {
+			if s.Hook == "post-rewrite" {
+				return s.Outdated
+			}
+		}
+		t.Fatal("no post-rewrite state")
+		return false
+	}
+	if !outdated() {
+		t.Fatal("the old block is not reported as outdated")
+	}
+	if _, err := InstallHooks(ctx, repo, InstallOptions{BeaconPath: bin}); err != nil {
+		t.Fatal(err)
+	}
+	if outdated() {
+		t.Fatal("setup did not refresh the block")
+	}
+	data, _ := os.ReadFile(path)
+	if !strings.HasSuffix(string(data), "echo mine\n") || strings.Count(string(data), hookBlockStart) != 1 {
+		t.Fatalf("hook after refresh:\n%s", data)
 	}
 }

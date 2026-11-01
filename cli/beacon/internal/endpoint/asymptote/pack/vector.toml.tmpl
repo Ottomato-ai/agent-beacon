@@ -26,6 +26,18 @@ include = ["{{LOG_PATH}}"]
 # Nothing recorded before the device was approved is shipped.
 read_from = "end"
 
+# The bounded session backfill every connect stages from the agents' own
+# session stores, so the dashboard shows recent history at once. Each connect
+# replaces the file atomically; fingerprinting by inode makes every restaged
+# copy a new file read from the beginning, where a content checksum could take
+# a restaged copy that starts with the same event for the old one and resume
+# at a stale offset. Lines already shipped carry the same event.id as before.
+[sources.beacon_backfill]
+type = "file"
+include = ["{{BACKFILL_LOG_PATH}}"]
+read_from = "beginning"
+fingerprint.strategy = "device_and_inode"
+
 [sources.beacon_inventory]
 type = "file"
 include = ["{{INVENTORY_LOG_PATH}}"]
@@ -35,7 +47,7 @@ read_from = "beginning"
 
 [sinks.asymptote_runtime]
 type = "http"
-inputs = ["beacon_runtime"]
+inputs = ["beacon_runtime", "beacon_backfill"]
 uri = "${BEACON_ASYMPTOTE_INGEST_URL}/v1/ingest/runtime"
 method = "post"
 compression = "gzip"
@@ -54,10 +66,12 @@ method = "newline_delimited"
 Content-Type = "application/x-ndjson"
 
 [sinks.asymptote_runtime.batch]
-# Stays under the ingest service's 8 MiB compressed / 10,000 line limits.
+# Stays under the ingest service's 8 MiB compressed / 10,000 line limits. A
+# short window puts a new user's first sessions on the dashboard within seconds
+# of connecting; a busy device still fills batches by size.
 max_bytes = 5000000
 max_events = 5000
-timeout_secs = 60
+timeout_secs = 10
 
 [sinks.asymptote_runtime.buffer]
 # Survives offline periods and forwarder restarts; drains on reconnect.
@@ -69,6 +83,11 @@ when_full = "block"
 timeout_secs = 30
 retry_initial_backoff_secs = 2
 retry_max_duration_secs = 300
+# At most one request a second, the rate the ingest service allows each
+# device. A backfill or a backlog drained after an offline period is sent in
+# full batches at that pace instead of tripping 429s.
+rate_limit_num = 1
+rate_limit_duration_secs = 1
 
 # The healthcheck carries the bearer key, so a revoked or expired device shows up
 # as an unhealthy sink at startup (401) instead of silently dropping batches.

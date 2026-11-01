@@ -9,14 +9,11 @@ const state = {
   inventory: null,
   loading: false,
   error: null,
-  currentQuery: "",
-  newEventCount: 0,
   lastDetectionHashScroll: "",
   findings: [],
   findingsRules: null,
   findingsSessions: new Map(),
   findingsExpanded: new Set(),
-  activityView: "summary",
   inventoryView: "configs",
   inventoryRuntime: "",
   inventoryUser: "",
@@ -33,7 +30,6 @@ const state = {
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => Array.from(document.querySelectorAll(selector));
 const navCollapsedStorageKey = "beacon.dashboard.navCollapsed";
-const isActivityPage = !document.body.dataset.page;
 const isSessionsPage = document.body.dataset.page === "sessions";
 const isSessionDetailPage = document.body.dataset.page === "session-detail";
 const isOverviewPage = document.body.dataset.page === "overview";
@@ -65,7 +61,6 @@ const formFields = [
   "limit",
   "review",
 ];
-state.activityView = initialActivityView();
 
 const presets = {
   all: { limit: "500" },
@@ -118,37 +113,20 @@ function hydrateFiltersFromURL() {
     if (!params.has(field)) continue;
     const value = params.get(field);
     if (field === "limit") ensureLimitOption(input, value);
+    ensureFacetOption(input, value);
     input.value = value;
   }
 }
 
-function initialActivityView() {
-  const params = new URLSearchParams(window.location.search);
-  if (params.get("view") === "detailed") return "detailed";
-  for (const field of formFields) {
-    if (field !== "limit" && params.has(field)) return "detailed";
-  }
-  return "summary";
-}
-
-function renderActivityView() {
-  if (!isActivityPage) return;
-  const summary = $("#activity-summary");
-  const detailed = $("#activity-detailed");
-  if (summary) summary.hidden = state.activityView !== "summary";
-  if (detailed) detailed.hidden = state.activityView !== "detailed";
-  $$("[data-activity-view]").forEach((button) => {
-    const active = button.dataset.activityView === state.activityView;
-    button.classList.toggle("active", active);
-    button.setAttribute("aria-selected", active ? "true" : "false");
-  });
-}
-
-function setActivityView(view, { updateLocation = false } = {}) {
-  if (!isActivityPage) return;
-  state.activityView = view === "detailed" ? "detailed" : "summary";
-  renderActivityView();
-  if (updateLocation) updateURL(queryFromFilters());
+// Dynamic facet options may not have loaded yet, or may be absent from a
+// filtered summary. Preserve explicit query values until the user clears them.
+function ensureFacetOption(select, value) {
+  if (!(select instanceof HTMLSelectElement) || !["harness", "model", "repository"].includes(select.name) || !value) return;
+  if (Array.from(select.options).some((option) => option.value === value)) return;
+  const option = document.createElement("option");
+  option.value = value;
+  option.textContent = select.name === "harness" ? harnessLabel(value) : select.name === "repository" ? repositoryOptionLabel(value) : value;
+  select.append(option);
 }
 
 // The limit control is a fixed <select>; a URL like ?limit=5 would otherwise
@@ -167,11 +145,6 @@ function ensureLimitOption(select, value) {
 
 function updateURL(query) {
   const params = new URLSearchParams(query);
-  if (isActivityPage && state.activityView === "detailed") {
-    params.set("view", "detailed");
-  } else {
-    params.delete("view");
-  }
   const range = $("#range-filter");
   if (range) {
     if (range.value && range.value !== "30d") {
@@ -185,7 +158,15 @@ function updateURL(query) {
   window.history.replaceState(null, "", next);
 }
 
+let activityLoadGeneration = 0;
+let activityLoadInFlight = false;
+
 async function load({ updateLocation = false, mode = "replace" } = {}) {
+  // Do not let the poll timer continually supersede a slow local log scan.
+  // Explicit filter changes still start immediately and replace the old view.
+  if (mode === "poll" && activityLoadInFlight) return;
+  const generation = ++activityLoadGeneration;
+  activityLoadInFlight = true;
   const query = queryFromFilters();
   if (updateLocation) updateURL(query);
   const suffix = query ? `?${query}` : "";
@@ -194,40 +175,33 @@ async function load({ updateLocation = false, mode = "replace" } = {}) {
   state.loading = !quiet;
   state.error = null;
   if (!quiet) renderLoading();
-  let rendered = false;
   try {
     const [status, summary, events] = await Promise.all([
       getJSON("/api/status"),
       getJSON(`/api/summary${suffix}`),
       getJSON(`${activityPath}${suffix}`),
     ]);
-    const previousEvents = state.events;
-    const previousQuery = state.currentQuery;
+    if (generation !== activityLoadGeneration) return;
     state.status = status;
     state.summary = summary;
     state.eventResult = isSessionsPage ? null : events;
     state.sessionResult = isSessionsPage ? events : null;
-    state.currentQuery = query;
     state.events = isSessionsPage ? [] : (events.events || []);
     state.sessions = isSessionsPage ? (events.sessions || []) : [];
-    if (quiet && previousQuery === query && canPatchEvents(previousEvents, state.events)) {
-      patchEvents(previousEvents, state.events);
-      renderSummaryOnly();
-      rendered = true;
-    }
   } catch (err) {
-    state.error = err;
+    if (generation === activityLoadGeneration) state.error = err;
   } finally {
-    state.loading = false;
-    if (!rendered) render();
+    if (generation === activityLoadGeneration) {
+      activityLoadInFlight = false;
+      state.loading = false;
+      render();
+    }
   }
 }
 
 function render() {
   setText("#log-path", state.status?.log_path || "Runtime log unavailable");
   setText("#last-updated", state.summary?.last_event_time ? `Last event ${formatTime(state.summary.last_event_time)}` : "");
-  renderActivityView();
-  renderNewEventsIndicator();
   renderFilterOptions();
   renderCards();
   renderActivityAnalytics();
@@ -397,18 +371,6 @@ function renderSearchState() {
   $$("[data-clear-filter]").forEach((button) => {
     button.addEventListener("click", () => clearFilter(button.dataset.clearFilter));
   });
-}
-
-function renderSummaryOnly() {
-  setText("#log-path", state.status?.log_path || "Runtime log unavailable");
-  setText("#last-updated", state.summary?.last_event_time ? `Last event ${formatTime(state.summary.last_event_time)}` : "");
-  renderActivityView();
-  renderNewEventsIndicator();
-  renderFilterOptions();
-  renderCards();
-  renderActivityAnalytics();
-  renderInsights();
-  renderSearchState();
 }
 
 async function loadSessionPage() {
@@ -798,9 +760,11 @@ const inventoryViewLabels = {
 const inventoryRuntimeLogos = {
   antigravity: "/runtime-logos/antigravity.png",
   antigravity_cli: "/runtime-logos/antigravity.png",
+  chatgpt_web: "/runtime-logos/chatgpt.svg",
   claude: "/runtime-logos/claude-code.png",
   claude_code: "/runtime-logos/claude-code.png",
   claude_cowork: "/runtime-logos/claude-code.png",
+  claude_web: "/runtime-logos/claude-code.png",
   cline: "/runtime-logos/cline.png",
   cline_cli: "/runtime-logos/cline.png",
   codex: "/runtime-logos/codex.png",
@@ -1538,26 +1502,7 @@ function configKindLabel(kind) {
 
 function renderEvents() {
   if (!$("#events")) return;
-  if (isSessionsPage) {
-    renderSessions();
-    return;
-  }
-  if (state.loading) {
-    renderLoading();
-    return;
-  }
-  if (state.error) {
-    $("#events").innerHTML = `<tr><td colspan="8">Failed to load dashboard: ${escapeHTML(state.error.message)}</td></tr>`;
-    return;
-  }
-  if (!state.events.length) {
-    $("#events").innerHTML = `<tr><td colspan="8">No events match this search. Clear filters or broaden the query.</td></tr>`;
-    return;
-  }
-  $("#events").innerHTML = state.events
-    .map((record) => eventRowHTML(record))
-    .join("");
-  bindEventRows();
+  if (isSessionsPage) renderSessions();
 }
 
 function renderSessions() {
@@ -1589,12 +1534,14 @@ function sessionRowHTML(session) {
     : `<span class="muted">No prompt captured</span>`;
   return `
     <tr class="row-link" data-session-id="${escapeHTML(session.id)}">
-      <td class="mono"><span class="cell-link">${escapeHTML(formatSessionID(session.id))}</span></td>
+      <td class="mono"><a class="cell-link" href="${escapeHTML(sessionPageURL(session.id))}">${escapeHTML(formatSessionID(session.id))}</a></td>
       <td>${badge(session.max_severity || "unknown", `severity-${session.max_severity || "unknown"}`)}${review ? `<br /><span class="muted">${escapeHTML(review)} review</span>` : ""}</td>
       <td>${sessionHarnessCell(session)}</td>
       <td class="col-message">
         <span class="session-list-prompt">
           ${models.length ? `<strong class="session-list-prompt-model">${models.map(escapeHTML).join(" · ")}</strong>` : ""}
+          ${session.is_recurring ? `<strong class="session-recurring-indicator">Recurring ×${escapeHTML(session.recurrence_count)}</strong>` : ""}
+          ${sessionSharingIndicator(session.sharing)}
           <span>${prompt}</span>
         </span>
       </td>
@@ -1607,10 +1554,52 @@ function sessionRowHTML(session) {
   `;
 }
 
+// Sharing state comes from the session.shared record `beacon share` writes. The dashboard is
+// read-only: it links to the shared trace and shows the refresh command to copy, and never shares.
+function sessionSharingIndicator(sharing) {
+  if (!sharing || !sharing.url) return "";
+  const stale = sharing.state === "stale";
+  return `<strong class="session-share-indicator${stale ? " session-share-stale" : ""}" title="${escapeHTML(stale ? "Shared; the session has newer activity than the shared trace" : "Shared on beacon.sh")}">${stale ? "Shared · stale" : "Shared"}</strong>`;
+}
+
+function safeShareURL(url) {
+  return typeof url === "string" && /^https:\/\/[^\s"'<>]+$/.test(url) ? url : "";
+}
+
+function sessionSharingRowHTML(sharing) {
+  if (!sharing || !sharing.url) return "";
+  const url = safeShareURL(sharing.url);
+  const stale = sharing.state === "stale";
+  const link = url
+    ? `<a href="${escapeHTML(url)}" target="_blank" rel="noopener noreferrer">${escapeHTML(url)}</a>`
+    : escapeHTML(sharing.url);
+  const detail = [sharing.visibility, stale ? "stale: newer local activity" : "up to date"].filter(Boolean).join(" · ");
+  const hint = sharing.refresh_command
+    ? `<span class="session-share-hint"><code>${escapeHTML(sharing.refresh_command)}</code> <button type="button" class="copy-share-refresh" data-command="${escapeHTML(sharing.refresh_command)}">Copy</button></span>`
+    : "";
+  return `${link}<small>${escapeHTML(detail)}</small>${hint}`;
+}
+
+function bindShareRefreshCopy(scope = document) {
+  scope.querySelectorAll(".copy-share-refresh").forEach((button) => {
+    button.onclick = async (event) => {
+      event.stopPropagation();
+      try {
+        await navigator.clipboard.writeText(button.dataset.command || "");
+        button.textContent = "Copied";
+      } catch (_) {
+        button.textContent = "Copy failed";
+      }
+      window.setTimeout(() => { button.textContent = "Copy"; }, 1400);
+    };
+  });
+}
+
 function bindSessionRows(scope = document) {
   const rows = scope.matches?.("tr[data-session-id]") ? [scope] : Array.from(scope.querySelectorAll("tr[data-session-id]"));
   rows.forEach((row) => {
-    row.addEventListener("click", () => {
+    row.addEventListener("click", (event) => {
+      if (event.defaultPrevented || event.target.closest("a, button, input, select, textarea")) return;
       window.location.href = sessionPageURL(row.dataset.sessionId);
     });
   });
@@ -1618,128 +1607,6 @@ function bindSessionRows(scope = document) {
 
 function sessionPageURL(id) {
   return `/session.html?id=${encodeURIComponent(id)}`;
-}
-
-function eventRowHTML(record) {
-  const event = record.event || {};
-  const session = event.session || {};
-  return `
-    <tr data-id="${escapeHTML(record.id)}">
-      <td class="mono">${escapeHTML(formatSessionID(session.id))}</td>
-      <td>${badge(event.severity || "unknown", `severity-${event.severity || "unknown"}`)}</td>
-      <td class="col-timestamp timestamp-cell">${timestampCellHTML(event.timestamp)}</td>
-      <td>${harnessCell(event)}</td>
-      <td>${escapeHTML(repositoryShortLabel(event))}</td>
-      <td>${signalCell(record)}</td>
-      <td class="col-artifact">${artifactCell(event)}</td>
-      <td class="col-message">${escapeHTML(event.message || "")}</td>
-    </tr>
-  `;
-}
-
-function bindEventRows(scope = document) {
-  const rows = scope.matches?.("tr[data-id]") ? [scope] : Array.from(scope.querySelectorAll("#events tr, tr[data-id]"));
-  rows.forEach((row) => {
-    row.addEventListener("click", (event) => {
-      if (event.target.closest("button")) return;
-      showEvent(row.dataset.id);
-    });
-  });
-  Array.from(scope.querySelectorAll("[data-apply-filter]")).forEach((button) => {
-    button.addEventListener("click", () => applyFilters({ [button.dataset.applyFilter]: button.dataset.value }));
-  });
-}
-
-function canPatchEvents(previousEvents, nextEvents) {
-  return $("#events") && previousEvents.length > 0 && nextEvents.length > 0;
-}
-
-function patchEvents(previousEvents, nextEvents) {
-  const tbody = $("#events");
-  if (!tbody) return;
-  const existing = new Set(previousEvents.map((record) => record.id));
-  const newest = [];
-  for (const record of nextEvents) {
-    if (existing.has(record.id)) break;
-    newest.push(record);
-  }
-  if (newest.length) prependEventRows(newest);
-  trimEventRows(nextEvents.length);
-}
-
-// trimEventRows drops trailing rows so the poll path's prepends never grow the
-// table past the active limit; nextEvents is the server's limited slice, so its
-// length is the row budget for the current view.
-function trimEventRows(maxRows) {
-  const tbody = $("#events");
-  if (!tbody || !(maxRows > 0)) return;
-  while (tbody.children.length > maxRows) {
-    tbody.removeChild(tbody.lastElementChild);
-  }
-}
-
-function prependEventRows(records) {
-  const tbody = $("#events");
-  if (!tbody) return;
-  const nearTop = window.scrollY < 160;
-  const beforeTop = tbody.getBoundingClientRect().top;
-  const template = document.createElement("template");
-  template.innerHTML = records.map((record) => eventRowHTML(record)).join("");
-  const rows = Array.from(template.content.children);
-  const fragment = document.createDocumentFragment();
-  rows.forEach((row) => fragment.appendChild(row));
-  tbody.prepend(fragment);
-  rows.forEach((row) => bindEventRows(row));
-  if (!nearTop) {
-    const afterTop = tbody.getBoundingClientRect().top;
-    window.scrollBy(0, afterTop - beforeTop);
-    state.newEventCount += records.length;
-  } else {
-    state.newEventCount = 0;
-  }
-  renderNewEventsIndicator();
-}
-
-function renderNewEventsIndicator() {
-  const button = $("#new-events");
-  if (!button) return;
-  if (state.newEventCount > 0) {
-    button.hidden = false;
-    button.textContent = `${state.newEventCount} new event${state.newEventCount === 1 ? "" : "s"} available`;
-  } else {
-    button.hidden = true;
-    button.textContent = "";
-  }
-}
-
-function showNewEvents() {
-  state.newEventCount = 0;
-  renderNewEventsIndicator();
-  window.scrollTo({ top: 0, behavior: "smooth" });
-}
-
-async function showEvent(id) {
-  if (!$("#drawer")) return;
-  const record = await getJSON(`/api/event?id=${encodeURIComponent(id)}`);
-  setText("#drawer .drawer-head h2", "Event Detail");
-  $("#event-summary").innerHTML = detailSummary(record);
-  $("#event-json").textContent = JSON.stringify(record.event, null, 2);
-  $$("#event-summary [data-apply-filter]").forEach((button) => {
-    button.addEventListener("click", () => applyFilters({ [button.dataset.applyFilter]: button.dataset.value }));
-  });
-  $("#drawer").classList.add("open");
-  $("#drawer").setAttribute("aria-hidden", "false");
-}
-
-async function showSession(id) {
-  if (!$("#drawer")) return;
-  const detail = await getJSON(`/api/session?id=${encodeURIComponent(id)}`);
-  setText("#drawer .drawer-head h2", "Session Detail");
-  $("#event-summary").innerHTML = sessionDetailSummary(detail);
-  const rawEvents = (detail.events || []).map((record) => record.raw_event || record.event || {});
-  $("#event-json").textContent = JSON.stringify(rawEvents, null, 2);
-  $("#drawer").classList.add("open");
-  $("#drawer").setAttribute("aria-hidden", "false");
 }
 
 function closeDrawer() {
@@ -1752,16 +1619,6 @@ function renderLoading() {
   setText("#result-meta", "Loading...");
   const columns = isSessionDetailPage ? 11 : (isSessionsPage ? 9 : 8);
   if ($("#events")) $("#events").innerHTML = `<tr><td colspan="${columns}">Loading ${isSessionsPage ? "sessions" : "events"}...</td></tr>`;
-}
-
-function signalCell(record) {
-  const event = record.event || {};
-  const info = event.event || {};
-  const parts = [
-    `<strong>${escapeHTML(signalAction(record))}</strong>`,
-    `<span class="muted">${escapeHTML(info.category || "uncategorized")}${event.model ? ` · ${escapeHTML(event.model)}` : ""}</span>`,
-  ].filter(Boolean);
-  return parts.join("<br />");
 }
 
 function harnessCell(event) {
@@ -1857,20 +1714,6 @@ function primaryArtifact(event) {
   return event.model || event.branch || "";
 }
 
-function artifactCell(event) {
-  const artifact = primaryArtifact(event);
-  const meta = [
-    event.command?.exit_code !== undefined ? `exit ${event.command.exit_code}` : "",
-    event.command?.duration_ms ? `${event.command.duration_ms}ms` : "",
-    event.file?.language,
-    event.mcp?.server,
-  ].filter(Boolean);
-  return `
-    <div class="artifact">${escapeHTML(truncateMiddle(artifact || event.message || "", 140))}</div>
-    ${meta.length ? `<div class="muted">${escapeHTML(meta.join(" · "))}</div>` : ""}
-  `;
-}
-
 function detailSummary(record) {
   const event = record.event || {};
   const info = event.event || {};
@@ -1904,36 +1747,6 @@ function detailSummary(record) {
     .join("");
 }
 
-function sessionDetailSummary(detail) {
-  const session = detail.session || {};
-  const events = detail.events || [];
-  const rows = [
-    ["Session", session.id],
-    ["Events", `${events.length || session.event_count || 0}`],
-    ["First event", session.first_event_at ? formatTime(session.first_event_at) : ""],
-    ["Last event", session.last_event_at ? formatTime(session.last_event_at) : ""],
-    ["Harness", session.harness],
-    ["Model", session.model],
-    ["Repository", sessionRepositoryLabel(session)],
-    ["Session prompt", session.original_prompt],
-    ["Working directory", session.working_directory],
-    ["Max severity", session.max_severity],
-    ["Needs review", session.review_count ? `${session.review_count} event${session.review_count === 1 ? "" : "s"}` : ""],
-  ].filter(([, value]) => value);
-  return `
-    ${rows.map(([label, value]) => `
-      <div>
-        <span class="muted">${escapeHTML(label)}</span>
-        <strong>${escapeHTML(label === "Session" ? formatSessionID(value) : value)}</strong>
-      </div>
-    `).join("")}
-    <div class="session-raw-note">
-      <span class="muted">Raw events</span>
-      <strong>Full JSON timeline shown below</strong>
-    </div>
-  `;
-}
-
 function renderSessionOverview(detail) {
   const session = detail.session || {};
   const records = detail.events || [];
@@ -1957,6 +1770,11 @@ function renderSessionOverview(detail) {
       : `<span class="session-badge session-badge-ok">No high risk events</span>`,
     `<span class="session-badge session-badge-info">${escapeHTML(session.event_count || records.length)} events captured</span>`,
   ];
+  if (session.sharing && session.sharing.url) {
+    badges.push(session.sharing.state === "stale"
+      ? `<span class="session-badge session-badge-risk">Shared · stale</span>`
+      : `<span class="session-badge session-badge-ok">Shared</span>`);
+  }
   $("#session-badges").innerHTML = badges.join("");
 
   renderSessionMetadata(session, events);
@@ -1987,16 +1805,20 @@ function renderSessionMetadata(session, events) {
     },
     { label: "Model", value: models.length ? escapeHTML(models.join(", ")) : `<span class="muted">-</span>`, className: "mono" },
     { label: "Tokens", value: usage.tokens ? escapeHTML(formatCompactTokens(usage.tokens)) : `<span class="muted">-</span>` },
-    { label: "Est. Cost", value: usage.cost ? `$${escapeHTML(usage.cost.toFixed(4))}` : `<span class="muted">-</span>` },
+    { label: "Reported Cost", value: usage.cost ? `$${escapeHTML(usage.cost.toFixed(4))}` : `<span class="muted">-</span>` },
     { label: "Repository", value: session.repository ? escapeHTML(repositoryOptionLabel(session.repository)) : `<span class="muted">-</span>`, className: "mono" },
     { label: "Branch", value: session.branch ? escapeHTML(session.branch) : `<span class="muted">-</span>`, className: "mono" },
   ];
+  if (session.sharing && session.sharing.url) {
+    rows.push({ label: "Shared", value: sessionSharingRowHTML(session.sharing), className: "session-meta-sharing" });
+  }
   $("#session-metadata").innerHTML = rows.map((row) => `
     <div class="session-meta-item ${row.className || ""}">
       <span>${escapeHTML(row.label)}</span>
       <strong>${row.value}</strong>
     </div>
   `).join("");
+  bindShareRefreshCopy($("#session-metadata"));
 }
 
 function renderSessionActivity(session, records) {
@@ -2140,7 +1962,7 @@ function sessionEventCategory(event) {
   if (event.file) return "file";
   if (event.mcp) return "mcp";
   if (event.approval || event.policy) return "approval";
-  if (event.prompt) return "prompt";
+  if (event.prompt?.text) return "prompt";
   if (event.tool) return "tool";
   return "other";
 }
@@ -2217,18 +2039,6 @@ function repositoryLabel(event) {
   return [event.repository, event.branch].filter(Boolean).join(" @ ");
 }
 
-function sessionRepositoryLabel(session) {
-  return [session.repository, session.branch].filter(Boolean).join(" @ ");
-}
-
-function repositoryShortLabel(event) {
-  if (!event.repository) return event.branch || "";
-  const parts = event.repository.split("/").filter(Boolean);
-  const repo = parts[parts.length - 1] || event.repository;
-  const label = parts.length > 1 ? `../${repo}` : repo;
-  return [label, event.branch].filter(Boolean).join(" @ ");
-}
-
 function formatSessionID(value, fallback = "") {
   const sessionID = String(value || "").trim();
   if (!sessionID) return fallback;
@@ -2284,7 +2094,8 @@ function renderHarnessSelect(values) {
     ...values.map((item) => `<option value="${escapeHTML(item.name)}">${escapeHTML(harnessLabel(item.name))} (${escapeHTML(item.count)})</option>`),
   ];
   select.innerHTML = options.join("");
-  select.value = values.some((item) => item.name === current) ? current : "";
+  ensureFacetOption(select, current);
+  select.value = current;
 }
 
 function renderModelSelect(values) {
@@ -2296,7 +2107,8 @@ function renderModelSelect(values) {
     ...values.map((item) => `<option value="${escapeHTML(item.name)}">${escapeHTML(item.name)} (${escapeHTML(item.count)})</option>`),
   ];
   select.innerHTML = options.join("");
-  select.value = values.some((item) => item.name === current) ? current : "";
+  ensureFacetOption(select, current);
+  select.value = current;
 }
 
 function renderRepositorySelect(values) {
@@ -2307,10 +2119,8 @@ function renderRepositorySelect(values) {
     `<option value="">All repositories</option>`,
     ...values.map((item) => `<option value="${escapeHTML(item.name)}">${escapeHTML(repositoryOptionLabel(item.name))} (${escapeHTML(item.count)})</option>`),
   ];
-  if (current && !values.some((item) => item.name === current)) {
-    options.push(`<option value="${escapeHTML(current)}">${escapeHTML(repositoryOptionLabel(current))}</option>`);
-  }
   select.innerHTML = options.join("");
+  ensureFacetOption(select, current);
   select.value = current;
 }
 
@@ -2328,9 +2138,11 @@ function renderDatalist(id, values) {
 
 function harnessLabel(value) {
   const labels = {
+    chatgpt_web: "ChatGPT Web",
     cline: "Cline",
     cursor: "Cursor",
     claude_code: "Claude Code",
+    claude_web: "Claude Web",
     codex_cli: "Codex CLI",
     codex_desktop: "Codex Desktop",
     copilot_cli: "GitHub Copilot CLI",
@@ -2458,7 +2270,6 @@ function detailFilterKey(label) {
 
 function setFilters(filters, { reset = false } = {}) {
   if (reset) clearFields(false);
-  state.newEventCount = 0;
   for (const [key, value] of Object.entries(filters)) {
     const input = $(`[name="${key}"]`);
     if (input) input.value = value;
@@ -2475,7 +2286,6 @@ function applyFilters(filters, options = {}) {
     window.location.href = `/?${params.toString()}`;
     return;
   }
-  if (isActivityPage) setActivityView("detailed");
   setFilters(filters, options);
 }
 
@@ -2489,7 +2299,6 @@ function queryStringFromObject(values) {
 
 function clearFilter(key) {
   if (!$("#filters")) return;
-  state.newEventCount = 0;
   const input = $(`[name="${key}"]`);
   if (input) input.value = "";
   load({ updateLocation: true }).catch(console.error);
@@ -2497,7 +2306,6 @@ function clearFilter(key) {
 
 function clearFields(loadAfter = true) {
   if (!$("#filters")) return;
-  state.newEventCount = 0;
   const sessionState = $("#session-state-filter")?.value || "captured";
   for (const field of formFields) {
     const input = $(`[name="${field}"]`);
@@ -2508,11 +2316,31 @@ function clearFields(loadAfter = true) {
   if (loadAfter) load({ updateLocation: true }).catch(console.error);
 }
 
+const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
+// truncateMiddle shortens value to maxLength visible characters, keeping both ends. It cuts between
+// graphemes, so an emoji, flag or accented letter at the cut stays whole. It reads only the
+// characters it keeps, so a long prompt costs no more than a short one.
 function truncateMiddle(value, maxLength) {
   value = String(value || "");
+  // Every grapheme is at least one UTF-16 unit, so a string this short has nothing to cut.
   if (value.length <= maxLength) return value;
-  const keep = Math.floor((maxLength - 3) / 2);
-  return `${value.slice(0, keep)}...${value.slice(value.length - keep)}`;
+  const segments = graphemes.segment(value);
+  const head = [];
+  for (const { segment } of segments) {
+    if (head.length === maxLength) {
+      const keep = Math.floor((maxLength - 3) / 2);
+      const tail = [];
+      for (let end = value.length; tail.length < keep; ) {
+        const last = segments.containing(end - 1);
+        tail.push(last.segment);
+        end = last.index;
+      }
+      return `${head.slice(0, keep).join("")}...${tail.reverse().join("")}`;
+    }
+    head.push(segment);
+  }
+  return value;
 }
 
 function escapeHTML(value) {
@@ -2565,7 +2393,7 @@ async function loadTokens() {
 function renderTokensPage(report, session) {
   setText("#log-path", state.status?.log_path || "Runtime log unavailable");
   setText("#token-meta", `${report.events_with_usage} of ${report.total_events} events carry usage`);
-  renderTokenCards(report.totals || {});
+  renderTokenCards(report.totals || {}, report.pricing);
   renderTokenThroughput(report.series || []);
   renderTokenSplit(report.totals || {});
   renderTokenBreakdowns(report);
@@ -2582,20 +2410,38 @@ function usageTotal(usage = {}) {
   return (usage.input_tokens || 0) +
     (usage.output_tokens || 0) +
     (usage.cache_read_input_tokens || 0) +
-    (usage.cache_creation_input_tokens || 0) +
-    (usage.reasoning_output_tokens || 0);
+    (usage.cache_creation_input_tokens || 0);
 }
 
-function renderTokenCards(totals) {
+// The estimate is labeled wherever it appears: it is a list price from the embedded catalog
+// (or the operator's pricing overrides file), not what anyone was billed, and it sits beside the
+// runtime-reported cost rather than in it.
+function estimateHint(totals, pricing) {
+  const overrides = pricing?.overrides;
+  const parts = [overrides && !overrides.error ? "list price + overrides" : "list price"];
+  const catalog = pricing?.catalog;
+  if (catalog?.generated_at) parts.push(`catalog ${catalog.generated_at}`);
+  if (overrides?.error) parts.push("overrides file invalid, not used");
+  if (totals.unpriced_events) parts.push(`${totals.unpriced_events} unpriced events excluded`);
+  return parts.join(" · ");
+}
+
+function formatEstimatedCost(usage = {}) {
+  if (usage.estimated_cost_usd) return `~${usage.estimated_cost_usd.toFixed(4)}`;
+  return usage.unpriced_events ? "?" : "-";
+}
+
+function renderTokenCards(totals, pricing) {
   if (!$("#token-cards")) return;
   const totalTokens = usageTotal(totals);
   const cards = [
     { label: "Total Tokens", value: formatTokens(totalTokens), hint: "local captured usage" },
     { label: "Input Tokens", value: formatTokens((totals.input_tokens || 0) + (totals.cache_read_input_tokens || 0) + (totals.cache_creation_input_tokens || 0)), hint: "fresh + cached" },
-    { label: "Output Tokens", value: formatTokens((totals.output_tokens || 0) + (totals.reasoning_output_tokens || 0)), hint: "completion + reasoning" },
+    { label: "Output Tokens", value: formatTokens(totals.output_tokens), hint: "includes reasoning" },
     { label: "Cached Tokens", value: formatTokens((totals.cache_read_input_tokens || 0) + (totals.cache_creation_input_tokens || 0)) },
     { label: "Reasoning", value: formatTokens(totals.reasoning_output_tokens) },
-    { label: "Cost (USD)", value: totals.cost_usd ? totals.cost_usd.toFixed(4) : "-", hint: "runtime-reported only" },
+    { label: "Reported cost (USD)", value: totals.cost_usd ? totals.cost_usd.toFixed(4) : "-", hint: "runtime-reported only" },
+    { label: "Est. cost (USD)", value: formatEstimatedCost(totals), hint: estimateHint(totals, pricing) },
   ];
   $("#token-cards").innerHTML = cards
     .map((card) => `
@@ -2619,7 +2465,6 @@ function renderTokenSplit(totals) {
     { name: "Input (fresh)", value: freshInput, color: "#0f7498" },
     { name: "Cached input", value: cached, color: "#10b981" },
     { name: "Output", value: output, color: "#7dd3fc" },
-    { name: "Reasoning", value: reasoning, color: "#f59e0b" },
   ].filter((segment) => segment.value > 0);
   const total = segments.reduce((sum, segment) => sum + segment.value, 0);
   if (!total) {
@@ -2648,6 +2493,7 @@ function renderTokenSplit(totals) {
         </div>
       `).join("")}
     </div>
+    ${reasoning > 0 && output > 0 ? `<p class="muted token-reasoning-note">Reasoning: ${escapeHTML(formatTokens(reasoning))} tokens (included in output).</p>` : ""}
   `;
 }
 
@@ -2763,7 +2609,7 @@ function renderTokenThroughput(series) {
     .map((bucket) => {
       const usage = bucket.usage || {};
       const input = (usage.input_tokens || 0) + (usage.cache_read_input_tokens || 0) + (usage.cache_creation_input_tokens || 0);
-      const output = (usage.output_tokens || 0) + (usage.reasoning_output_tokens || 0);
+      const output = usage.output_tokens || 0;
       const inputWidth = Math.max(0, Math.round((input / max) * 100));
       const outputWidth = Math.max(0, Math.round((output / max) * 100));
       return `
@@ -2806,7 +2652,7 @@ function renderUsageGroupRows(selector, groups, filterKey) {
   const tbody = $(selector);
   if (!tbody) return;
   if (!groups.length) {
-    tbody.innerHTML = `<tr><td colspan="8" class="muted">No usage captured yet.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="9" class="muted">No usage captured yet.</td></tr>`;
     return;
   }
   tbody.innerHTML = groups
@@ -2852,7 +2698,7 @@ function renderSessionDetail(detail, session) {
   walk(detail.steps, 0);
   $("#token-session-detail").innerHTML = rows.length
     ? rows.join("")
-    : `<tr><td colspan="8" class="muted">No usage-bearing steps in this session.</td></tr>`;
+    : `<tr><td colspan="9" class="muted">No usage-bearing steps in this session.</td></tr>`;
 }
 
 function usageCells(usage = {}, { events = true } = {}) {
@@ -2863,6 +2709,7 @@ function usageCells(usage = {}, { events = true } = {}) {
     formatTokens(usage.cache_creation_input_tokens),
     formatTokens(usage.reasoning_output_tokens),
     usage.cost_usd ? usage.cost_usd.toFixed(4) : "-",
+    formatEstimatedCost(usage),
   ];
   if (events) cells.push(String(usage.events ?? 0));
   return cells.map((value) => `<td>${escapeHTML(value)}</td>`).join("");
@@ -2974,8 +2821,37 @@ async function loadFindings() {
   }
 }
 
+// A finding is the rule's match over its ordered supporting events, not its
+// current row number. Legacy events without IDs use their complete JSON value.
+function findingExpansionKey(finding) {
+  if (!finding.events?.length) return null;
+  const evidence = finding.events.map((event) => event.event?.id
+    ? ["id", event.event.id]
+    : ["event", JSON.stringify(event, (_key, value) => {
+      if (value && typeof value === "object" && !Array.isArray(value)) {
+        return Object.fromEntries(Object.keys(value).sort().map((key) => [key, value[key]]));
+      }
+      return value;
+    })]);
+  return JSON.stringify([finding.rule_id, finding.session_id || "", evidence]);
+}
+
+function remapFindingExpansions(previous, findings, expanded) {
+  const previousKeys = previous.map(findingExpansionKey);
+  const nextKeys = findings.map(findingExpansionKey);
+  const counts = (keys) => keys.reduce((map, key) => map.set(key, (map.get(key) || 0) + 1), new Map());
+  const previousCounts = counts(previousKeys);
+  const nextCounts = counts(nextKeys);
+  const selected = new Set(previousKeys.filter((key, i) => key !== null
+    && expanded.has(i) && previousCounts.get(key) === 1));
+  // Identical duplicate findings have no unambiguous identity. Collapse them
+  // rather than selecting both or moving the user's choice to another row.
+  return new Set(nextKeys.flatMap((key, i) => selected.has(key) && nextCounts.get(key) === 1 ? [i] : []));
+}
+
 function renderFindings(resp) {
   const findings = resp?.findings || [];
+  state.findingsExpanded = remapFindingExpansions(state.findings, findings, state.findingsExpanded);
   state.findings = findings;
   setText("#findings-meta", `${findings.length} finding${findings.length === 1 ? "" : "s"} across ${resp?.scanned || 0} events`);
   const tbody = $("#findings-rows");
@@ -3316,16 +3192,310 @@ $("#filters")?.addEventListener("submit", (event) => {
 });
 $("#clear-search")?.addEventListener("click", clearSearch);
 $("#close-drawer")?.addEventListener("click", closeDrawer);
-$("#new-events")?.addEventListener("click", showNewEvents);
 window.addEventListener("hashchange", () => scrollDetectionHashIntoView({ force: true }));
-$$("[data-activity-view]").forEach((button) => {
-  button.addEventListener("click", () => {
-    setActivityView(button.dataset.activityView, { updateLocation: true });
-  });
-});
 $$("[data-preset]").forEach((button) => {
   button.addEventListener("click", () => applyPreset(button.dataset.preset));
 });
+
+// Lens tabs on the session page. Each lens runs in a sandboxed frame served by /lenses/frame/<id>
+// (see spec/lenses/SPEC.md). This is the host half of the protocol: it hands the frame one
+// MessagePort and answers getTrace over it with /api/lens-data. The frame never reaches the
+// dashboard any other way, and a lens that fails or stalls before it renders gives way to the full
+// session view.
+const lensAddedStorageKey = "beacon.dashboard.lenses";
+const lensRenderTimeoutMs = 10000;
+// After the data is delivered, a lens that throws within this window is treated as having failed
+// to render rather than as a lens with a late bug.
+const lensSettleMs = 1000;
+const lensMaxFrameHeight = 200000;
+
+const lensHost = {
+  session: "",
+  lenses: [],
+  added: [],
+  active: "",
+  mount: null,
+};
+
+function readAddedLenses() {
+  try {
+    const value = JSON.parse(localStorage.getItem(lensAddedStorageKey) || "[]");
+    return Array.isArray(value) ? value.filter((id) => typeof id === "string") : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+function writeAddedLenses(ids) {
+  try {
+    localStorage.setItem(lensAddedStorageKey, JSON.stringify(ids));
+  } catch (_) {
+    // Remembering tabs is a convenience; a browser without storage still works.
+  }
+}
+
+function lensByID(id) {
+  return lensHost.lenses.find((lens) => lens.id === id);
+}
+
+async function initLensTabs() {
+  const params = new URLSearchParams(window.location.search);
+  lensHost.session = (params.get("id") || "").trim();
+  if (!lensHost.session || !$("#lens-tabs")) return;
+  try {
+    lensHost.lenses = (await getJSON("/api/lenses")).lenses || [];
+  } catch (err) {
+    console.warn("lenses unavailable", err);
+    lensHost.lenses = [];
+  }
+  lensHost.added = readAddedLenses().filter((id) => lensByID(id));
+  const wanted = (params.get("lens") || "").trim();
+  if (wanted && lensByID(wanted) && !lensHost.added.includes(wanted)) {
+    lensHost.added.push(wanted);
+    writeAddedLenses(lensHost.added);
+  }
+
+  const addButton = $("#lens-add-button");
+  addButton.addEventListener("click", (event) => {
+    event.stopPropagation();
+    toggleLensMenu();
+  });
+  document.addEventListener("click", (event) => {
+    if (!event.target.closest(".lens-add")) toggleLensMenu(false);
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") toggleLensMenu(false);
+  });
+  window.addEventListener("popstate", () => {
+    const id = new URLSearchParams(window.location.search).get("lens") || "";
+    selectLens(lensByID(id) ? id : "", { history: false });
+  });
+
+  renderLensTabs();
+  selectLens(lensByID(wanted) ? wanted : "", { history: false });
+}
+
+function renderLensTabs() {
+  const tabs = $("#lens-tabs");
+  tabs.replaceChildren();
+  const tab = (id, title) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "lens-tab";
+    button.setAttribute("role", "tab");
+    button.setAttribute("aria-selected", String(lensHost.active === id));
+    button.dataset.lens = id;
+    button.addEventListener("click", () => {
+      // The active tab is already showing; reselecting it would reload the lens and push a
+      // duplicate history entry.
+      if (lensHost.active !== id) selectLens(id);
+    });
+    const label = document.createElement("span");
+    label.textContent = title;
+    button.append(label);
+    return button;
+  };
+  tabs.append(tab("", "Full session"));
+  for (const id of lensHost.added) {
+    const lens = lensByID(id);
+    const button = tab(id, lens.title);
+    const remove = document.createElement("span");
+    remove.className = "lens-tab-remove";
+    remove.setAttribute("role", "button");
+    remove.setAttribute("aria-label", `Remove the ${lens.title} lens`);
+    remove.textContent = "×";
+    remove.addEventListener("click", (event) => {
+      event.stopPropagation();
+      removeLens(id);
+    });
+    button.append(remove);
+    tabs.append(button);
+  }
+  renderLensMenu();
+}
+
+function renderLensMenu() {
+  const menu = $("#lens-menu");
+  menu.replaceChildren();
+  const available = lensHost.lenses.filter((lens) => !lensHost.added.includes(lens.id));
+  if (available.length === 0) {
+    const empty = document.createElement("span");
+    empty.className = "lens-menu-empty";
+    empty.textContent = lensHost.lenses.length ? "Every lens is already open." : "No lenses are installed.";
+    menu.append(empty);
+    return;
+  }
+  for (const lens of available) {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "lens-menu-item";
+    item.setAttribute("role", "menuitem");
+    const title = document.createElement("span");
+    title.className = "lens-menu-title";
+    title.textContent = lens.title;
+    item.append(title);
+    if (lens.description) {
+      const description = document.createElement("span");
+      description.className = "lens-menu-description";
+      description.textContent = lens.description;
+      item.append(description);
+    }
+    item.addEventListener("click", () => {
+      lensHost.added.push(lens.id);
+      writeAddedLenses(lensHost.added);
+      toggleLensMenu(false);
+      selectLens(lens.id);
+    });
+    menu.append(item);
+  }
+}
+
+function toggleLensMenu(open) {
+  const menu = $("#lens-menu");
+  const button = $("#lens-add-button");
+  if (!menu || !button) return;
+  const show = open === undefined ? menu.hidden : open;
+  menu.hidden = !show;
+  button.setAttribute("aria-expanded", String(show));
+}
+
+function removeLens(id) {
+  lensHost.added = lensHost.added.filter((added) => added !== id);
+  writeAddedLenses(lensHost.added);
+  if (lensHost.active === id) {
+    selectLens("");
+  } else {
+    renderLensTabs();
+  }
+}
+
+function selectLens(id, { history = true } = {}) {
+  if (id && !lensHost.added.includes(id)) {
+    // Reached through history after its tab was removed: show the tab again with the lens.
+    lensHost.added.push(id);
+    writeAddedLenses(lensHost.added);
+  }
+  lensHost.active = id;
+  if (history) {
+    const params = new URLSearchParams(window.location.search);
+    if (id) params.set("lens", id);
+    else params.delete("lens");
+    window.history.pushState(null, "", `${window.location.pathname}?${params}`);
+  }
+  if (id) $("#lens-notice").hidden = true;
+  $("#session-detail-view").dataset.view = id ? "lens" : "full";
+  $("#lens-view").hidden = !id;
+  renderLensTabs();
+  if (id) mountLens(lensByID(id));
+  else unmountLens();
+}
+
+function lensData(mount) {
+  if (!mount.dataPromise) {
+    // A frame receives one snapshot. Reopening creates a new mount and fetches
+    // current data without changing the snapshot of a frame already on screen.
+    mount.dataPromise = getJSON(`/api/lens-data?session=${encodeURIComponent(lensHost.session)}`);
+    mount.dataPromise.catch(() => {
+      mount.dataPromise = null;
+    });
+  }
+  return mount.dataPromise;
+}
+
+function unmountLens() {
+  const mount = lensHost.mount;
+  if (!mount) return;
+  lensHost.mount = null;
+  clearTimeout(mount.timer);
+  clearTimeout(mount.settleTimer);
+  if (mount.port) mount.port.close();
+  mount.frame.remove();
+}
+
+function mountLens(lens) {
+  unmountLens();
+  const status = $("#lens-status");
+  status.hidden = false;
+  status.textContent = `Loading ${lens.title}...`;
+
+  const frame = document.createElement("iframe");
+  frame.className = "lens-frame";
+  frame.setAttribute("sandbox", "allow-scripts");
+  frame.referrerPolicy = "no-referrer";
+  frame.title = `${lens.title} lens`;
+  frame.src = `/lenses/frame/${encodeURIComponent(lens.id)}`;
+
+  const mount = { lens, frame, dataPromise: null, port: null, loads: 0, delivered: false, rendered: false, timer: 0, settleTimer: 0 };
+  lensHost.mount = mount;
+  const fail = (reason) => {
+    if (lensHost.mount !== mount) return;
+    const notice = $("#lens-notice");
+    selectLens("", { history: false });
+    const params = new URLSearchParams(window.location.search);
+    params.delete("lens");
+    window.history.replaceState(null, "", `${window.location.pathname}?${params}`);
+    notice.textContent = `The ${lens.title} lens could not be shown (${reason}). Showing the full session instead.`;
+    notice.hidden = false;
+  };
+  const rendered = () => {
+    if (lensHost.mount !== mount || mount.rendered) return;
+    mount.rendered = true;
+    clearTimeout(mount.timer);
+    status.hidden = true;
+  };
+  mount.timer = setTimeout(() => fail("it did not render within 10 seconds"), lensRenderTimeoutMs);
+
+  frame.addEventListener("load", () => {
+    // A load queued before this lens was unmounted still fires; the frame is detached by then
+    // and has no window to post to.
+    if (lensHost.mount !== mount) return;
+    mount.loads += 1;
+    if (mount.loads > 1) {
+      // The lens navigated its own frame. Whatever loaded now is not the lens that was vetted,
+      // so it gets no port and the lens is closed.
+      fail("it navigated away from itself");
+      return;
+    }
+    const channel = new MessageChannel();
+    mount.port = channel.port1;
+    mount.port.onmessage = (event) => {
+      if (lensHost.mount !== mount) return;
+      const message = event.data;
+      if (!message || typeof message !== "object") return;
+      if (message.type === "getTrace") {
+        // The fetch can outlive this mount (another tab selected, the lens failed); its port is
+        // closed by then, and posting to it would throw.
+        const reply = (payload) => {
+          if (lensHost.mount !== mount) return false;
+          mount.port.postMessage(payload);
+          return true;
+        };
+        lensData(mount).then(
+          (data) => reply({ type: "trace", data }),
+          (err) => reply({ type: "traceError", message: String(err.message || err) }),
+        ).then((sent) => {
+          if (!sent) return;
+          mount.delivered = true;
+          mount.settleTimer = setTimeout(rendered, lensSettleMs);
+        });
+      } else if (message.type === "resize") {
+        const height = Number(message.height);
+        if (Number.isFinite(height)) {
+          frame.style.height = `${Math.min(Math.max(height, 0), lensMaxFrameHeight)}px`;
+        }
+        if (mount.delivered && height > 0) rendered();
+      } else if (message.type === "error") {
+        const reason = String(message.message || "error").slice(0, 200);
+        if (mount.rendered) console.warn(`lens ${lens.id}: ${reason}`);
+        else fail(`it raised an error: ${reason}`);
+      }
+    };
+    // The frame's origin is opaque, so "*" is the only target that reaches it. The message carries
+    // the port and nothing else; the trace only ever crosses the port.
+    frame.contentWindow.postMessage({ type: "beacon.lens.connect", version: 1 }, "*", [channel.port2]);
+  });
+  $("#lens-frame-slot").append(frame);
+}
 
 if (isDetectionsPage) {
   loadDetections().catch(console.error);
@@ -3337,6 +3507,7 @@ if (isDetectionsPage) {
   loadTokens().catch(console.error);
   setInterval(() => loadTokens().catch(console.error), 15000);
 } else if (isSessionDetailPage) {
+  initLensTabs().catch(console.error);
   loadSessionPage().catch(console.error);
   setInterval(() => loadSessionPage().catch(console.error), 15000);
 } else if (isInventoryPage) {
