@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -15,7 +16,15 @@ import (
 	"github.com/pelletier/go-toml/v2"
 	"gopkg.in/yaml.v3"
 
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/claudesession"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/clinesession"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/codexsession"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/harness"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/hooks"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/hermessession"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/launchpkg"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/sessionfs"
+	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve"
 )
 
 const (
@@ -73,7 +82,26 @@ type Options struct {
 	IncludeContents bool
 	// MaxContentBytes caps retained content per file. Zero uses DefaultMaxContentBytes.
 	MaxContentBytes int
+	// LauncherEnv is where MCP servers' launchers look for registry and index settings beyond
+	// the scanned home's own config files: the environment and working directory they inherit,
+	// and whether the system's files count. Nil reads the home's and the system's files only,
+	// which is all a scheduled job, whose environment is not the user's shell, can know. Every
+	// inventory snapshot is scanned that way, so a server's package_registry does not depend on
+	// which command took the snapshot. Its Home is always the scanned home.
+	LauncherEnv *launchpkg.RegistryEnv
+	// ResolvePackages answers which package each server runs. The answer reads the launcher
+	// config the user chose (an npmrc's userconfig, a project, a server's PATH), so it must be
+	// read with that user's rights, never root's: the system job, which scans as root, passes one
+	// that runs as the console user. Nil resolves in this process, which a confined scan never
+	// does: there every package is held back as private.
+	ResolvePackages func(launchpkg.RegistryEnv, []launchpkg.Query) ([]launchpkg.Answer, error)
 }
+
+// PackageRegistry values: where a server's launcher fetches the package it runs.
+const (
+	PackageRegistryPublic  = "public"
+	PackageRegistryPrivate = "private"
+)
 
 type Result struct {
 	GeneratedAt string      `json:"generated_at"`
@@ -132,6 +160,25 @@ type MCPServer struct {
 	ParserStatus    string                 `json:"parser_status"`
 	Redaction       string                 `json:"redaction"`
 	Definition      map[string]interface{} `json:"definition,omitempty"`
+	// Package is the npm or PyPI package the server's launch command runs from the public
+	// registry, as Beacon Intel looks it up (npm:<name> or pypi:<name>, no version), and
+	// PackageRegistry is "public". When the command, its env or the launcher config the scan
+	// read points that ecosystem at another registry or index, PackageRegistry is "private" and
+	// Package is left out, since the name may be private too. Both are empty for anything else
+	// (a binary, a script, a remote URL).
+	Package         string `json:"package,omitempty"`
+	PackageRegistry string `json:"package_registry,omitempty"`
+	// PrivatePackage names the package when PackageRegistry is "private". In memory only, for
+	// Beacon Intel's check by name, which the caller must opt into; never serialized.
+	PrivatePackage string `json:"-"`
+	// Launch is the redacted definition, kept whether or not contents are captured, so a reader
+	// such as Beacon Intel can tell which program a server runs without the record carrying its
+	// arguments. In memory only; never serialized.
+	Launch map[string]interface{} `json:"-"`
+	// projectDirs are the directories of the projects whose entry in a runtime's own config
+	// declares the server (Claude Code's ~/.claude.json projects.<path>.mcpServers), which the
+	// runtime starts it in, so its launcher reads the config it finds there.
+	projectDirs []string
 }
 
 type candidate struct {
@@ -173,11 +220,73 @@ func Scan(opts Options) Result {
 	co := contentOptions{include: opts.IncludeContents, maxBytes: opts.MaxContentBytes}
 	for _, item := range filterCandidates(withoutProjectScope(candidates(home, wd), wd), opts.Runtimes) {
 		config, servers := inspectCandidate(item, redaction, co)
+		if item.scope == ScopeProject {
+			// The runtime starts a server its project's config declares in that project, so the
+			// launcher reads the project's own registry config.
+			for i := range servers {
+				if len(servers[i].projectDirs) == 0 {
+					servers[i].projectDirs = []string{wd}
+				}
+			}
+		}
 		result.Configs = append(result.Configs, config)
 		result.MCPServers = append(result.MCPServers, servers...)
 	}
+	resolvePackages(result.MCPServers, home, opts)
 	result.Skills = scanSkills(home, wd, redaction, opts.Runtimes, co)
 	return result
+}
+
+// resolvePackages names the npm or PyPI package each server runs and where its launcher fetches
+// it from, with the home Scan resolved. A resolver that fails holds every package back as private:
+// a name Beacon could not check may be a private one.
+func resolvePackages(servers []MCPServer, home string, opts Options) {
+	if len(servers) == 0 {
+		return
+	}
+	env := launchpkg.RegistryEnv{System: true}
+	if opts.LauncherEnv != nil {
+		env = *opts.LauncherEnv
+	}
+	env.Home = home
+	queries := make([]launchpkg.Query, len(servers))
+	for i, s := range servers {
+		queries[i] = launchpkg.Query{Launch: s.Launch, ProjectDirs: s.projectDirs}
+	}
+	resolve := opts.ResolvePackages
+	if resolve == nil && !sessionfs.Confined(home) {
+		resolve = func(env launchpkg.RegistryEnv, queries []launchpkg.Query) ([]launchpkg.Answer, error) {
+			return launchpkg.ResolveAll(env, queries), nil
+		}
+	}
+	var answers []launchpkg.Answer
+	if resolve != nil {
+		if got, err := resolve(env, queries); err == nil && len(got) == len(queries) {
+			answers = got
+		}
+	}
+	for i := range servers {
+		if answers != nil {
+			if answers[i].OK {
+				servers[i].RecordPackage(answers[i].Package)
+			}
+			continue
+		}
+		if p, ok := launchpkg.FromCommand(launchpkg.Command(servers[i].Launch)); ok {
+			p.Private = true
+			servers[i].RecordPackage(p)
+		}
+	}
+}
+
+// RecordPackage records the package a server runs. A package from a private registry or index
+// keeps its name in memory only (PrivatePackage): the name may be private too.
+func (s *MCPServer) RecordPackage(p launchpkg.Package) {
+	if p.Private {
+		s.Package, s.PackageRegistry, s.PrivatePackage = "", PackageRegistryPrivate, p.Ref
+		return
+	}
+	s.Package, s.PackageRegistry, s.PrivatePackage = p.Ref, PackageRegistryPublic, ""
 }
 
 // withoutProjectScope drops project-scoped candidates when there is no working directory to
@@ -263,22 +372,37 @@ func candidates(home, wd string) []candidate {
 	return out
 }
 
+// claudeCandidates resolves the user-scope files through CLAUDE_CONFIG_DIR, as Claude Code does.
+// Project and managed scope are unaffected.
 func claudeCandidates(home, wd string) []candidate {
-	return []candidate{
-		{runtime: "claude_code", path: filepath.Join(home, ".claude.json"), scope: ScopeUser, format: formatJSON, kind: KindNativeConfig, volatile: true},
-		{runtime: "claude_code", path: filepath.Join(home, ".claude", "settings.json"), scope: ScopeUser, format: formatJSON, kind: KindNativeConfig},
-		{runtime: "claude_code", path: filepath.Join(wd, ".claude", "settings.json"), scope: ScopeProject, format: formatJSON, kind: KindNativeConfig},
-		{runtime: "claude_code", path: "/Library/Application Support/ClaudeCode/managed-settings.json", scope: ScopeManaged, format: formatJSON, kind: KindManagedConfig},
+	items := []candidate{}
+	if state := claudesession.StateFile(home); state != "" {
+		items = append(items, candidate{runtime: "claude_code", path: state, scope: ScopeUser, format: formatJSON, kind: KindNativeConfig, volatile: true})
 	}
+	if dir := claudesession.ConfigDir(home); dir != "" {
+		items = append(items, candidate{runtime: "claude_code", path: filepath.Join(dir, "settings.json"), scope: ScopeUser, format: formatJSON, kind: KindNativeConfig})
+	}
+	return append(items,
+		candidate{runtime: "claude_code", path: filepath.Join(wd, ".claude", "settings.json"), scope: ScopeProject, format: formatJSON, kind: KindNativeConfig},
+		candidate{runtime: "claude_code", path: "/Library/Application Support/ClaudeCode/managed-settings.json", scope: ScopeManaged, format: formatJSON, kind: KindManagedConfig},
+	)
 }
 
+// codexCandidates resolves the user-scope files through CODEX_HOME, as Codex does, and leaves them
+// out when CODEX_HOME names something Codex itself would refuse to start with. Project scope is
+// always <wd>/.codex.
 func codexCandidates(home, wd string) []candidate {
-	return []candidate{
-		{runtime: "codex_cli", path: filepath.Join(home, ".codex", "config.toml"), scope: ScopeUser, format: formatTOML, kind: KindNativeConfig},
-		{runtime: "codex_cli", path: filepath.Join(home, ".codex", "hooks.json"), scope: ScopeUser, format: formatJSON, kind: KindHookConfig},
-		{runtime: "codex_cli", path: filepath.Join(wd, ".codex", "config.toml"), scope: ScopeProject, format: formatTOML, kind: KindNativeConfig},
-		{runtime: "codex_cli", path: filepath.Join(wd, ".codex", "hooks.json"), scope: ScopeProject, format: formatJSON, kind: KindHookConfig},
+	items := []candidate{}
+	if dir, err := codexsession.HomeDir(home); err == nil {
+		items = append(items,
+			candidate{runtime: "codex_cli", path: filepath.Join(dir, "config.toml"), scope: ScopeUser, format: formatTOML, kind: KindNativeConfig},
+			candidate{runtime: "codex_cli", path: filepath.Join(dir, "hooks.json"), scope: ScopeUser, format: formatJSON, kind: KindHookConfig},
+		)
 	}
+	return append(items,
+		candidate{runtime: "codex_cli", path: filepath.Join(wd, ".codex", "config.toml"), scope: ScopeProject, format: formatTOML, kind: KindNativeConfig},
+		candidate{runtime: "codex_cli", path: filepath.Join(wd, ".codex", "hooks.json"), scope: ScopeProject, format: formatJSON, kind: KindHookConfig},
+	)
 }
 
 func cursorCandidates(home, wd string) []candidate {
@@ -291,7 +415,7 @@ func cursorCandidates(home, wd string) []candidate {
 }
 
 func geminiCandidates(home string) []candidate {
-	return []candidate{{runtime: "gemini_cli", path: filepath.Join(home, ".gemini", "settings.json"), scope: ScopeUser, format: formatJSON, kind: KindNativeConfig}}
+	return []candidate{{runtime: "gemini_cli", path: harness.GeminiSettingsPath(home), scope: ScopeUser, format: formatJSON, kind: KindNativeConfig}}
 }
 
 func antigravityCandidates(home, wd string) []candidate {
@@ -322,18 +446,24 @@ func copilotCandidates(home string) []candidate {
 	return []candidate{{runtime: "copilot_cli", path: shellProfilePath(home), scope: ScopeUser, format: formatMetadataOnly, kind: KindProfile}}
 }
 
+// opencodeCandidates resolves the user plugin through OPENCODE_CONFIG_DIR and XDG_CONFIG_HOME, as
+// OpenCode does.
 func opencodeCandidates(home, wd string) []candidate {
-	return []candidate{
-		{runtime: "opencode", path: filepath.Join(home, ".config", "opencode", "plugins", "beacon.ts"), scope: ScopeUser, format: formatMetadataOnly, kind: KindPlugin},
-		{runtime: "opencode", path: filepath.Join(wd, ".opencode", "plugins", "beacon.ts"), scope: ScopeProject, format: formatMetadataOnly, kind: KindPlugin},
+	items := []candidate{}
+	if dir, err := hooks.OpenCodeConfigDir(home); err == nil {
+		items = append(items, candidate{runtime: "opencode", path: filepath.Join(dir, "plugins", "beacon.ts"), scope: ScopeUser, format: formatMetadataOnly, kind: KindPlugin})
 	}
+	return append(items, candidate{runtime: "opencode", path: filepath.Join(wd, ".opencode", "plugins", "beacon.ts"), scope: ScopeProject, format: formatMetadataOnly, kind: KindPlugin})
 }
 
+// clineCandidates resolves the user plugin through CLINE_DIR, as Cline does. Project scope is
+// always <wd>/.cline.
 func clineCandidates(home, wd string) []candidate {
-	return []candidate{
-		{runtime: "cline", path: filepath.Join(home, ".cline", "plugins", "beacon.ts"), scope: ScopeUser, format: formatMetadataOnly, kind: KindPlugin},
-		{runtime: "cline", path: filepath.Join(wd, ".cline", "plugins", "beacon.ts"), scope: ScopeProject, format: formatMetadataOnly, kind: KindPlugin},
+	items := []candidate{}
+	if dir := clinesession.ClineDir(home); dir != "" {
+		items = append(items, candidate{runtime: "cline", path: filepath.Join(dir, "plugins", "beacon.ts"), scope: ScopeUser, format: formatMetadataOnly, kind: KindPlugin})
 	}
+	return append(items, candidate{runtime: "cline", path: filepath.Join(wd, ".cline", "plugins", "beacon.ts"), scope: ScopeProject, format: formatMetadataOnly, kind: KindPlugin})
 }
 
 // piCandidates covers both documented Pi extension locations.
@@ -346,11 +476,13 @@ func clineCandidates(home, wd string) []candidate {
 func piCandidates(home, wd string) []candidate {
 	items := []candidate{}
 	if home != "" {
-		items = append(items, candidate{
-			runtime: "pi_cli",
-			path:    filepath.Join(home, ".pi", "agent", "extensions", "beacon.ts"),
-			scope:   ScopeUser, format: formatMetadataOnly, kind: KindPlugin,
-		})
+		if path, err := hooks.PiExtensionPathForHome(home); err == nil {
+			items = append(items, candidate{
+				runtime: "pi_cli",
+				path:    path,
+				scope:   ScopeUser, format: formatMetadataOnly, kind: KindPlugin,
+			})
+		}
 	}
 	if wd != "" {
 		items = append(items, candidate{
@@ -475,8 +607,14 @@ func omoCandidates(home, wd string) []candidate {
 	return items
 }
 
+// hermesCandidates resolves config.yaml through HERMES_HOME and the active profile, as Hermes does,
+// and leaves it out when the active profile names one Hermes itself would refuse to start with.
 func hermesCandidates(home string) []candidate {
-	return []candidate{{runtime: "hermes", path: filepath.Join(home, ".hermes", "config.yaml"), scope: ScopeUser, format: formatYAML, kind: KindNativeConfig}}
+	dir, err := hermessession.HomeDir(home)
+	if err != nil {
+		return nil
+	}
+	return []candidate{{runtime: "hermes", path: filepath.Join(dir, "config.yaml"), scope: ScopeUser, format: formatYAML, kind: KindNativeConfig}}
 }
 
 func devinCandidates(home, wd string) []candidate {
@@ -492,11 +630,14 @@ func devinCandidates(home, wd string) []candidate {
 // native config file that Beacon merges into rather than a file Beacon owns. That is why it is
 // classified KindHookConfig and detected by the hook command it contains rather than by a
 // Beacon-managed marker: there is no marker to write into a file the user also edits.
+//
+// The user file follows QWEN_HOME, as Qwen Code does, through the same resolver the installer uses.
 func qwenCandidates(home, wd string) []candidate {
-	return []candidate{
-		{runtime: "qwen_code", path: filepath.Join(home, ".qwen", "settings.json"), scope: ScopeUser, format: formatJSON, kind: KindHookConfig},
-		{runtime: "qwen_code", path: filepath.Join(wd, ".qwen", "settings.json"), scope: ScopeProject, format: formatJSON, kind: KindHookConfig},
+	items := []candidate{}
+	if path, err := hooks.QwenSettingsPathForHome(hooks.LevelUser, home); err == nil {
+		items = append(items, candidate{runtime: "qwen_code", path: path, scope: ScopeUser, format: formatJSON, kind: KindHookConfig})
 	}
+	return append(items, candidate{runtime: "qwen_code", path: filepath.Join(wd, ".qwen", "settings.json"), scope: ScopeProject, format: formatJSON, kind: KindHookConfig})
 }
 
 // Muse Code is two files: the managed hooks file Beacon owns outright, and Muse's own settings.json,
@@ -573,12 +714,27 @@ func kiroCandidates(home, wd string) []candidate {
 // The patch file is listed as YAML and the hooks file as JSON, which is what they are -- and the
 // patch file is also the user's own, so the inventory may well find rows in it that have nothing to
 // do with Beacon. Detection keys on Beacon's mount, not on the file existing.
+//
+// Each profile's own patch layer is listed too, because that is where a declarative setup (a Nix
+// store path, say) mounts the bridge at Beacon's hooks file instead of Beacon's row in the home
+// layer. Without it, an install that works would look like a half-install here.
 func dshCandidates(home string) []candidate {
 	dir := dshUserDir(home)
-	return []candidate{
+	items := []candidate{
 		{runtime: "deepseek_harness", path: filepath.Join(dir, "beacon-endpoint-hooks.json"), scope: ScopeUser, format: formatJSON, kind: KindHookConfig},
 		{runtime: "deepseek_harness", path: filepath.Join(dir, "cordis.patch.yml"), scope: ScopeUser, format: formatYAML, kind: KindHookConfig},
 	}
+	entries, _ := readDirPath(filepath.Join(dir, "profiles"))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		layer := filepath.Join(dir, "profiles", entry.Name(), "cordis.patch.yml")
+		if _, err := statPath(layer); err == nil {
+			items = append(items, candidate{runtime: "deepseek_harness", path: layer, scope: ScopeUser, format: formatYAML, kind: KindHookConfig})
+		}
+	}
+	return items
 }
 
 // kimiCandidates covers the one file a Kimi Code install touches.
@@ -730,7 +886,7 @@ func inspectCandidate(item candidate, redaction string, co contentOptions) (Conf
 		ParserStatus: StatusNotFound,
 		Redaction:    redaction,
 	}
-	info, err := os.Stat(item.path)
+	info, err := statPath(item.path)
 	if err != nil {
 		config.Reason = errReason(err)
 		if !os.IsNotExist(err) {
@@ -745,7 +901,7 @@ func inspectCandidate(item candidate, redaction string, co contentOptions) (Conf
 		config.Reason = "path is a directory"
 		return config, nil
 	}
-	data, err := os.ReadFile(item.path)
+	data, err := readFilePath(item.path)
 	if err != nil {
 		config.ParserStatus = StatusUnreadable
 		config.Reason = errReason(err)
@@ -808,6 +964,12 @@ func serversFromNestedMCPBlocks(item candidate, value interface{}, redaction str
 	switch typed := value.(type) {
 	case map[string]interface{}:
 		for key, nested := range typed {
+			if key == "projects" {
+				if projects, ok := nested.(map[string]interface{}); ok {
+					servers = append(servers, serversFromProjects(item, projects, redaction, co)...)
+					continue
+				}
+			}
 			if isMCPServerBlockKey(key) {
 				servers = append(servers, serversFromBlock(item, nested, redaction, co)...)
 			}
@@ -817,6 +979,24 @@ func serversFromNestedMCPBlocks(item candidate, value interface{}, redaction str
 		for _, nested := range typed {
 			servers = append(servers, serversFromNestedMCPBlocks(item, nested, redaction, co)...)
 		}
+	}
+	return servers
+}
+
+// serversFromProjects reads a projects block keyed by project directory (Claude Code's
+// ~/.claude.json), and records each server's project so a reader knows where it is started.
+func serversFromProjects(item candidate, projects map[string]interface{}, redaction string, co contentOptions) []MCPServer {
+	var servers []MCPServer
+	for dir, nested := range projects {
+		found := serversFromNestedMCPBlocks(item, nested, redaction, co)
+		if filepath.IsAbs(dir) {
+			for i := range found {
+				if len(found[i].projectDirs) == 0 {
+					found[i].projectDirs = []string{dir}
+				}
+			}
+		}
+		servers = append(servers, found...)
 	}
 	return servers
 }
@@ -899,6 +1079,7 @@ func serverFromDefinition(item candidate, name string, def map[string]interface{
 	if command != "" {
 		server.CommandNameHash = hashString(filepath.Base(command))
 	}
+	server.Launch = redactedDef
 	if co.include {
 		server.Definition = redactedDef
 	}
@@ -926,20 +1107,35 @@ func inferTransport(def map[string]interface{}, url, command string) string {
 	}
 }
 
+func mergeDirs(dirs, more []string) []string {
+	for _, d := range more {
+		if !slices.Contains(dirs, d) {
+			dirs = append(dirs, d)
+		}
+	}
+	sort.Strings(dirs)
+	return dirs
+}
+
 func dedupeServers(servers []MCPServer) []MCPServer {
-	seen := map[string]bool{}
+	seen := map[string]int{}
 	out := make([]MCPServer, 0, len(servers))
 	for _, server := range servers {
 		key := server.Runtime + "\x00" + server.SourcePathHash + "\x00" + server.ServerNameHash + "\x00" + server.DefinitionHash
-		if seen[key] {
+		if i, ok := seen[key]; ok {
+			// The same definition in several projects is one entry, started in each of them.
+			out[i].projectDirs = mergeDirs(out[i].projectDirs, server.projectDirs)
 			continue
 		}
-		seen[key] = true
+		seen[key] = len(out)
 		out = append(out, server)
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Runtime == out[j].Runtime {
 			if out[i].SourcePathHash == out[j].SourcePathHash {
+				if out[i].ServerNameHash == out[j].ServerNameHash {
+					return out[i].DefinitionHash < out[j].DefinitionHash
+				}
 				return out[i].ServerNameHash < out[j].ServerNameHash
 			}
 			return out[i].SourcePathHash < out[j].SourcePathHash
@@ -968,7 +1164,7 @@ func valuesForEnvKeys(keys []string, redaction string) []string {
 }
 
 func safeEnvKey(key string) bool {
-	return !containsSecretMarker(key)
+	return !asymptoteobserve.IsSecretKeyName(key)
 }
 
 func mapKeys(raw interface{}) []string {
@@ -1006,6 +1202,10 @@ func beaconManaged(item candidate, data []byte) bool {
 	switch item.runtime {
 	case "claude_code", "cursor", "antigravity_cli", "vscode", "factory", "hermes", "devin-cli", "devin-desktop":
 		if strings.Contains(text, "BEACON_ENDPOINT_MODE=1") {
+			return true
+		}
+		// Hooks written since the settings moved to --log/--config flags carry no prefix.
+		if managed, _ := hooks.ConfigHasEndpointHook(data, ""); managed {
 			return true
 		}
 	case "opencode":
@@ -1074,9 +1274,13 @@ func beaconManaged(item candidate, data []byte) bool {
 	// the plugin specifier the loader resolves, so it cannot be edited to something else and still
 	// work. A user who mounts the bridge themselves would match too -- which is correct, since
 	// that is a live route from this runtime into a hooks file.
+	//
+	// A patch layer that mounts the bridge by path (a Nix store path names no package) is
+	// recognized by the hooks file it points the bridge at, which is Beacon's.
 	case "deepseek_harness":
 		return strings.Contains(text, "--platform dsh") || strings.Contains(text, "--platform=dsh") ||
-			strings.Contains(text, "@deepseek-ai/dsh-hooks-claude-code")
+			strings.Contains(text, "@deepseek-ai/dsh-hooks-claude-code") ||
+			strings.Contains(text, "beacon-endpoint-hooks.json")
 	// Matched on the hook command rather than on the comment Beacon writes above its block, and
 	// here that is not a preference between two working options: Kimi Code's legacy migration
 	// from `kimi-cli` rewrites this file by serializing the merged config, which keeps the
@@ -1160,7 +1364,7 @@ func localEndpointText(text string) bool {
 // command name, a timestamp, or a whole config file's bytes. A secret value must not be hashed
 // here -- a digest over one short, low-entropy secret is a lookup table away from the secret
 // itself -- so route anything that may hold a secret through redactStructured first, the way
-// serverFromDefinition does. Secret-looking keys are stripped by containsSecretMarker.
+// serverFromDefinition does. Secret-looking keys are stripped by asymptoteobserve.IsSecretKeyName.
 
 func hashString(value string) string {
 	if value == "" {

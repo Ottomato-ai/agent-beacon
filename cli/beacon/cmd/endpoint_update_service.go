@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/selfupdate"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/service"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/writer"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/updatecheck"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/version"
 )
 
@@ -95,15 +97,15 @@ func setConfigAutoUpdateModeAt(path, mode string) error {
 		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 			return err
 		}
-		return os.WriteFile(path, data, 0644)
+		return endpointconfig.RewriteSystemConfig(path, data, false)
 	}
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
-	perm := os.FileMode(0644)
-	if info, err := os.Stat(path); err == nil {
-		perm = info.Mode().Perm()
+	private := false
+	if info, err := os.Stat(path); err == nil && runtime.GOOS != "windows" {
+		private = info.Mode().Perm()&0o077 == 0
 	}
 	autoUpdate, err := json.Marshal(endpointconfig.AutoUpdate{Mode: mode})
 	if err != nil {
@@ -114,7 +116,7 @@ func setConfigAutoUpdateModeAt(path, mode string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, out, perm)
+	return endpointconfig.RewriteSystemConfig(path, out, private)
 }
 
 func requireRootForUpdater() error {
@@ -125,6 +127,10 @@ func requireRootForUpdater() error {
 }
 
 func runUpdateEnable(cmd *cobra.Command, args []string) error {
+	if !updatecheck.PublicReleases {
+		fmt.Fprintln(cmd.OutOrStdout(), notUpdatedFromPublicReleases)
+		return nil
+	}
 	if err := requireRootForUpdater(); err != nil {
 		return err
 	}

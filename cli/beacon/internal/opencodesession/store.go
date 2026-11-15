@@ -6,13 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"net/url"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/sessionfs"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/sessionsync"
 
 	_ "modernc.org/sqlite"
 )
@@ -28,12 +29,20 @@ type Store struct {
 	LegacyStorageDir string
 }
 
+// NewStore opens the OpenCode store at dataDir, which is a data directory or an opencode.db path.
+// Empty means where OpenCode itself writes: its data directory, with the database named by
+// OPENCODE_DB when that is set.
 func NewStore(dataDir string) (*Store, error) {
 	if strings.TrimSpace(dataDir) == "" {
-		dataDir = DefaultDataDir()
-	}
-	if strings.TrimSpace(dataDir) == "" {
-		return nil, errors.New("opencode data directory is empty")
+		data := DefaultDataDir()
+		if data == "" {
+			return nil, errors.New("opencode data directory is empty")
+		}
+		return &Store{
+			DataDir:          data,
+			SQLitePath:       defaultDBPath(data),
+			LegacyStorageDir: filepath.Join(data, "storage"),
+		}, nil
 	}
 	dataDir = filepath.Clean(dataDir)
 	if strings.HasSuffix(dataDir, ".db") {
@@ -50,23 +59,32 @@ func NewStore(dataDir string) (*Store, error) {
 	}, nil
 }
 
+// DefaultDataDir is OpenCode's data directory, which holds opencode.db and the legacy storage tree.
+// OpenCode uses XDG paths on every platform, Windows included. Its plugins and configuration live in
+// a separate directory (~/.config/opencode) that holds no sessions.
 func DefaultDataDir() string {
+	if xdg := os.Getenv("XDG_DATA_HOME"); xdg != "" {
+		return filepath.Join(xdg, "opencode")
+	}
 	home, err := os.UserHomeDir()
 	if err != nil || strings.TrimSpace(home) == "" {
 		return ""
 	}
-	switch runtime.GOOS {
-	case "windows":
-		if appData := strings.TrimSpace(os.Getenv("APPDATA")); appData != "" {
-			return filepath.Join(appData, "opencode")
-		}
-		return filepath.Join(home, "AppData", "Roaming", "opencode")
-	default:
-		if xdg := strings.TrimSpace(os.Getenv("XDG_CONFIG_HOME")); xdg != "" {
-			return filepath.Join(xdg, "opencode")
-		}
-		return filepath.Join(home, ".config", "opencode")
+	return filepath.Join(home, ".local", "share", "opencode")
+}
+
+// defaultDBPath resolves OPENCODE_DB as OpenCode does: an absolute path is used as given and a
+// relative one is resolved against the data directory. Unset, or the in-memory name, means
+// opencode.db.
+func defaultDBPath(data string) string {
+	name := os.Getenv("OPENCODE_DB")
+	if name == "" || name == ":memory:" {
+		return filepath.Join(data, "opencode.db")
 	}
+	if filepath.IsAbs(name) {
+		return filepath.Clean(name)
+	}
+	return filepath.Join(data, name)
 }
 
 func (s *Store) Exists() bool {
@@ -124,10 +142,30 @@ func (s *Store) listSQLite() ([]TraceRef, error) {
 		return nil, fmt.Errorf("open OpenCode sqlite: %w", err)
 	}
 	defer db.Close()
-	if !sqliteTableExists(db, "session") {
-		return nil, nil
+	// OpenCode 2.x keeps sessions in session_v2 and migrates 1.x sessions into it under the same
+	// ids. session is the 1.x table, still read for a session that has not been migrated.
+	var refs []TraceRef
+	seen := map[string]bool{}
+	for _, table := range []string{"session_v2", "session"} {
+		if !sqliteTableExists(db, table) {
+			continue
+		}
+		tableRefs, err := s.listSQLiteTable(db, table)
+		for _, ref := range tableRefs {
+			if !seen[ref.ID] {
+				seen[ref.ID] = true
+				refs = append(refs, ref)
+			}
+		}
+		if err != nil {
+			return refs, err
+		}
 	}
-	cols := sqliteColumns(db, "session")
+	return refs, nil
+}
+
+func (s *Store) listSQLiteTable(db *sql.DB, table string) ([]TraceRef, error) {
+	cols := sqliteColumns(db, table)
 	selects := []string{
 		sqliteSelectColumn(cols, "id"),
 		sqliteSelectColumn(cols, "title"),
@@ -137,7 +175,7 @@ func (s *Store) listSQLite() ([]TraceRef, error) {
 		sqliteSelectColumn(cols, "time_updated"),
 		sqliteSelectColumn(cols, "parent_id"),
 	}
-	rows, err := db.Query("SELECT "+strings.Join(selects, ", ")+" FROM session ORDER BY COALESCE(time_updated, time_created, 0) DESC LIMIT ?", defaultListLimit)
+	rows, err := db.Query("SELECT "+strings.Join(selects, ", ")+" FROM "+table+" ORDER BY COALESCE(time_updated, time_created, 0) DESC LIMIT ?", defaultListLimit)
 	if err != nil {
 		return nil, fmt.Errorf("read OpenCode sessions: %w", err)
 	}
@@ -167,7 +205,7 @@ func (s *Store) listSQLite() ([]TraceRef, error) {
 			ref.RelatedTo = parent.String
 			ref.RelationshipType = "subagent"
 		}
-		if info, err := os.Stat(s.SQLitePath); err == nil {
+		if info, err := sessionfs.Stat(s.SQLitePath); err == nil {
 			ref.SizeBytes = info.Size()
 		}
 		refs = append(refs, ref)
@@ -181,18 +219,35 @@ func (s *Store) readSQLite(ref TraceRef) ([]Record, error) {
 		return nil, fmt.Errorf("open OpenCode sqlite: %w", err)
 	}
 	defer db.Close()
-	if !sqliteTableExists(db, "message") || !sqliteTableExists(db, "part") {
-		return nil, nil
+	var records []Record
+	// through is the latest 1.x message or part. OpenCode's migration copies a 1.x session into
+	// session_message with the same timestamps, so only what 2.x wrote after it is read from there.
+	var through int64
+	if sqliteTableExists(db, "message") && sqliteTableExists(db, "part") {
+		messages, err := readSQLiteMessages(db, ref.ID)
+		if err != nil {
+			return nil, err
+		}
+		parts, err := readSQLiteParts(db, ref.ID)
+		if err != nil {
+			return nil, err
+		}
+		records = recordsFromMessages(messages, parts)
+		for _, msg := range messages {
+			through = max(through, msg.Time.Created, msg.Time.Completed)
+			for _, part := range parts[msg.ID] {
+				through = max(through, part.TimeCreated)
+			}
+		}
 	}
-	messages, err := readSQLiteMessages(db, ref.ID)
-	if err != nil {
-		return nil, err
+	if sqliteTableExists(db, "session_message") {
+		v2, err := readSessionMessages(db, ref.ID, through, len(records)+1)
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, v2...)
 	}
-	parts, err := readSQLiteParts(db, ref.ID)
-	if err != nil {
-		return nil, err
-	}
-	return recordsFromMessages(messages, parts), nil
+	return records, nil
 }
 
 func readSQLiteMessages(db *sql.DB, sessionID string) ([]opencodeMessage, error) {
@@ -255,12 +310,156 @@ func readSQLiteParts(db *sql.DB, sessionID string) (map[string][]opencodePart, e
 	return out, rows.Err()
 }
 
+// readSessionMessages reads the session_message rows OpenCode 2.x wrote after through. Each row is
+// one typed entry, and an assistant step carries its text, reasoning and tool calls in content.
+func readSessionMessages(db *sql.DB, sessionID string, through int64, order int) ([]Record, error) {
+	rows, err := db.Query("SELECT id, type, time_created, data FROM session_message WHERE session_id = ? AND time_created > ? ORDER BY seq", sessionID, through)
+	if err != nil {
+		return nil, fmt.Errorf("read OpenCode session messages: %w", err)
+	}
+	defer rows.Close()
+	var out []Record
+	for rows.Next() {
+		var id, typ, data sql.NullString
+		var created sql.NullInt64
+		if err := rows.Scan(&id, &typ, &created, &data); err != nil {
+			continue
+		}
+		var raw map[string]interface{}
+		_ = json.Unmarshal([]byte(nullString(data)), &raw)
+		for _, rec := range sessionMessageRecords(nullString(id), nullString(typ), normalizeMillis(nullInt(created)), raw) {
+			rec.Order = order
+			order++
+			out = append(out, rec)
+		}
+	}
+	return out, rows.Err()
+}
+
+func sessionMessageRecords(id, typ string, created int64, raw map[string]interface{}) []Record {
+	model := opencodeModel(raw)
+	switch typ {
+	case "user":
+		text := stringFromMap(raw, "text")
+		if strings.TrimSpace(text) == "" {
+			return nil
+		}
+		return []Record{{NativeID: id, TimestampMS: created, Type: "user_message", Role: "user", Content: text, ModelID: model}}
+	case "shell":
+		// A command the user ran with !, recorded as the bash tool call 1.x stored it as.
+		status := "completed"
+		if stringFromMap(raw, "status") == "running" {
+			status = "running"
+		}
+		output := map[string]interface{}{"output": stringFromMap(mapFromAny(raw["output"]), "output")}
+		if exit, ok := raw["exit"]; ok {
+			output["metadata"] = map[string]interface{}{"exit": exit}
+		}
+		recType := "tool_result"
+		if status == "running" {
+			recType = "tool_call"
+		}
+		return []Record{{NativeID: id, TimestampMS: firstNonZero(normalizeMillis(intFromAny(mapFromAny(raw["time"])["completed"])), created), Type: recType,
+			ToolName: "bash", CallID: firstNonEmpty(stringFromMap(raw, "shellID"), id), Args: map[string]interface{}{"command": stringFromMap(raw, "command")},
+			Output: output, Status: status, Raw: map[string]interface{}{"message": raw}}}
+	case "compaction":
+		// A completed compaction carries the usage of the model call that summarized the history.
+		out := []Record{{NativeID: id, TimestampMS: created, Type: "compaction", ModelID: model, Raw: map[string]interface{}{"message": raw}}}
+		if usage, ok := sessionMessageUsage(id, raw, created, model); ok {
+			out = append(out, usage)
+		}
+		return out
+	case "assistant":
+	default:
+		return nil
+	}
+	var out []Record
+	content, _ := raw["content"].([]interface{})
+	for i, value := range content {
+		item := mapFromAny(value)
+		nativeID := id + ":" + strconv.Itoa(i)
+		switch stringFromMap(item, "type") {
+		case "text", "reasoning":
+			text := stringFromMap(item, "text")
+			if strings.TrimSpace(text) == "" {
+				continue
+			}
+			recType := "assistant_text"
+			if stringFromMap(item, "type") == "reasoning" {
+				recType = "agent_reasoning"
+			}
+			out = append(out, Record{NativeID: nativeID, TimestampMS: created, Type: recType, Role: "assistant", Content: text, ModelID: model, Raw: map[string]interface{}{"part": item}})
+		case "tool":
+			out = append(out, sessionToolRecord(id, item, created, model))
+		}
+	}
+	if usage, ok := sessionMessageUsage(id, raw, created, model); ok {
+		out = append(out, usage)
+	}
+	completed := firstNonZero(normalizeMillis(intFromAny(mapFromAny(raw["time"])["completed"])), created)
+	if errMap := mapFromAny(raw["error"]); len(content) == 0 && len(errMap) > 0 {
+		out = append(out, Record{NativeID: id + ":error", TimestampMS: completed, Type: "error", Content: stringFromMap(errMap, "message", "type"), ModelID: model, Raw: map[string]interface{}{"message": raw}})
+	}
+	return out
+}
+
+// sessionMessageUsage is the token_usage record for a session_message row's tokens and cost.
+func sessionMessageUsage(id string, raw map[string]interface{}, created int64, model string) (Record, bool) {
+	completed := firstNonZero(normalizeMillis(intFromAny(mapFromAny(raw["time"])["completed"])), created)
+	tokens := tokenUsageFromAny(raw["tokens"])
+	// 2.x stores output without reasoning; a total that covers both tells outputTokens to add it back.
+	tokens.Total = tokens.Input + tokens.CacheRead + tokens.CacheWrite + tokens.Output + tokens.Reasoning
+	tokens.CostUSD = floatFromAny(raw["cost"])
+	if !hasUsage(tokens) {
+		return Record{}, false
+	}
+	return Record{NativeID: id + ":usage", TimestampMS: completed, Type: "token_usage", ModelID: model, Tokens: &tokens}, true
+}
+
+func sessionToolRecord(messageID string, item map[string]interface{}, created int64, model string) Record {
+	state := mapFromAny(item["state"])
+	timeMap := mapFromAny(item["time"])
+	status := stringFromMap(state, "status")
+	rec := Record{
+		NativeID:    messageID + ":" + stringFromMap(item, "id"),
+		TimestampMS: firstNonZero(normalizeMillis(intFromAny(timeMap["created"])), created),
+		Type:        "tool_call",
+		ModelID:     model,
+		ToolName:    stringFromMap(item, "name"),
+		CallID:      stringFromMap(item, "id"),
+		Args:        mapFromAny(state["input"]),
+		Status:      firstNonEmpty(status, "invoked"),
+		Raw:         map[string]interface{}{"part": item},
+	}
+	if status != "completed" && status != "error" {
+		return rec
+	}
+	rec.Type = "tool_result"
+	rec.TimestampMS = firstNonZero(normalizeMillis(intFromAny(timeMap["completed"])), rec.TimestampMS)
+	var texts []string
+	contentItems, _ := state["content"].([]interface{})
+	for _, value := range contentItems {
+		if text := stringFromMap(mapFromAny(value), "text"); text != "" {
+			texts = append(texts, text)
+		}
+	}
+	var output interface{} = strings.Join(texts, "\n")
+	if metadata := mapFromAny(state["metadata"]); len(metadata) > 0 {
+		output = map[string]interface{}{"output": output, "metadata": metadata}
+	}
+	rec.Output = output
+	if errText := stringFromMap(mapFromAny(state["error"]), "message"); errText != "" {
+		rec.Raw["error"] = errText
+	}
+	return rec
+}
+
 func (s *Store) listLegacy() ([]TraceRef, error) {
 	sessionRoot := filepath.Join(s.LegacyStorageDir, "session")
 	if !dirExists(sessionRoot) {
 		return nil, nil
 	}
-	projects, err := os.ReadDir(sessionRoot)
+	projects, err := sessionfs.ReadDir(sessionRoot)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, nil
@@ -275,7 +474,7 @@ func (s *Store) listLegacy() ([]TraceRef, error) {
 		projectID := project.Name()
 		projectDir := legacyProjectDirectory(filepath.Join(s.LegacyStorageDir, "project", projectID+".json"))
 		sessionDir := filepath.Join(sessionRoot, projectID)
-		files, err := os.ReadDir(sessionDir)
+		files, err := sessionfs.ReadDir(sessionDir)
 		if err != nil {
 			continue
 		}
@@ -299,7 +498,7 @@ func (s *Store) readLegacy(ref TraceRef) ([]Record, error) {
 		return nil, fmt.Errorf("read OpenCode legacy session %s", ref.SourcePath)
 	}
 	messageDir := filepath.Join(s.LegacyStorageDir, "message", session.ID)
-	files, err := os.ReadDir(messageDir)
+	files, err := sessionfs.ReadDir(messageDir)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, nil
@@ -325,7 +524,7 @@ func (s *Store) readLegacy(ref TraceRef) ([]Record, error) {
 	parts := map[string][]opencodePart{}
 	for _, msg := range messages {
 		partDir := filepath.Join(s.LegacyStorageDir, "part", msg.ID)
-		partFiles, err := os.ReadDir(partDir)
+		partFiles, err := sessionfs.ReadDir(partDir)
 		if err != nil {
 			continue
 		}
@@ -548,7 +747,7 @@ func partFromMap(raw map[string]interface{}) opencodePart {
 }
 
 func readLegacySessionRef(path, projectDir string) (TraceRef, bool) {
-	info, err := os.Stat(path)
+	info, err := sessionfs.Stat(path)
 	if err != nil || info.IsDir() || info.Size() > maxSessionBytes {
 		return TraceRef{}, false
 	}
@@ -580,7 +779,7 @@ func readLegacySessionRef(path, projectDir string) (TraceRef, bool) {
 }
 
 func readLegacySession(path string) opencodeMessage {
-	data, err := os.ReadFile(path)
+	data, err := sessionfs.ReadFile(path)
 	if err != nil {
 		return opencodeMessage{}
 	}
@@ -594,7 +793,7 @@ func readLegacySession(path string) opencodeMessage {
 }
 
 func readLegacyMessage(path string) opencodeMessage {
-	data, err := os.ReadFile(path)
+	data, err := sessionfs.ReadFile(path)
 	if err != nil {
 		return opencodeMessage{}
 	}
@@ -608,7 +807,7 @@ func readLegacyMessage(path string) opencodeMessage {
 }
 
 func readLegacyPart(path string) opencodePart {
-	data, err := os.ReadFile(path)
+	data, err := sessionfs.ReadFile(path)
 	if err != nil {
 		return opencodePart{}
 	}
@@ -622,7 +821,7 @@ func readLegacyPart(path string) opencodePart {
 }
 
 func legacyProjectDirectory(path string) string {
-	data, err := os.ReadFile(path)
+	data, err := sessionfs.ReadFile(path)
 	if err != nil {
 		return ""
 	}
@@ -633,50 +832,9 @@ func legacyProjectDirectory(path string) string {
 	return firstNonEmpty(stringFromMap(raw, "worktree"), stringFromMap(raw, "directory"), stringFromMap(raw, "name"))
 }
 
+// openSQLiteReadOnly opens OpenCode's store read-only, with query_only in place of a busy timeout.
 func openSQLiteReadOnly(path string) (*sql.DB, error) {
-	return sql.Open("sqlite", sqliteFileURI(path))
-}
-
-// sqliteFileURI renders an OS path as the file: URI the driver needs to honour mode=ro.
-//
-// The URI form is not optional: modernc.org/sqlite only forwards query parameters to SQLite when
-// the DSN starts with "file:", and it opens every database with READWRITE|CREATE flags, so mode=ro
-// is the one thing keeping a read of OpenCode's store from writing to it.
-//
-// Handing url.URL a raw OS path does not produce that URI on Windows. A path like
-// C:\Users\me\opencode.db has no leading slash, so URL.String emits "file://C:%5CUsers%5C..." and
-// SQLite reads "C:" as the URI's authority -- every list and read then fails, and OpenCode sync
-// collects nothing. The path is made absolute, switched to forward slashes, and split into the host
-// and path a file: URI actually has.
-func sqliteFileURI(path string) string {
-	abs := path
-	if resolved, err := filepath.Abs(path); err == nil {
-		abs = resolved
-	}
-	u := fileURL(filepath.ToSlash(abs))
-	q := u.Query()
-	q.Set("mode", "ro")
-	q.Set("_pragma", "query_only(1)")
-	u.RawQuery = q.Encode()
-	return u.String()
-}
-
-// fileURL splits an already slash-separated path into the host and path of a file: URL.
-//
-// A UNC path (\\server\share\opencode.db, slashed to //server/share/opencode.db) names a host, and
-// is the one case where a file: URI has one. Everything else is a plain local path and gets the
-// leading slash that keeps a Windows drive letter inside the path instead of in the authority.
-func fileURL(slashed string) url.URL {
-	if rest, ok := strings.CutPrefix(slashed, "//"); ok {
-		host, remainder, _ := strings.Cut(rest, "/")
-		if host != "" {
-			return url.URL{Scheme: "file", Host: host, Path: "/" + remainder}
-		}
-	}
-	if !strings.HasPrefix(slashed, "/") {
-		slashed = "/" + slashed
-	}
-	return url.URL{Scheme: "file", Path: slashed}
+	return sessionsync.OpenSQLite(path, "query_only(1)")
 }
 
 func sqliteTableExists(db *sql.DB, table string) bool {
@@ -713,12 +871,12 @@ func sqliteSelectColumn(cols map[string]bool, name string) string {
 }
 
 func fileExists(path string) bool {
-	info, err := os.Stat(path)
+	info, err := sessionfs.Stat(path)
 	return err == nil && info.Mode().IsRegular()
 }
 
 func dirExists(path string) bool {
-	info, err := os.Stat(path)
+	info, err := sessionfs.Stat(path)
 	return err == nil && info.IsDir()
 }
 

@@ -1,16 +1,17 @@
 package groksession
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
-	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/schema"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/writer"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/sessionsync"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/sessionwindow"
 )
 
 const StateVersion = 1
@@ -51,49 +52,21 @@ func DefaultStatePath() string {
 	return filepath.Join(base, "endpoint", "state", "grok-sessions.json")
 }
 
-func LoadState(path string) (*State, error) {
-	state := &State{Version: StateVersion, Sessions: map[string]*Cursor{}}
-	if path == "" {
-		return state, nil
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return state, nil
+var stateFile = sessionsync.StateFile[State]{
+	Name:  "Grok session",
+	New:   func() *State { return &State{Version: StateVersion, Sessions: map[string]*Cursor{}} },
+	Valid: func(s *State) bool { return s.Version == StateVersion && s.Sessions != nil },
+	Stamp: func(s *State) {
+		if s.Sessions == nil {
+			s.Sessions = map[string]*Cursor{}
 		}
-		return nil, err
-	}
-	var stored State
-	if err := json.Unmarshal(data, &stored); err != nil {
-		return nil, fmt.Errorf("read Grok session collector state %s: %w", path, err)
-	}
-	if stored.Version != StateVersion || stored.Sessions == nil {
-		return state, nil
-	}
-	return &stored, nil
+		s.Version = StateVersion
+	},
 }
 
-func (s *State) Save(path string) error {
-	if path == "" {
-		return nil
-	}
-	if s.Sessions == nil {
-		s.Sessions = map[string]*Cursor{}
-	}
-	s.Version = StateVersion
-	data, err := json.MarshalIndent(s, "", "  ")
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
-}
+func LoadState(path string) (*State, error) { return stateFile.Load(path) }
+
+func (s *State) Save(path string) error { return stateFile.Save(path, s) }
 
 func (s *State) cursor(id string) *Cursor {
 	if s.Sessions == nil {
@@ -115,6 +88,19 @@ type CollectOptions struct {
 	UserMode    bool
 	Print       bool
 	Out         io.Writer
+	// Since, when set, limits the sweep to sessions modified at or after it, newest first. Older
+	// sessions are not read and their cursors do not move, so a later sync still collects them.
+	// The install-time backfill sets it; an ordinary sync leaves it zero.
+	Since time.Time
+	// Budget, when set, caps the bytes this sweep may append. The sweep stops at the first event
+	// that does not fit and returns writer.ErrBudgetSpent, with cursors past only what was written.
+	Budget *writer.Budget
+	// RotateBytes is the size the runtime log rotates at while this sweep writes it; zero is
+	// writer.DefaultRotateBytes.
+	RotateBytes int64
+
+	// guard keeps the sweep from rotating its own output out of the log; CollectOnce sets it.
+	guard *writer.RetentionGuard
 }
 
 type SummaryResult struct {
@@ -123,6 +109,7 @@ type SummaryResult struct {
 	EventsEmitted   int `json:"events_emitted"`
 	Errors          int `json:"errors"`
 	MalformedLines  int `json:"malformed_lines"`
+	sessionsync.Retention
 }
 
 func CollectOnce(opts CollectOptions) (summary SummaryResult, err error) {
@@ -137,6 +124,7 @@ func CollectOnce(opts CollectOptions) (summary SummaryResult, err error) {
 	if err != nil {
 		return summary, err
 	}
+	refs = sessionwindow.Recent(refs, opts.Since, func(r SessionRef) int64 { return r.ModTimeUnixMS })
 	summary.Sessions = len(refs)
 	if len(refs) == 0 {
 		return summary, nil
@@ -152,8 +140,20 @@ func CollectOnce(opts CollectOptions) (summary SummaryResult, err error) {
 	}()
 
 	var errs []error
+	opts.guard = sessionsync.NewRetentionGuard(opts.Print, opts.Write)
+	var stopErr error
 	for _, ref := range refs {
 		changed, collectErr := collectSession(store, ref, state, opts, &summary)
+		if sessionsync.Stopped(collectErr) {
+			// Not a failed session: this one and the rest are left for a later sync, with cursors
+			// that have not moved past anything that was not written.
+			if changed {
+				summary.SessionsChanged++
+			}
+			stopErr = collectErr
+			errs = append(errs, collectErr)
+			break
+		}
 		if collectErr != nil {
 			summary.Errors++
 			errs = append(errs, fmt.Errorf("Grok session %s: %w", ref.ID, collectErr))
@@ -162,6 +162,9 @@ func CollectOnce(opts CollectOptions) (summary SummaryResult, err error) {
 		if changed {
 			summary.SessionsChanged++
 		}
+	}
+	if rotatedOut := summary.Finish(opts.sink(), stopErr); rotatedOut != nil {
+		errs = append(errs, rotatedOut)
 	}
 	if len(errs) > 0 {
 		return summary, errors.Join(errs...)
@@ -215,7 +218,7 @@ func collectSession(store *Store, ref SessionRef, state *State, opts CollectOpti
 	}
 	written := 0
 	for _, item := range mapped {
-		if err := emit(item.Event, opts); err != nil {
+		if err := opts.sink().Emit(item.Event); err != nil {
 			commit(cursor, mapped, written)
 			return true, err
 		}
@@ -263,20 +266,6 @@ func commit(cursor *Cursor, mapped []MappedEvent, written int) {
 	cursor.Events += written
 }
 
-func emit(event schema.Event, opts CollectOptions) error {
-	if opts.Print && opts.Out != nil {
-		data, err := json.Marshal(event)
-		if err != nil {
-			return err
-		}
-		if _, err := opts.Out.Write(append(data, '\n')); err != nil {
-			return err
-		}
-	}
-	if opts.Write {
-		if _, err := writer.AppendEvent(event, writer.Options{Path: opts.LogPath, UserMode: opts.UserMode}); err != nil {
-			return err
-		}
-	}
-	return nil
+func (o CollectOptions) sink() sessionsync.Sink {
+	return sessionsync.Sink{Print: o.Print, Out: o.Out, Write: o.Write, Log: writer.Options{Path: o.LogPath, UserMode: o.UserMode, RotateSize: o.RotateBytes, Budget: o.Budget, Guard: o.guard}}
 }

@@ -1,8 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# The cloud shuttle uploads only from /tmp/beacon, so a path outside it is refused.
+under_sandbox() {
+  case "$1" in
+    */../* | */..) return 1 ;;
+    /tmp/beacon | /tmp/beacon/*) return 0 ;;
+  esac
+  return 1
+}
+
 BEACON_HOME="${BEACON_HOME:-/tmp/beacon}"
+if ! under_sandbox "$BEACON_HOME"; then
+  echo "Beacon ignores BEACON_HOME=$BEACON_HOME outside /tmp/beacon." >&2
+  BEACON_HOME=/tmp/beacon
+fi
 BEACON_LOG_PATH="${BEACON_CLOUD_LOG_PATH:-$BEACON_HOME/runtime.jsonl}"
+if [ "$BEACON_LOG_PATH" = /tmp/beacon ] || ! under_sandbox "$BEACON_LOG_PATH"; then
+  echo "Beacon ignores BEACON_CLOUD_LOG_PATH=$BEACON_LOG_PATH outside /tmp/beacon." >&2
+  BEACON_LOG_PATH="$BEACON_HOME/runtime.jsonl"
+fi
 
 mkdir -p "$(dirname "$BEACON_LOG_PATH")"
 
@@ -10,6 +27,13 @@ BEACON_CLOUD_UPLOAD_NORMALIZED="$(printf '%s' "${BEACON_CLOUD_UPLOAD:-gcs}" | tr
 BEACON_CLOUD_S3_REGION_EFFECTIVE="${BEACON_CLOUD_S3_REGION:-${AWS_REGION:-${AWS_DEFAULT_REGION:-}}}"
 
 case "$BEACON_CLOUD_UPLOAD_NORMALIZED" in
+  asymptote)
+    if [ -n "${BEACON_CLOUD_INGEST_URL:-}" ] && [ -n "${BEACON_CLOUD_DEVICE_KEY:-}" ]; then
+      echo "Beacon Cloud forwarding to Asymptote Managed is configured for: $BEACON_CLOUD_INGEST_URL"
+    else
+      echo "Asymptote Managed forwarding is not active; set BEACON_CLOUD_INGEST_URL and BEACON_CLOUD_DEVICE_KEY to enable uploads."
+    fi
+    ;;
   s3)
     if [ -n "${BEACON_CLOUD_S3_BUCKET:-}" ] &&
       [ -n "$BEACON_CLOUD_S3_REGION_EFFECTIVE" ] &&

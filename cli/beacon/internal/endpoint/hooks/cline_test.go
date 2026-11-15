@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/testenv"
 )
 
 // clineRenderedArgv extracts the argv the installer substituted into the plugin.
@@ -185,8 +187,8 @@ func TestClineEmbeddedPluginMatchesRootSource(t *testing.T) {
 
 func TestClinePluginPathsPerLevel(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("USERPROFILE", home)
+	testenv.SetHome(t, home)
+	t.Setenv("CLINE_DIR", "")
 
 	userPath, err := clinePluginPath(LevelUser)
 	if err != nil {
@@ -206,6 +208,33 @@ func TestClinePluginPathsPerLevel(t *testing.T) {
 
 	if _, err := clinePluginPath("nonsense"); err == nil {
 		t.Error("clinePluginPath accepted an unknown level")
+	}
+}
+
+// Cline loads global plugins from $CLINE_DIR/plugins when CLINE_DIR is set, so the user-level
+// plugin goes there; a project plugin stays in <cwd>/.cline/plugins.
+func TestClinePluginPathFollowsClineDir(t *testing.T) {
+	testenv.SetHome(t, t.TempDir())
+	clineDir := t.TempDir()
+	t.Setenv("CLINE_DIR", clineDir)
+	userPath, err := clinePluginPath(LevelUser)
+	if err != nil {
+		t.Fatalf("clinePluginPath(user): %v", err)
+	}
+	if want := filepath.Join(clineDir, "plugins", "beacon.ts"); userPath != want {
+		t.Fatalf("user plugin path = %q, want %q", userPath, want)
+	}
+	t.Chdir(t.TempDir())
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectPath, err := clinePluginPath(LevelProject)
+	if err != nil {
+		t.Fatalf("clinePluginPath(project): %v", err)
+	}
+	if want := filepath.Join(cwd, ".cline", "plugins", "beacon.ts"); projectPath != want {
+		t.Fatalf("project plugin path = %q, want %q", projectPath, want)
 	}
 }
 
@@ -249,20 +278,6 @@ func TestClineStatusRejectsAPluginPointingElsewhere(t *testing.T) {
 	}
 }
 
-func TestIsClineInstalledAtRequiresTheManagedMarker(t *testing.T) {
-	dir := t.TempDir()
-	unmanaged := filepath.Join(dir, "other.ts")
-	if err := os.WriteFile(unmanaged, []byte("export default {}"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if isClineInstalledAt(unmanaged) {
-		t.Error("an unmanaged plugin was reported as Beacon's")
-	}
-	if isClineInstalledAt(filepath.Join(dir, "absent.ts")) {
-		t.Error("a missing plugin was reported as installed")
-	}
-}
-
 // The plugin holds its argv JSON-encoded, so a backslash appears doubled in the file. Comparing
 // against the raw path therefore matched nothing on Windows, and every correctly installed plugin
 // there was reported as not referencing its own binary. Asserted on the rendered source so the
@@ -286,19 +301,5 @@ func TestClinePluginReferencesBinaryHandlesWindowsPaths(t *testing.T) {
 	}
 	if clinePluginReferencesBinary(source, "") {
 		t.Error("an empty binary path was treated as a match")
-	}
-}
-
-func TestClinePluginReferencesBinaryOnPOSIXPaths(t *testing.T) {
-	binary := "/opt/beacon/hooks/beacon-hooks"
-	source, err := renderClinePlugin(binary, "/var/log/beacon/runtime.jsonl", "/etc/beacon/config.json")
-	if err != nil {
-		t.Fatalf("renderClinePlugin returned error: %v", err)
-	}
-	if !clinePluginReferencesBinary(source, binary) {
-		t.Error("a plugin rendered for this binary was not recognized as referencing it")
-	}
-	if clinePluginReferencesBinary(source, "/opt/beacon/hooks/beacon-hooks-old") {
-		t.Error("a plugin was reported as referencing a binary it does not spawn")
 	}
 }

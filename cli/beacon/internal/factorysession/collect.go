@@ -1,16 +1,18 @@
 package factorysession
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/schema"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/writer"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/sessionsync"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/sessionwindow"
 )
 
 const StateVersion = 1
@@ -22,6 +24,9 @@ type Cursor struct {
 	ModTimeUnixMS  int64  `json:"mtime_ms,omitempty"`
 	SizeBytes      int64  `json:"size_bytes,omitempty"`
 	SettingsUnixMS int64  `json:"settings_mtime_ms,omitempty"`
+	// Usage is the cumulative settings usage Beacon has already emitted for this session, the
+	// baseline the next token.usage delta is measured from. Nil means none has been emitted yet.
+	Usage *UsageTotals `json:"usage_totals,omitempty"`
 }
 
 type State struct {
@@ -29,47 +34,16 @@ type State struct {
 	Sessions map[string]*Cursor `json:"sessions"`
 }
 
-func LoadState(path string) (*State, error) {
-	state := &State{Version: StateVersion, Sessions: map[string]*Cursor{}}
-	if path == "" {
-		return state, nil
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return state, nil
-		}
-		return nil, err
-	}
-	var stored State
-	if err := json.Unmarshal(data, &stored); err != nil {
-		return nil, fmt.Errorf("read Factory collector state %s: %w", path, err)
-	}
-	if stored.Version != StateVersion || stored.Sessions == nil {
-		return state, nil
-	}
-	state.Sessions = stored.Sessions
-	return state, nil
+var stateFile = sessionsync.StateFile[State]{
+	Name:  "Factory",
+	New:   func() *State { return &State{Version: StateVersion, Sessions: map[string]*Cursor{}} },
+	Valid: func(s *State) bool { return s.Version == StateVersion && s.Sessions != nil },
+	Stamp: func(s *State) { s.Version = StateVersion },
 }
 
-func (s *State) Save(path string) error {
-	if path == "" {
-		return nil
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	s.Version = StateVersion
-	data, err := json.MarshalIndent(s, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
-}
+func LoadState(path string) (*State, error) { return stateFile.Load(path) }
+
+func (s *State) Save(path string) error { return stateFile.Save(path, s) }
 
 func (s *State) cursor(sessionID string) *Cursor {
 	if s.Sessions == nil {
@@ -99,6 +73,19 @@ type CollectOptions struct {
 	UserMode    bool
 	Print       bool
 	Out         io.Writer
+	// Since, when set, limits the sweep to sessions modified at or after it, newest first. Older
+	// sessions are not read and their cursors do not move, so a later sync still collects them.
+	// The install-time backfill sets it; an ordinary sync leaves it zero.
+	Since time.Time
+	// Budget, when set, caps the bytes this sweep may append. The sweep stops at the first event
+	// that does not fit and returns writer.ErrBudgetSpent, with cursors past only what was written.
+	Budget *writer.Budget
+	// RotateBytes is the size the runtime log rotates at while this sweep writes it; zero is
+	// writer.DefaultRotateBytes.
+	RotateBytes int64
+
+	// guard keeps the sweep from rotating its own output out of the log; CollectOnce sets it.
+	guard *writer.RetentionGuard
 }
 
 type Summary struct {
@@ -108,6 +95,7 @@ type Summary struct {
 	Errors          int `json:"errors"`
 	MalformedLines  int `json:"malformed_lines"`
 	PartialSessions int `json:"partial_sessions"`
+	sessionsync.Retention
 }
 
 func CollectOnce(opts CollectOptions) (summary Summary, err error) {
@@ -119,6 +107,7 @@ func CollectOnce(opts CollectOptions) (summary Summary, err error) {
 	if err != nil {
 		return summary, err
 	}
+	refs = sessionwindow.Recent(refs, opts.Since, func(r SessionRef) int64 { return r.ModTimeUnixMS })
 	summary.Sessions = len(refs)
 	if len(refs) == 0 {
 		return summary, nil
@@ -134,8 +123,20 @@ func CollectOnce(opts CollectOptions) (summary Summary, err error) {
 	}()
 
 	var errs []error
+	opts.guard = sessionsync.NewRetentionGuard(opts.Print, opts.Write)
+	var stopErr error
 	for _, ref := range refs {
 		changed, collectErr := collectSession(store, ref, state, opts, &summary)
+		if sessionsync.Stopped(collectErr) {
+			// Not a failed session: this one and the rest are left for a later sync, with cursors
+			// that have not moved past anything that was not written.
+			if changed {
+				summary.SessionsChanged++
+			}
+			stopErr = collectErr
+			errs = append(errs, collectErr)
+			break
+		}
 		if collectErr != nil {
 			summary.Errors++
 			errs = append(errs, fmt.Errorf("Factory session %s: %w", ref.ID, collectErr))
@@ -144,6 +145,9 @@ func CollectOnce(opts CollectOptions) (summary Summary, err error) {
 		if changed {
 			summary.SessionsChanged++
 		}
+	}
+	if rotatedOut := summary.Finish(opts.sink(), stopErr); rotatedOut != nil {
+		errs = append(errs, rotatedOut)
 	}
 	if len(errs) > 0 {
 		return summary, errors.Join(errs...)
@@ -157,7 +161,10 @@ func collectSession(store *Store, ref SessionRef, state *State, opts CollectOpti
 		cursor.LastLine = 0
 		cursor.Started = false
 		cursor.SettingsUnixMS = 0
+		// Usage stays: the session id is the same session, and its settings totals are still
+		// cumulative from the same start, so forgetting them would count them again.
 	}
+	seedLegacyUsageBaseline(cursor, ref)
 	if cursor.LastLine > 0 &&
 		cursor.ModTimeUnixMS == ref.ModTimeUnixMS &&
 		cursor.SizeBytes == ref.SizeBytes &&
@@ -177,6 +184,7 @@ func collectSession(store *Store, ref SessionRef, state *State, opts CollectOpti
 		MinLine:            cursor.LastLine,
 		SkipSessionStarted: cursor.Started,
 		EmitSettingsUsage:  emitSettingsUsage,
+		PreviousUsage:      cursor.Usage,
 	})
 	for i, item := range mapped {
 		if err := emitEvent(item.Event, opts); err != nil {
@@ -189,7 +197,27 @@ func collectSession(store *Store, ref SessionRef, state *State, opts CollectOpti
 		}
 	}
 	advanceCursor(cursor, ref, stats)
+	// Committed only once every event is on disk, so a failed write retries the same delta. A
+	// settings file with no usable totals keeps the baseline it had.
+	if emitSettingsUsage {
+		if totals := SettingsUsageTotals(ref.Settings); totals != nil {
+			cursor.Usage = totals
+		}
+	}
 	return len(mapped) > 0 || stats.Lines != cursor.LastLine || emitSettingsUsage, nil
+}
+
+// seedLegacyUsageBaseline upgrades state written before Beacon kept usage totals. That release
+// emitted the whole cumulative total each time the settings mtime changed, so a cursor that has a
+// settings mtime but no totals already holds a token.usage event for exactly the settings it
+// recorded. When the file is still at that mtime, its totals are what was emitted, and they become
+// the baseline instead of being counted again. A file that changed since then cannot be told
+// apart from first sight, so it is counted from zero, as that release would have.
+func seedLegacyUsageBaseline(cursor *Cursor, ref SessionRef) {
+	if cursor.Usage != nil || cursor.SettingsUnixMS == 0 || cursor.SettingsUnixMS != ref.SettingsUnixMS {
+		return
+	}
+	cursor.Usage = SettingsUsageTotals(ref.Settings)
 }
 
 func advanceCursor(cursor *Cursor, ref SessionRef, stats ReadStats) {
@@ -222,23 +250,9 @@ func advanceCursorPartial(cursor *Cursor, ref SessionRef, mapped []MappedEvent, 
 	}
 }
 
-// emitEvent is emit, swapped by tests to fail a chosen write.
-var emitEvent = emit
+// emitEvent emits through opts.sink(), swapped by tests to fail a chosen write.
+var emitEvent = func(event schema.Event, opts CollectOptions) error { return opts.sink().Emit(event) }
 
-func emit(event schema.Event, opts CollectOptions) error {
-	if opts.Print && opts.Out != nil {
-		data, err := json.Marshal(event)
-		if err != nil {
-			return err
-		}
-		if _, err := opts.Out.Write(append(data, '\n')); err != nil {
-			return err
-		}
-	}
-	if opts.Write {
-		if _, err := writer.AppendEvent(event, writer.Options{Path: opts.LogPath, UserMode: opts.UserMode}); err != nil {
-			return err
-		}
-	}
-	return nil
+func (o CollectOptions) sink() sessionsync.Sink {
+	return sessionsync.Sink{Print: o.Print, Out: o.Out, Write: o.Write, Log: writer.Options{Path: o.LogPath, UserMode: o.UserMode, RotateSize: o.RotateBytes, Budget: o.Budget, Guard: o.guard}}
 }

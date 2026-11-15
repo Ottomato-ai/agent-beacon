@@ -3,7 +3,16 @@ set -euo pipefail
 
 echo "Installing Beacon Cursor Cloud binaries..."
 
-BEACON_HOME="${BEACON_HOME:-/tmp/beacon}"
+# The cloud shuttle uploads only from /tmp/beacon, so a BEACON_HOME outside it is refused.
+case "${BEACON_HOME:=/tmp/beacon}" in
+  */../* | */..) BEACON_HOME_OK=0 ;;
+  /tmp/beacon | /tmp/beacon/*) BEACON_HOME_OK=1 ;;
+  *) BEACON_HOME_OK=0 ;;
+esac
+if [ "$BEACON_HOME_OK" != 1 ]; then
+  echo "Beacon ignores BEACON_HOME=$BEACON_HOME outside /tmp/beacon." >&2
+  BEACON_HOME=/tmp/beacon
+fi
 BEACON_BIN_DIR="$BEACON_HOME/bin"
 REPO_ROOT="${BEACON_CLOUD_REPO_DIR:-${CURSOR_PROJECT_DIR:-$(pwd)}}"
 
@@ -31,7 +40,7 @@ go_is_compatible() {
   local go_binary="$1"
   local current_version
   current_version="$("$go_binary" version 2>/dev/null | awk '{print $3}')"
-  [[ "$current_version" =~ ^go1\.([0-9]+) ]] && [ "${BASH_REMATCH[1]}" -ge 24 ]
+  [[ "$current_version" =~ ^go1\.([0-9]+) ]] && [ "${BASH_REMATCH[1]}" -ge 27 ]
 }
 
 install_go() {
@@ -49,7 +58,7 @@ install_go() {
     fi
   fi
 
-  local go_version="${BEACON_GO_VERSION:-1.24.4}"
+  local go_version="${BEACON_GO_VERSION:-1.27.3}"
   local arch
 
   case "$(uname -m)" in

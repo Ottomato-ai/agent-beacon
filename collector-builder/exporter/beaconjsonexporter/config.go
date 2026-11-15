@@ -18,6 +18,12 @@ type Config struct {
 	ContentRetention      string `mapstructure:"content_retention"` // Deprecated no-op; retained for older collector configs.
 	IncludeRuntimeMetrics bool   `mapstructure:"include_runtime_metrics"`
 	IncludeCodexSpans     bool   `mapstructure:"include_codex_spans"`
+	// CaptureModelContext is the --claude-capture-model-context opt-in, the same setting the
+	// claude_api_body processor reads; see beaconevent.Options.
+	CaptureModelContext bool `mapstructure:"capture_model_context"`
+	// PeerUser records each event under the account the beacon_peer processor resolved; set only
+	// together with that processor in the pipeline. See beaconevent.Options.PeerUser.
+	PeerUser bool `mapstructure:"peer_user"`
 }
 
 func createDefaultConfig() *Config {

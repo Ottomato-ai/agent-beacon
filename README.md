@@ -1,6 +1,9 @@
 <p align="center">
-  <img src="images/beacon-hero.png" alt="Beacon" width="860">
+  <img src="images/beacon-lockup-light-mode.svg#gh-light-mode-only" alt="Beacon" width="480">
+  <img src="images/beacon-lockup-dark-mode.svg#gh-dark-mode-only" alt="Beacon" width="480">
 </p>
+
+<h1 align="center">Self‑improving memory for coding agents</h1>
 
 <p align="center">
   <a href="https://github.com/asymptote-labs/agent-beacon/releases"><img src="https://img.shields.io/github/v/release/asymptote-labs/agent-beacon" alt="GitHub release"></a>
@@ -23,6 +26,14 @@
   <a href="https://docs.beacon.sh/cli">Commands</a>
 </p>
 
+<p align="center">
+  <a href="https://trendshift.io/repositories/30512?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-30512" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/30512" alt="Asymptote-Labs%2Fagent-beacon | Trendshift" width="250" height="55" /></a>
+  <a href="https://www.producthunt.com/products/asymptotelabs?embed=true&utm_source=badge-top-post-badge&utm_medium=badge&utm_campaign=badge-beacon-sh" target="_blank" rel="noopener noreferrer"><picture><source media="(prefers-color-scheme: dark)" srcset="https://api.producthunt.com/widgets/embed-image/v1/top-post-badge.svg?post_id=1292351&theme=dark&period=daily&t=1793685827673" /><source media="(prefers-color-scheme: light)" srcset="https://api.producthunt.com/widgets/embed-image/v1/top-post-badge.svg?post_id=1292351&theme=neutral&period=daily&t=1793685827673" /><img alt="beacon.sh - Open-source self-improving memory for AI coding agents | Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/top-post-badge.svg?post_id=1292351&theme=neutral&period=daily&t=1793685827673" /></picture></a>
+  <a href="https://www.producthunt.com/products/asymptotelabs?embed=true&utm_source=badge-top-post-badge&utm_medium=badge&utm_campaign=badge-beacon-sh" target="_blank" rel="noopener noreferrer"><picture><source media="(prefers-color-scheme: dark)" srcset="https://api.producthunt.com/widgets/embed-image/v1/top-post-badge.svg?post_id=1292351&theme=dark&period=weekly&t=1794218691353" /><source media="(prefers-color-scheme: light)" srcset="https://api.producthunt.com/widgets/embed-image/v1/top-post-badge.svg?post_id=1292351&theme=neutral&period=weekly&t=1794218691353" /><img alt="beacon.sh - Open-source self-improving memory for AI coding agents | Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/top-post-badge.svg?post_id=1292351&theme=neutral&period=weekly&t=1794218691353" /></picture></a>
+</p>
+
+⭐ *Help us reach more developers and grow the Beacon community. Star this repo!*
+
 Beacon captures **agent session history** across Claude Code, Cursor, Codex, OpenCode, and 20+ other harnesses, then turns useful workflows, corrections, and debugging patterns into reusable knowledge for future agents.
 
 **A problem solved by one agent shouldn't need to be learned from scratch by another.**
@@ -43,20 +54,35 @@ Beacon is an open-source memory layer for AI coding agents that learns from your
 
 ---
 
+## 🎬 Demo
+
+https://github.com/user-attachments/assets/38995612-84e9-4989-a905-0099f77955f0
+
+---
+
 ## 🚀 Quick Start
 
 Beacon is open source and local-first. Interactive endpoint setup signs in through
 beacon.sh and preselects Beacon Cloud, with an explicit Local opt-out. Signing in
 forwards nothing; confirming Managed installs Beacon and connects this machine in
-the same command, and the confirm screen says so before you accept. System, package,
-MDM, and CI installation paths remain noninteractive and account-free.
+the same command, and the confirm screen says so before you accept. Setup then ends
+on a short summary and opens the hosted dashboard at
+[beacon.sh/dashboard](https://beacon.sh/dashboard). System, package, MDM, and CI
+installation paths remain noninteractive and account-free.
 
 ### 1. Install Beacon
+
+**Copy & paste setup prompt into your coding agent**
+
+```text
+Read https://beacon.sh/start.md then set me up on Beacon
+```
 
 <details open>
 <summary><strong>macOS</strong></summary>
 
 ```bash
+brew update
 brew trust asymptote-labs/tap
 brew tap asymptote-labs/tap
 brew install beacon
@@ -102,7 +128,7 @@ grep "  ${PKG}$" checksums.txt | sha256sum --check - && \
 sudo apt install "./${PKG}"   # or: sudo dnf install "./${PKG}"
 ```
 
-`checksums.txt` is published with the release, so it catches a corrupted or swapped download but does not prove who built the release. If that matters to you, pin `VERSION` to a release you have reviewed instead of following `latest`. To install without root, use the tarball in user mode ([Linux install guide](https://docs.asymptotelabs.ai/platforms/linux#without-root-or-without-a-package-manager)).
+`checksums.txt` on its own catches a corrupted download but does not prove who built the release. From 1.3.57 on, `checksums.txt.sig` signs it with Beacon's Linux release key (fingerprint `07BEA34ED6A411F4C066D98322F94195DCDC8F45`), which `install.sh` checks; the [Linux install guide](https://docs.asymptotelabs.ai/platforms/linux#release-signing) shows how to check it by hand and how to install from the signed apt repository instead. You can also verify the package's build-provenance attestation, which shows it was built by this repository's release workflow: `gh attestation verify "${PKG}" --repo asymptote-labs/agent-beacon`. You can also pin `VERSION` to a release you have reviewed instead of following `latest`. To install without root, use the tarball in user mode ([Linux install guide](https://docs.asymptotelabs.ai/platforms/linux#without-root-or-without-a-package-manager)).
 
 </details>
 
@@ -149,12 +175,20 @@ Or inspect the raw event stream:
 
 > [!NOTE]
 > Signing in does not enable forwarding. Confirming the preselected Beacon Cloud
-> option does: the wizard says so on the confirm screen, names what your chosen
-> privacy mode sends, and connects the endpoint after the install succeeds. Choose
-> Local to keep everything on this machine, and disconnect any time with
-> `beacon endpoint disconnect`.
+> option does: the confirm screen names the signed-in account, states that
+> confirming installs Beacon and starts forwarding, names Asymptote Labs as the
+> operator, the destination, and the capture mode, and connects the endpoint
+> after the install succeeds. Choose Local to keep everything on this machine,
+> and disconnect any time with `beacon endpoint disconnect`.
 
-If this endpoint forwards to Beacon Cloud, your agents can search that history over MCP:
+Whichever destination you choose, the wizard also installs the
+[Beacon Skills](https://docs.beacon.sh/concepts/beacon-skills) into `~/.agents/skills`
+and `~/.claude/skills` unless you turn them off; redo or undo that with
+`beacon skills install|uninstall`.
+
+If you choose Beacon Cloud, the wizard also registers Beacon Cloud MCP in your harnesses
+unless you turn it off, so your agents can search the forwarded history. To do it later,
+or for an endpoint connected another way:
 
 ```bash
 beacon mcp connect
@@ -255,6 +289,18 @@ beacon endpoint dashboard
 ```
 
 Use it to explore session history across harnesses and understand what your agents actually did.
+Open the URL it prints: it carries a secret for that run, so other accounts on a shared machine
+cannot read your log through the port. Administrators can turn the dashboard off for everyone
+with `beacon endpoint install|repair --system --dashboard disabled` (`BEACON_DASHBOARD=disabled`
+for package installs).
+
+Each session page can also show **lenses**: purpose-built views of one trace, such as files
+changed with their diffs, an itemized token bill, a security review grouped by risk, or the
+approval timeline. A lens is a single HTML file running in a sandboxed frame with no access to
+Beacon or the dashboard and no ordinary network APIs, so you can have your coding agent write
+your own (`beacon lenses spec`, `lint`, `preview`, `add`). The sandbox cannot block every way a
+browser can send data out, so install only lenses you trust with your traces. See
+[Lenses](https://docs.beacon.sh/concepts/lenses).
 
 The underlying JSONL remains directly accessible, so you're never dependent on the UI.
 
@@ -268,7 +314,7 @@ Beacon supports local agents, browser agents, cloud agents, CI workflows, and ag
 
 | Runtime | Collection | Session | Prompt | Tool | Command | File | Approval | MCP | Tokens | Skills |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Antigravity CLI | Hooks | ✅ | ✅ | ✅ | ✅ | ✅ | – | – | – | ✅ skills CLI |
+| Antigravity CLI | Hooks + poll | ✅ | ✅ | ✅ | ✅ | ✅ | – | – | ✅ | ✅ skills CLI |
 | Claude Code | OTLP + hooks + poll | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ Plugin |
 | Claude Cowork | OTLP | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ Plugin |
 | Cline | Plugin + poll | ✅ | ✅ | ✅ | ✅ | ✅ | – | ✅ | ✅ | ✅ `.cline/skills` |
@@ -276,7 +322,7 @@ Beacon supports local agents, browser agents, cloud agents, CI workflows, and ag
 | Codex Desktop | OTLP | ✅ | ✅ | ✅ | ✅ | – | ✅ | – | ✅ | ✅ Plugin |
 | Cursor | Hooks + poll | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | – | ✅ Plugin |
 | DeepSeek Harness | Hooks + poll | ✅ | ✅ | ✅ | ✅ | ✅ | – | ✅ | ✅ | ✅ `.agents/skills` |
-| Devin CLI | Hooks | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | – | ✅ Plugin |
+| Devin CLI | Hooks + poll | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ Plugin |
 | Devin Desktop | Hooks | – | ✅ | ✅ | ✅ | ✅ | – | ✅ | – | ✅ via Devin CLI |
 | Factory Droid | OTLP + hooks + poll | ✅ | ✅ | ✅ | – | ✅ | ✅ | – | – | ✅ Plugin |
 | fx (Vercel Labs) | Poll | ✅ | ✅ | ✅ | ✅ | ✅ | – | ✅ | ✅ | ✅ `/skills install` |
@@ -333,6 +379,12 @@ The [Beacon Skills page](https://docs.beacon.sh/concepts/beacon-skills#install) 
 | Claude Agent SDK | `Observe.wrapClaudeAgentQuery()` | Query root spans with Beacon-compatible prompt attributes |
 | Vercel AI SDK | `experimental_telemetry` tracer handoff | Model call and tool spans where telemetry is enabled |
 
+### LLM Gateways
+
+| Gateway | Collection | Captures |
+| --- | --- | --- |
+| LiteLLM, Envoy (incl. Envoy Gateway, Istio), Portkey | [`beacon-gateway`](gateway/README.md) hook adapter | Prompts, responses, tool calls, and token usage for every model call routed through the gateway |
+
 ---
 
 ## Output Destinations
@@ -371,7 +423,8 @@ Local agents ───────┐
 Browser chat ───────┤
 CI ─────────────────┼──→ Beacon ──→ unified session history
 Cloud agents ───────┤                    │
-Agent SDKs ─────────┘                    ├──→ local JSONL
+Agent SDKs ─────────┤                    ├──→ local JSONL
+LLM gateways ───────┘                    │
                                          ├──→ reviewed memory
                                          ├──→ MCP / Agent Skills
                                          └──→ your own infrastructure

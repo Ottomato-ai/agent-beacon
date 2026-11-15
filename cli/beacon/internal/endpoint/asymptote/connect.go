@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/atomicfile"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/auth"
 	endpointconfig "github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/config"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/service"
@@ -24,6 +25,7 @@ type Forwarder interface {
 	Label() string
 	UnitPath() (string, error)
 	WriteUnit(vectorBin, configPath string) (string, error)
+	UnitCurrent(vectorBin, configPath string) (bool, error)
 	Load() error
 	Unload() error
 	RemoveUnits()
@@ -49,9 +51,26 @@ type ConnectOptions struct {
 	InstallID string
 	// PrivacyMode controls the Vector-side transform before managed upload.
 	PrivacyMode string
-	Out         io.Writer
+	// Backfill, when set, ships recent session history on this connect, first or not. Nil ships
+	// nothing recorded before the connection point.
+	Backfill *ConnectBackfill
+	Out      io.Writer
+	// Quiet leaves the progress lines (which Vector was found, that the account authorized the
+	// device) out of Out and keeps the warnings, for a caller that closes on a summary of its own.
+	Quiet bool
 	// Now is injectable for tests.
 	Now func() time.Time
+}
+
+// ConnectBackfill is the bounded session backfill a connect ships. Neither step can fail
+// the connect: a backfill that could not be staged leaves a working forwarder, and says so.
+type ConnectBackfill struct {
+	// Sync reads the agents' session stores into the runtime log, so the backfill covers what
+	// they wrote since install. It runs before enrollment, so it never delays a step that holds a
+	// freshly issued key. Nil skips it.
+	Sync func() error
+	// Options bounds what StageBackfill copies.
+	Options BackfillOptions
 }
 
 // ConnectResult reports what Connect wrote and where telemetry now goes.
@@ -63,6 +82,8 @@ type ConnectResult struct {
 	Forwarder      string         `json:"forwarder"`
 	ReEnrolled     bool           `json:"re_enrolled"`
 	ForwarderState service.Status `json:"forwarder_state"`
+	// Backfill reports the session history staged for upload; nil when none was.
+	Backfill *BackfillResult `json:"backfill,omitempty"`
 }
 
 // Connect enrolls this machine and starts the forwarder.
@@ -83,6 +104,10 @@ func Connect(ctx context.Context, opts ConnectOptions) (_ *ConnectResult, err er
 	out := opts.Out
 	if out == nil {
 		out = io.Discard
+	}
+	progress := out
+	if opts.Quiet {
+		progress = io.Discard
 	}
 	now := opts.Now
 	if now == nil {
@@ -124,7 +149,7 @@ func Connect(ctx context.Context, opts ConnectOptions) (_ *ConnectResult, err er
 	if err != nil {
 		return nil, err
 	}
-	fmt.Fprintf(out, "Using Vector %s at %s\n", vector.Version, vector.Path)
+	fmt.Fprintf(progress, "Using Vector %s at %s\n", vector.Version, vector.Path)
 
 	previous, err := LoadEnrollment(opts.UserMode)
 	if err != nil && !errors.Is(err, ErrNotEnrolled) {
@@ -167,6 +192,14 @@ func Connect(ctx context.Context, opts ConnectOptions) (_ *ConnectResult, err er
 		return nil, err
 	}
 
+	// The session-store sweep is local and can take a while on a machine with a lot of history,
+	// so it runs here, after every check that could refuse the connect and before a key exists.
+	if opts.Backfill != nil && opts.Backfill.Sync != nil {
+		if err := opts.Backfill.Sync(); err != nil {
+			fmt.Fprintf(out, "Session backfill: %v\n", err)
+		}
+	}
+
 	// Pin the id before the dashboard learns it, so a failure after approval retries as
 	// the same device.
 	if err := WriteInstallID(opts.UserMode, installID); err != nil {
@@ -205,9 +238,9 @@ func Connect(ctx context.Context, opts ConnectOptions) (_ *ConnectResult, err er
 		return nil, fmt.Errorf("could not record that connect is in progress: %w", err)
 	}
 	if opts.AccountEnroll != nil {
-		fmt.Fprintf(out, "Account authorized device enrollment for %s (device %s, key %s)\n", displayOrg(result), result.DeviceID, result.KeyPrefix)
+		fmt.Fprintf(progress, "Account authorized device enrollment for %s (device %s, key %s)\n", displayOrg(result), result.DeviceID, result.KeyPrefix)
 	} else {
-		fmt.Fprintf(out, "Approved for %s (device %s, key %s)\n", displayOrg(result), result.DeviceID, result.KeyPrefix)
+		fmt.Fprintf(progress, "Approved for %s (device %s, key %s)\n", displayOrg(result), result.DeviceID, result.KeyPrefix)
 	}
 
 	// Secrets first, then the config that references them, then the unit that runs it.
@@ -240,6 +273,7 @@ func Connect(ctx context.Context, opts ConnectOptions) (_ *ConnectResult, err er
 		return nil, err
 	}
 
+	dropStaged := false
 	if previous != nil {
 		previousMode, _ := managedprivacy.Normalize(previous.PrivacyMode)
 		if previousMode != privacyMode {
@@ -252,9 +286,34 @@ func Connect(ctx context.Context, opts ConnectOptions) (_ *ConnectResult, err er
 			if err := os.MkdirAll(dataDir, 0o700); err != nil {
 				return nil, err
 			}
+			// The buffer held lines in the old mode; the old staged copy goes with it. It stays
+			// linked until the restage below renames the new-mode copy over it, so that copy
+			// always gets a new inode for the inode-fingerprinted backfill source. Removing it
+			// first would free the inode for the restage to reuse.
+			dropStaged = true
 		}
 	}
-	if err := writeFileAtomic(configPath, []byte(rendered), 0o644); err != nil {
+	// Staged before the forwarder (re)starts, so on a first connect the runtime source's connection
+	// point falls after every line staged here. A re-connect stages too: the runtime source resumes
+	// from its checkpoint, and the backfill source reads the restaged file as a new one, so history
+	// the agents wrote while the endpoint was not connected, or before a system endpoint could read
+	// it, still arrives. Lines the forwarder already shipped carry the same deterministic event.id.
+	var backfill *BackfillResult
+	if opts.Backfill != nil {
+		staged, err := StageBackfill(logPath, opts.Backfill.Options)
+		if err != nil {
+			fmt.Fprintf(out, "Session backfill was not staged: %v\n", err)
+		} else {
+			backfill = &staged
+		}
+	}
+	if dropStaged && (backfill == nil || backfill.Events == 0) {
+		// Nothing replaced the old-mode copy, so delete it rather than ship it.
+		if err := RemoveBackfill(logPath); err != nil {
+			return nil, fmt.Errorf("could not remove the staged session backfill: %w", err)
+		}
+	}
+	if err := atomicfile.Write(configPath, []byte(rendered), 0o644); err != nil {
 		return nil, err
 	}
 	firstConnectForwarderTouched = !reconnect
@@ -310,6 +369,7 @@ func Connect(ctx context.Context, opts ConnectOptions) (_ *ConnectResult, err er
 		Forwarder:      manager.Label(),
 		ReEnrolled:     previous != nil,
 		ForwarderState: manager.Status(),
+		Backfill:       backfill,
 	}, nil
 }
 
@@ -351,6 +411,9 @@ func Disconnect(opts DisconnectOptions) error {
 			problems = append(problems, fmt.Errorf("stop forwarder: %w", err))
 		}
 		manager.RemoveUnits()
+	}
+	if err := RemoveBackfill(opts.LogPath); err != nil {
+		problems = append(problems, fmt.Errorf("remove staged session backfill: %w", err))
 	}
 	if err := RemoveState(opts.UserMode, opts.KeepCredentials); err != nil {
 		problems = append(problems, fmt.Errorf("remove %s: %w", Dir(opts.UserMode), err))

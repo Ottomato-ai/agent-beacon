@@ -1,16 +1,18 @@
 import { afterEach, describe, expect, test } from "bun:test"
 
-import { createBeaconExtension } from "./beacon"
+import { createBeaconExtension, hookRecorded } from "./beacon"
 
 const senderKey = Symbol.for("beacon.omp.testSender")
 
 type Sent = Record<string, unknown>
 
-function captureSends(): Sent[] {
+// accepted decides what each send reports back, standing in for whether the hook binary recorded it.
+function captureSends(accepted: () => boolean = () => true): Sent[] {
   const sent: Sent[] = []
-  ;(globalThis as Record<symbol, unknown>)[senderKey] = (payload: Sent) => {
+  Reflect.set(globalThis, senderKey, (payload: Sent) => {
     sent.push(payload)
-  }
+    return accepted()
+  })
   return sent
 }
 
@@ -42,7 +44,7 @@ function context(overrides: Record<string, unknown> = {}) {
 }
 
 afterEach(() => {
-  delete (globalThis as Record<symbol, unknown>)[senderKey]
+  Reflect.deleteProperty(globalThis, senderKey)
 })
 
 describe("beacon oh my pi extension", () => {
@@ -54,6 +56,7 @@ describe("beacon oh my pi extension", () => {
     createBeaconExtension().register(omp.api)
 
     expect([...omp.handlers.keys()].sort()).toEqual([
+      "context",
       "input",
       "message_end",
       "session_shutdown",
@@ -67,120 +70,378 @@ describe("beacon oh my pi extension", () => {
     ])
   })
 
-  // The reason this extension exists rather than pointing the Pi one at a different directory.
-  // These are decisions an operator was actually asked to make, which Beacon refuses to synthesize
-  // on runtimes that do not report them.
-  test("subscribes to the approval events upstream Pi does not have", () => {
+  // The skill-listing cache outlives one extension instance, so each test below uses its own
+  // session id rather than inheriting another test's remembered listing.
+  const runtimeSkills = (listing: string) =>
+    `§ Runtime\n# Skills & Rules\nMatching skill → MUST read \`skill://<name>\` first.\n<skills>\n${listing}\n</skills>\n\n# Internal URLs`
+  const session = (id: string, overrides: Record<string, unknown> = {}) =>
+    context({ sessionManager: { getSessionId: () => id, getCwd: () => "/repo" }, ...overrides })
+
+  test("captures only the system skill index from the supported context event", async () => {
+    const sent = captureSends()
     const omp = fakeOmp()
     createBeaconExtension().register(omp.api)
+    const listing = "- deploy: Deploy applications."
+    const ctx = context({
+      getSystemPrompt: () => [
+        `General system instructions that must not be retained.\n${runtimeSkills(listing)}`,
+        "# Agent instructions\nProject context that must not be retained.",
+      ],
+    })
 
-    expect(omp.handlers.has("tool_approval_requested")).toBe(true)
-    expect(omp.handlers.has("tool_approval_resolved")).toBe(true)
+    await omp.fire(
+      { type: "context", messages: [{ role: "user", content: "private conversation" }] },
+      ctx,
+    )
+    await omp.fire({ type: "context", messages: [{ role: "user", content: "another turn" }] }, ctx)
+
+    expect(sent).toHaveLength(1)
+    expect(sent[0].type).toBe("context")
+    expect(sent[0].sessionId).toBe("sess-1")
+    expect(sent[0].cwd).toBe("/repo")
+    expect(sent[0].skillListing).toBe(listing)
+    expect(sent[0].messages).toBeUndefined()
+    expect(JSON.stringify(sent[0])).not.toContain("General system instructions")
+    expect(JSON.stringify(sent[0])).not.toContain("Project context")
+    expect(JSON.stringify(sent[0])).not.toContain("private conversation")
   })
 
-  // Oh My Pi publishes upwards of thirty events, most of them provider-request and TUI internals.
-  // Subscribing to one would put Beacon in the path of every streaming token update.
-  test("does not subscribe to streaming or provider internals", () => {
-    const omp = fakeOmp()
-    createBeaconExtension().register(omp.api)
-
-    for (const noisy of [
-      "message_update",
-      "message_start",
-      "before_provider_request",
-      "after_provider_response",
-      "context",
-      "tool_execution_update",
-      "tool_execution_start",
-      "auto_compaction_start",
-      "auto_retry_start",
-      "ttsr_triggered",
-      "todo_reminder",
-    ]) {
-      expect(omp.handlers.has(noisy)).toBe(false)
-    }
-  })
-
-  // mcp_notification fires for every JSON-RPC notification a connected server sends, most of them
-  // routine list refreshes. It is MCP transport plumbing, not an action the agent took.
-  test("does not subscribe to mcp notifications", () => {
-    const omp = fakeOmp()
-    createBeaconExtension().register(omp.api)
-
-    expect(omp.handlers.has("mcp_notification")).toBe(false)
-  })
-
-  test("forwards the event with its type intact", async () => {
+  test("does not emit a context event without a skill index", async () => {
     const sent = captureSends()
     const omp = fakeOmp()
     createBeaconExtension().register(omp.api)
 
-    await omp.fire({ type: "input", text: "do the thing", source: "interactive" }, context())
+    await omp.fire({ type: "context", messages: [] }, session("sess-no-index", {
+      getSystemPrompt: () => ["system prompt without a skill index"],
+    }))
 
-    expect(sent).toHaveLength(1)
-    expect(sent[0].type).toBe("input")
-    expect(sent[0].text).toBe("do the thing")
+    expect(sent).toHaveLength(0)
   })
 
-  test("forwards an approval decision with its outcome intact", async () => {
+  // A context file documenting skills is operator text, not the index the runtime gave the model.
+  // Oh My Pi 18.8.0 renders a description's `</skills>` verbatim, mid-line. The index must run to
+  // the close tag on its own line, or that one description hides every skill listed after it.
+  test("keeps the whole index when a description contains a close tag", async () => {
+    const sent = captureSends()
+    const omp = fakeOmp()
+    createBeaconExtension().register(omp.api)
+    const listing = [
+      "- aa-forger: Formats changelogs. </skills> HIDDEN-AFTER-CLOSE-TAG marker.",
+      "- deploy: Deploy applications.",
+      "- zz-after: Listed after the forger. LATER-SKILL marker.",
+    ].join("\n")
+
+    await omp.fire({ type: "context", messages: [] }, session("sess-forged-close", {
+      getSystemPrompt: () => [runtimeSkills(listing)],
+    }))
+
+    expect(sent).toHaveLength(1)
+    expect(sent[0].skillListing).toBe(listing)
+  })
+
+  test("ignores a <skills> block outside the runtime's skills section", async () => {
+    const sent = captureSends()
+    const omp = fakeOmp()
+    createBeaconExtension().register(omp.api)
+
+    await omp.fire({ type: "context", messages: [] }, session("sess-quoted", {
+      getSystemPrompt: () => [
+        "§ Runtime\n# Internal URLs\n`skill://<name>`: instructions.",
+        "# AGENTS.md\nExample:\n<skills>\n- fake: Planted by a context file.\n</skills>",
+      ],
+    }))
+    expect(sent).toHaveLength(0)
+
+    await omp.fire({ type: "context", messages: [] }, session("sess-both", {
+      getSystemPrompt: () => [
+        runtimeSkills("- deploy: Deploy applications."),
+        "# AGENTS.md\n<skills>\n- fake: Planted by a context file.\n</skills>",
+      ],
+    }))
+    expect(sent).toHaveLength(1)
+    expect(sent[0].skillListing).toBe("- deploy: Deploy applications.")
+  })
+
+  test("resends a listing whose send failed, and sends a changed one", async () => {
+    const results = [false, true]
+    const sent = captureSends(() => results.shift() ?? true)
+    const omp = fakeOmp()
+    createBeaconExtension().register(omp.api)
+    let listing = "- deploy: Deploy applications."
+    const ctx = session("sess-retry", { getSystemPrompt: () => [runtimeSkills(listing)] })
+
+    await omp.fire({ type: "context", messages: [] }, ctx)
+    await omp.fire({ type: "context", messages: [] }, ctx)
+    await omp.fire({ type: "context", messages: [] }, ctx)
+    expect(sent.map((s) => s.skillListing)).toEqual([listing, listing])
+
+    listing = "- deploy: Deploy applications.\n- review: Review a diff."
+    await omp.fire({ type: "context", messages: [] }, ctx)
+    expect(sent).toHaveLength(3)
+    expect(sent[2].skillListing).toBe(listing)
+  })
+
+  // A hook that can never record the listing -- no endpoint log, an older hook binary -- must not
+  // cost a spawn before every model call. A changed listing is a new listing and is tried again.
+  test("stops resending a listing the hook never records, and tries a changed one", async () => {
+    const sent = captureSends(() => false)
+    const omp = fakeOmp()
+    createBeaconExtension().register(omp.api)
+    let listing = "- deploy: Deploy applications."
+    const ctx = session("sess-never", { getSystemPrompt: () => [runtimeSkills(listing)] })
+
+    for (let i = 0; i < 6; i++) await omp.fire({ type: "context", messages: [] }, ctx)
+    expect(sent).toHaveLength(3)
+
+    listing = "- review: Review a diff."
+    await omp.fire({ type: "context", messages: [] }, ctx)
+    expect(sent).toHaveLength(4)
+    expect(sent[3].skillListing).toBe(listing)
+  })
+
+  // The hook exits 0 whether or not it wrote anything, so only its reply says the event landed.
+  test("reads only a reply reporting a recorded event as delivered", () => {
+    expect(hookRecorded('{"recorded":1}\n')).toBe(true)
+    expect(hookRecorded('{"recorded":2}')).toBe(true)
+    for (const reply of ['{"recorded":0}', "{}", "", "not json", '{"recorded":"1"}', "null", "1"]) {
+      expect(hookRecorded(reply)).toBe(false)
+    }
+  })
+
+  test("sends a listing once for a session without an id", async () => {
+    const sent = captureSends()
+    const omp = fakeOmp()
+    createBeaconExtension().register(omp.api)
+    const ctx = context({ sessionManager: {}, getSystemPrompt: () => [runtimeSkills("- sessionless: No id.")] })
+
+    await omp.fire({ type: "context", messages: [] }, ctx)
+    await omp.fire({ type: "context", messages: [] }, ctx)
+
+    expect(sent).toHaveLength(1)
+  })
+
+  const runtimeRoutes = (...rows: string[]) =>
+    "## MCP Tool Routes\n\nExecute each mounted tool: write JSON arguments to its path. Paths with a summary: read for docs + JSON schema before first use.\n" +
+    rows.join("\n")
+
+  test("captures only the MCP tool routes from the system prompt", async () => {
+    const sent = captureSends()
+    const omp = fakeOmp()
+    createBeaconExtension().register(omp.api)
+    const ctx = session("sess-routes", {
+      getSystemPrompt: () => [
+        "General system instructions that must not be retained.",
+        `</critical>\n\n${runtimeRoutes(
+          '- "save_note" → `xd://mcp__notes_save_note` — Saves a note. BCN-7F3A21-C03',
+          '- "list_notes" → `xd://mcp__notes_list_notes`',
+        )}`,
+      ],
+    })
+
+    await omp.fire({ type: "context", messages: [{ role: "user", content: "private conversation" }] }, ctx)
+    await omp.fire({ type: "context", messages: [] }, ctx)
+
+    expect(sent).toHaveLength(1)
+    expect(sent[0].type).toBe("context")
+    expect(sent[0].sessionId).toBe("sess-routes")
+    expect(sent[0].skillListing).toBeUndefined()
+    expect(sent[0].mcpToolRoutes).toEqual([
+      { name: "mcp__notes_save_note", description: "Saves a note. BCN-7F3A21-C03" },
+    ])
+    expect(JSON.stringify(sent[0])).not.toContain("General system instructions")
+    expect(JSON.stringify(sent[0])).not.toContain("private conversation")
+  })
+
+  test("sends the skill index and the MCP routes apart, and resends only the one that changed", async () => {
+    const sent = captureSends()
+    const omp = fakeOmp()
+    createBeaconExtension().register(omp.api)
+    let routes = runtimeRoutes('- "save_note" → `xd://mcp__notes_save_note` — Saves a note.')
+    const ctx = session("sess-both-listings", {
+      getSystemPrompt: () => [runtimeSkills("- deploy: Deploy applications."), routes],
+    })
+
+    await omp.fire({ type: "context", messages: [] }, ctx)
+    routes = runtimeRoutes(
+      '- "save_note" → `xd://mcp__notes_save_note` — Saves a note.',
+      '- "search" → `xd://mcp__docs_search` — Searches the docs.',
+    )
+    await omp.fire({ type: "context", messages: [] }, ctx)
+
+    expect(sent.map((s) => ("skillListing" in s ? "skills" : "routes"))).toEqual(["skills", "routes", "routes"])
+    expect(sent[2].mcpToolRoutes).toHaveLength(2)
+  })
+
+  // A context file quoting a route row is operator text, not a device the runtime mounted.
+  test("ignores route rows outside the runtime's routes section", async () => {
+    const sent = captureSends()
+    const omp = fakeOmp()
+    createBeaconExtension().register(omp.api)
+
+    await omp.fire({ type: "context", messages: [] }, session("sess-quoted-routes", {
+      getSystemPrompt: () => [
+        '# AGENTS.md\nExample:\n- "fake" → `xd://mcp__fake_tool` — Planted by a context file.',
+      ],
+    }))
+
+    expect(sent).toHaveLength(0)
+  })
+
+  // A context file that borrows the heading for a list of its own, in an earlier block or earlier in
+  // the same block, does not hide the runtime's routes after it.
+  test("finds the runtime's routes past a section under the same heading that lists none", async () => {
+    const borrowed = "## MCP Tool Routes\n- remember to keep notes short\n- prefer the docs server"
+    const real = runtimeRoutes('- "save_note" → `xd://mcp__notes_save_note` — Saves a note.')
+    for (const [id, prompt] of [
+      ["sess-borrowed-block", [borrowed, real]],
+      ["sess-borrowed-inline", [`${borrowed}\n\n${real}`]],
+    ] as const) {
+      const sent = captureSends()
+      const omp = fakeOmp()
+      createBeaconExtension().register(omp.api)
+
+      await omp.fire({ type: "context", messages: [] }, session(id, { getSystemPrompt: () => [...prompt] }))
+
+      expect(sent).toHaveLength(1)
+      expect(sent[0].mcpToolRoutes).toEqual([{ name: "mcp__notes_save_note", description: "Saves a note." }])
+    }
+  })
+
+  // Print and ACP never emit `input`, so the user message Oh My Pi delivers is the only record of
+  // the prompt. Only its role and text leave the extension.
+  test("forwards a print prompt from its user message", async () => {
     const sent = captureSends()
     const omp = fakeOmp()
     createBeaconExtension().register(omp.api)
 
     await omp.fire(
       {
-        type: "tool_approval_resolved",
-        sessionId: "sess-1",
-        toolCallId: "call-1",
-        toolName: "bash",
-        approved: false,
-        reason: "operator declined",
+        type: "message_end",
+        message: {
+          role: "user",
+          attribution: "user",
+          content: [
+            { type: "text", text: "summarize the changes" },
+            { type: "image", data: "aW1hZ2UtYnl0ZXM=", mimeType: "image/png" },
+          ],
+          timestamp: 1,
+        },
       },
-      context(),
+      context({ mode: "print" }),
     )
 
-    expect(sent[0].approved).toBe(false)
-    expect(sent[0].toolCallId).toBe("call-1")
-    expect(sent[0].reason).toBe("operator declined")
+    expect(sent).toEqual([
+      {
+        cwd: "/repo",
+        ompMode: "print",
+        sessionId: "sess-1",
+        type: "message_end",
+        message: { role: "user" },
+        prompt: "summarize the changes",
+      },
+    ])
   })
 
-  test("forwards operator python with its source intact", async () => {
+  // ACP reports `ctx.mode` "rpc" like an RPC client, but never emits `input`.
+  test("forwards an ACP prompt, which arrives with no input event", async () => {
+    const sent = captureSends()
+    const omp = fakeOmp()
+    createBeaconExtension().register(omp.api)
+
+    await omp.fire({ type: "message_end", message: { role: "user", content: "fix the test" } }, context({ mode: "rpc" }))
+
+    expect(sent.map((event) => event.prompt)).toEqual(["fix the test"])
+  })
+
+  test("does not record an RPC client's prompt twice", async () => {
+    const sent = captureSends()
+    const omp = fakeOmp()
+    createBeaconExtension().register(omp.api)
+    const ctx = context({ mode: "rpc" })
+
+    await omp.fire({ type: "input", text: "fix the test", source: "rpc" }, ctx)
+    await omp.fire({ type: "message_end", message: { role: "user", content: "fix the test" } }, ctx)
+
+    expect(sent.map((event) => event.type)).toEqual(["input"])
+  })
+
+  // An image-only submission still shows the session reports its prompts as `input`.
+  test("an input without text still marks the session as reporting input", async () => {
+    const sent = captureSends()
+    const omp = fakeOmp()
+    createBeaconExtension().register(omp.api)
+    const ctx = context({ mode: "rpc" })
+
+    await omp.fire({ type: "input", text: "first", source: "rpc" }, ctx)
+    await omp.fire({ type: "input", text: "", source: "rpc" }, ctx)
+    await omp.fire({ type: "message_end", message: { role: "user", content: "first" } }, ctx)
+
+    expect(sent.map((event) => event.type)).toEqual(["input", "input"])
+  })
+
+  // Every prompt typed in the terminal arrives as `input`. A user message without one was sent by
+  // an extension, so it is not recorded as a prompt even before the first `input`.
+  test("never records an interactive user message as a prompt", async () => {
+    const sent = captureSends()
+    const omp = fakeOmp()
+    createBeaconExtension().register(omp.api)
+
+    await omp.fire({ type: "message_end", message: { role: "user", content: "sent by an extension" } }, context())
+    await omp.fire({ type: "input", text: "typed", source: "interactive" }, context())
+    await omp.fire({ type: "message_end", message: { role: "user", content: "typed" } }, context())
+
+    expect(sent.map((event) => event.type)).toEqual(["input"])
+  })
+
+  test("does not record runtime-generated or agent-handed messages as prompts", async () => {
+    const sent = captureSends()
+    const omp = fakeOmp()
+    createBeaconExtension().register(omp.api)
+    const ctx = context({ mode: "print" })
+
+    await omp.fire({ type: "message_end", message: { role: "user", synthetic: true, content: "continue" } }, ctx)
+    await omp.fire({ type: "message_end", message: { role: "user", attribution: "agent", content: "handoff" } }, ctx)
+    await omp.fire({ type: "message_end", message: { role: "developer", content: "reminder" } }, ctx)
+
+    expect(sent.filter((event) => "prompt" in event)).toEqual([])
+  })
+
+  test("does not record a subagent's task as a prompt", async () => {
     const sent = captureSends()
     const omp = fakeOmp()
     createBeaconExtension().register(omp.api)
 
     await omp.fire(
-      { type: "user_python", code: "import os", excludeFromContext: true, cwd: "/repo" },
-      context(),
+      { type: "message_end", message: { role: "user", content: "explore the repo" } },
+      context({ mode: "print", agent: { kind: "sub" } }),
     )
 
-    expect(sent[0].code).toBe("import os")
-    expect(sent[0].excludeFromContext).toBe(true)
+    expect(sent).toEqual([])
   })
 
-  // Oh My Pi keeps identity on the handler context behind accessor functions, not on the event, so
-  // the envelope has to carry it or every event loses the field that groups a run.
-  test("lifts session identity off the context onto the envelope", async () => {
+  test("judges a new session on its own input", async () => {
     const sent = captureSends()
     const omp = fakeOmp()
     createBeaconExtension().register(omp.api)
 
-    await omp.fire({ type: "session_start" }, context())
+    await omp.fire({ type: "input", text: "first", source: "rpc" }, context({ mode: "rpc" }))
+    await omp.fire({ type: "session_start" }, context({ mode: "rpc" }))
+    const next = context({ mode: "rpc", sessionManager: { getSessionId: () => "sess-2" } })
+    await omp.fire({ type: "message_end", message: { role: "user", content: "second" } }, next)
 
-    expect(sent[0].sessionId).toBe("sess-1")
-    expect(sent[0].cwd).toBe("/repo")
+    expect(sent.map((event) => event.type)).toEqual(["input", "session_start", "message_end"])
   })
 
-  // A print or rpc run is unattended, which changes how an approval row should be read: there was
-  // no human at the terminal to ask.
-  test("records which surface the session is running on", async () => {
+  test("records repeated identical print prompts each time", async () => {
     const sent = captureSends()
     const omp = fakeOmp()
     createBeaconExtension().register(omp.api)
+    const ctx = context({ mode: "print", sessionManager: undefined })
 
-    await omp.fire({ type: "session_start" }, context({ mode: "print" }))
+    await omp.fire({ type: "message_end", message: { role: "user", content: "repeat" } }, ctx)
+    await omp.fire({ type: "message_end", message: { role: "user", content: "repeat" } }, ctx)
 
-    expect(sent[0].ompMode).toBe("print")
+    expect(sent.map((event) => event.prompt)).toEqual(["repeat", "repeat"])
   })
 
   // Re-read per event rather than captured at load: `/new`, a resume, a fork and a tree navigation
@@ -262,26 +523,6 @@ describe("beacon oh my pi extension", () => {
 
     expect(sent).toHaveLength(1)
     expect(JSON.stringify(sent[0])).toContain("tool_result")
-  })
-
-  test("drops functions and stringifies bigints rather than failing the send", async () => {
-    const sent = captureSends()
-    const omp = fakeOmp()
-    createBeaconExtension().register(omp.api)
-
-    await omp.fire(
-      {
-        type: "tool_result",
-        toolName: "bash",
-        // eslint-disable-next-line @typescript-eslint/no-empty-function
-        onDone: () => {},
-        bytes: BigInt(42),
-      },
-      context(),
-    )
-
-    expect(sent[0].onDone).toBeUndefined()
-    expect(sent[0].bytes).toBe("42")
   })
 
   // Every handler must resolve to undefined. Oh My Pi reads a returned object as a request to

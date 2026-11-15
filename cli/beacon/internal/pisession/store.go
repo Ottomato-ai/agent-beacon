@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/homepath"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/sessionfs"
 	"io"
 	"io/fs"
 	"os"
@@ -72,8 +74,20 @@ func defaultAgentDir() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve home directory: %w", err)
 	}
+	return AgentDir(home)
+}
+
+// AgentDir resolves Pi's user agent directory for home, the way Pi does: PI_CODING_AGENT_DIR,
+// trimmed and with a leading `~` expanded against home, or ~/.pi/agent. Pi keeps its sessions and
+// its user extensions under it, so the session reader, the extension installer, discovery and
+// inventory all resolve it here.
+func AgentDir(home string) (string, error) {
 	if override := strings.TrimSpace(os.Getenv(piAgentDirEnv)); override != "" {
-		return expandTilde(override, home), nil
+		dir, err := homepath.ExpandTilde(override, home)
+		if err != nil {
+			return "", fmt.Errorf("resolve %s: %w", piAgentDirEnv, err)
+		}
+		return dir, nil
 	}
 	if strings.TrimSpace(home) == "" {
 		return "", errors.New("home directory is empty")
@@ -81,18 +95,8 @@ func defaultAgentDir() (string, error) {
 	return filepath.Join(home, ".pi", "agent"), nil
 }
 
-func expandTilde(path, home string) string {
-	if path == "~" {
-		return home
-	}
-	if strings.HasPrefix(path, "~/") || strings.HasPrefix(path, `~\`) {
-		return filepath.Join(home, filepath.FromSlash(path[2:]))
-	}
-	return path
-}
-
 func (s *Store) Exists() bool {
-	info, err := os.Stat(s.SessionsDir)
+	info, err := sessionfs.Stat(s.SessionsDir)
 	return err == nil && info.IsDir()
 }
 
@@ -103,7 +107,7 @@ func (s *Store) List() ([]SessionRef, error) {
 	}
 	refs := make([]SessionRef, 0, len(items))
 	for _, path := range items {
-		info, err := os.Stat(path)
+		info, err := sessionfs.Stat(path)
 		if err != nil || info.IsDir() {
 			continue
 		}
@@ -135,7 +139,7 @@ func listJSONL(root string) ([]string, error) {
 		return nil, nil
 	}
 	var out []string
-	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+	err := sessionfs.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
@@ -154,12 +158,12 @@ func listJSONL(root string) ([]string, error) {
 }
 
 func dirExists(path string) bool {
-	info, err := os.Stat(path)
+	info, err := sessionfs.Stat(path)
 	return err == nil && info.IsDir()
 }
 
 func readHeader(path string) map[string]interface{} {
-	file, err := os.Open(path)
+	file, err := sessionfs.Open(path)
 	if err != nil {
 		return nil
 	}
@@ -181,7 +185,7 @@ func readHeader(path string) map[string]interface{} {
 }
 
 func (s *Store) Read(ref SessionRef) ([]Entry, ReadStats, error) {
-	file, err := os.Open(ref.Path)
+	file, err := sessionfs.Open(ref.Path)
 	if err != nil {
 		return nil, ReadStats{}, err
 	}

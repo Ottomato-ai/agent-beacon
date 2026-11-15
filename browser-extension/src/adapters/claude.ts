@@ -2,13 +2,21 @@
 //
 // claude.ai streams Server-Sent Events whose `data:` payloads are Anthropic
 // streaming objects keyed by `type`:
-//   message_start { message: { model, usage:{input_tokens, cache_creation_input_tokens, cache_read_input_tokens} } }
+//   message_start { message: { model, usage:{input_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+//                   cache_creation?:{ephemeral_5m_input_tokens, ephemeral_1h_input_tokens}} } }
 //   content_block_start { index, content_block:{ type:'text'|'tool_use', id?, name? } }
 //   content_block_delta { index, delta:{ type:'text_delta', text } | { type:'input_json_delta', partial_json } }
 //   content_block_stop { index }
 //   message_delta { delta:{ stop_reason }, usage:{ output_tokens, ...possibly the input counts again } }
 //   message_stop
 // A legacy shape ({ completion: "…delta" }) is also tolerated.
+//
+// claude.ai adds blocks of its own: `tool_result` (content_block_start carrying
+// tool_use_id and the whole result as `content`, for tools it runs server side),
+// `thinking` with thinking_summary_delta, and citation deltas on text blocks,
+// plus `ping` and `message_limit` events. As of October 2026 it sends no
+// `usage` at all. The request body is {prompt, model, ...}, sent gzip-compressed;
+// the interceptor decompresses it (src/interceptor/request-body.ts).
 //
 // The exact claude.ai envelope must be confirmed against recorded live traffic
 // (the live-smoke drift alarm exists for exactly this); the parser is written
@@ -29,17 +37,18 @@ class ClaudeParser implements TurnParser {
   private inputTokens?: number;
   private outputTokens?: number;
   private cacheCreationInputTokens?: number;
+  private cacheCreation1hInputTokens?: number;
   private cacheReadInputTokens?: number;
   private startedAt = Date.now();
   private completedAt?: number;
-  private reqId: number;
+  private reqId: string;
   /** Stable per-turn id from message_start; used for turnId so ids don't collide
    *  across service-worker restarts (which reset the reqId counter). */
   private messageId = '';
   // tool_use blocks keyed by content-block index.
   private blocks = new Map<number, { type: string; tool?: ToolCall; argBuf: string }>();
 
-  constructor(reqId: number) {
+  constructor(reqId: string) {
     this.reqId = reqId;
   }
 
@@ -105,6 +114,12 @@ class ClaudeParser implements TurnParser {
         };
         if (cb.type === 'tool_use') {
           entry.tool = { id: String(cb.id ?? ''), name: String(cb.name ?? '') };
+        } else if (cb.type === 'tool_result') {
+          // claude.ai runs its tools (web search, weather, connectors) server
+          // side and streams each result whole, as its own block naming the
+          // tool_use it answers.
+          const call = this.toolCall(cb.tool_use_id);
+          if (call && cb.content !== undefined) call.result = cb.content;
         }
         this.blocks.set(obj.index ?? this.blocks.size, entry);
         break;
@@ -135,6 +150,12 @@ class ClaudeParser implements TurnParser {
     }
   }
 
+  private toolCall(id: unknown): ToolCall | undefined {
+    if (typeof id !== 'string' || id === '') return undefined;
+    for (const entry of this.blocks.values()) if (entry.tool?.id === id) return entry.tool;
+    return undefined;
+  }
+
   /** Merge the input-side counts of an Anthropic `usage` object into the turn.
    *
    *  Read from both `message_start` and `message_delta` because which of the two
@@ -154,6 +175,11 @@ class ClaudeParser implements TurnParser {
     if (typeof u.input_tokens === 'number') this.inputTokens = u.input_tokens;
     if (typeof u.cache_creation_input_tokens === 'number')
       this.cacheCreationInputTokens = u.cache_creation_input_tokens;
+    // cache_creation breaks the writes down by TTL. Only the one-hour part is
+    // kept: it is billed at 2x input against 1.25x for five-minute writes, and
+    // the five-minute part is the remainder.
+    if (typeof u.cache_creation?.ephemeral_1h_input_tokens === 'number')
+      this.cacheCreation1hInputTokens = u.cache_creation.ephemeral_1h_input_tokens;
     if (typeof u.cache_read_input_tokens === 'number')
       this.cacheReadInputTokens = u.cache_read_input_tokens;
   }
@@ -193,6 +219,7 @@ class ClaudeParser implements TurnParser {
         inputTokens: this.inputTokens,
         outputTokens: this.outputTokens,
         cacheCreationInputTokens: this.cacheCreationInputTokens,
+        cacheCreation1hInputTokens: this.cacheCreation1hInputTokens,
         cacheReadInputTokens: this.cacheReadInputTokens,
       },
       startedAt: this.startedAt,
@@ -212,8 +239,9 @@ function extractPrompt(body: any): { text: string; messages: Msg[] } {
   const messages: Msg[] = [];
   let text = '';
   if (typeof body?.prompt === 'string') {
+    // A retry_completion (regenerate) sends an empty prompt: no new message.
     text = body.prompt;
-    messages.push({ role: 'user', text });
+    if (text) messages.push({ role: 'user', text });
   } else if (Array.isArray(body?.messages)) {
     for (const m of body.messages) {
       const t = coerceContent(m?.content);

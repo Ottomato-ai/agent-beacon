@@ -5,10 +5,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/atomicfile"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/brewpath"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/codexsession"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/asymptote"
 	endpointcollector "github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/collector"
 	endpointconfig "github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/config"
@@ -17,9 +20,13 @@ import (
 	endpointinventory "github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/inventory"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/schema"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/selfupdate"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/sentinel"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/service"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/sysacl"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/writer"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/hermessession"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/version"
+	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve"
 )
 
 var (
@@ -40,8 +47,8 @@ var (
 	}
 	// newInventoryJob and removeInventoryJob are the seams tests replace so Install, Uninstall
 	// and Repair can be exercised without touching launchd or systemd.
-	newInventoryJob = func(userMode bool, kind service.Kind) inventoryJobController {
-		return service.InventoryManager{UserMode: userMode, Kind: kind}
+	newInventoryJob = func(userMode bool, kind service.Kind) service.ScheduledJob {
+		return service.InventoryManager{UserMode: userMode, Kind: kind, Env: inventoryJobEnv(userMode)}
 	}
 	removeInventoryJob = func(userMode bool) {
 		job := newInventoryJob(userMode, service.KindAuto)
@@ -52,20 +59,25 @@ var (
 	// helpers install, so tests can see whether an uninstall reaches them without touching
 	// /Library.
 	removeScriptForwarders = service.RemoveScriptForwarders
+	// scriptForwarderStatuses is the seam for reading those forwarders' state in GetStatus.
+	scriptForwarderStatuses = service.ScriptForwarderStatuses
+	// reconcileManagedForwarder is the seam for the Beacon Cloud forwarder reconcile, so tests can
+	// see whether Install reaches it without a connected endpoint or a service manager. It always
+	// restarts a running forwarder, as the Sentinel one below does: an install or repair may have
+	// replaced the log with a copy (switching to restricted log access does), which Vector only
+	// notices when it restarts, and a package upgrade may have installed a new Vector.
+	reconcileManagedForwarder = func(userMode bool, logPath string) (asymptote.ReconcileResult, error) {
+		return asymptote.ReconcileForwarder(asymptote.ReconcileOptions{UserMode: userMode, LogPath: logPath, Restart: true})
+	}
+	// reconcileSentinelForwarder and removeSentinelForwarder are the seams for the managed Sentinel
+	// forwarder. Install always restarts it: an install or repair may have replaced the log with a
+	// copy (switching log access does), which Vector only notices when it restarts.
+	reconcileSentinelForwarder = func(logPath string, start bool) (sentinel.ReconcileResult, error) {
+		return sentinel.Reconcile(sentinel.ReconcileOptions{LogPath: logPath, Restart: start, NoStart: !start})
+	}
+	removeSentinelForwarder = sentinel.Remove
+	sentinelForwarderStatus = sentinel.ReadStatus
 )
-
-// inventoryJobController is what lifecycle needs from service.InventoryManager.
-type inventoryJobController interface {
-	Supported() bool
-	UnsupportedReason() string
-	UnitPath() (string, error)
-	UnitPaths() []string
-	WriteUnit(program, logPath string) (string, error)
-	Load() error
-	Unload() error
-	RemoveUnits()
-	Status() service.Status
-}
 
 // InventoryJobOptions drives ReconcileInventoryJob.
 type InventoryJobOptions struct {
@@ -97,7 +109,7 @@ func ReconcileInventoryJob(opts InventoryJobOptions) (InventoryJobResult, error)
 	return reconcileInventoryJobWith(newInventoryJob(opts.UserMode, opts.Kind), opts)
 }
 
-func reconcileInventoryJobWith(job inventoryJobController, opts InventoryJobOptions) (InventoryJobResult, error) {
+func reconcileInventoryJobWith(job service.ScheduledJob, opts InventoryJobOptions) (InventoryJobResult, error) {
 	result := InventoryJobResult{Enabled: inventoryEnabledFromConfigFile(endpointconfig.ConfigPath(opts.UserMode))}
 	if !job.Supported() {
 		result.Skipped = job.UnsupportedReason()
@@ -121,6 +133,112 @@ func reconcileInventoryJobWith(job inventoryJobController, opts InventoryJobOpti
 		result.Loaded = true
 	}
 	return result, nil
+}
+
+// inventoryJobEnv is the environment written into a per-user inventory job. launchd and systemd
+// start the job without the user's shell environment, so a variable exported in a shell profile
+// that moves a runtime's user directory -- CODEX_HOME, HERMES_HOME, CLINE_DIR, GEMINI_CLI_HOME,
+// CLAUDE_CONFIG_DIR, or one in inventoryJobPathEnv or inventoryJobNameEnv -- would not reach it,
+// and the scheduled scan would inventory the default directory while the runtime reads the moved
+// one. Each value is taken from the install's shell, so a relative path still means the directory
+// it named at install time:
+//   - CODEX_HOME must name an existing directory, as Codex requires; otherwise nothing is recorded.
+//   - HERMES_HOME is trimmed and expanded as Hermes does, and HERMES_DATA_DIR_SUFFIX is recorded as
+//     it is. HERMES_HOME is recorded before profiles are applied, so the job still follows a later
+//     `hermes profile use`.
+//   - CLINE_DIR is used whenever it is non-empty after trimming, as Cline uses it.
+//   - GEMINI_CLI_HOME is used whenever it is non-empty, as Gemini CLI uses it.
+//   - CLAUDE_CONFIG_DIR is used whenever it is non-empty after trimming, as Claude Code uses it.
+//   - The rest are recorded whenever they are set, even to an empty value, because Oh My Pi's
+//     OMP_PROFILE and OMO's agent-directory overrides treat a set-but-empty variable differently
+//     from an unset one. See inventoryJobPathValue for how a path is recorded.
+//
+// A variable that is unset records nothing, and the job falls back to the default as before.
+// System mode records nothing: this process's environment is root's, not the console user's.
+func inventoryJobEnv(userMode bool) map[string]string {
+	if !userMode {
+		return nil
+	}
+	env := map[string]string{}
+	if os.Getenv("CODEX_HOME") != "" {
+		if dir, err := codexsession.HomeDir(""); err == nil {
+			env["CODEX_HOME"] = dir
+		}
+	}
+	if dir, err := hermessession.HomeOverride(""); err == nil && dir != "" {
+		env["HERMES_HOME"] = dir
+	}
+	if suffix := os.Getenv("HERMES_DATA_DIR_SUFFIX"); suffix != "" {
+		env["HERMES_DATA_DIR_SUFFIX"] = suffix
+	}
+	if value := strings.TrimSpace(os.Getenv("CLINE_DIR")); value != "" {
+		if dir, err := filepath.Abs(value); err == nil {
+			env["CLINE_DIR"] = dir
+		}
+	}
+	if value := os.Getenv("GEMINI_CLI_HOME"); value != "" {
+		if dir, err := filepath.Abs(value); err == nil {
+			env["GEMINI_CLI_HOME"] = dir
+		}
+	}
+	if value := strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR")); value != "" {
+		if dir, err := filepath.Abs(value); err == nil {
+			env["CLAUDE_CONFIG_DIR"] = dir
+		}
+	}
+	for _, name := range inventoryJobPathEnv {
+		if value, ok := os.LookupEnv(name); ok {
+			env[name] = inventoryJobPathValue(value)
+		}
+	}
+	for _, name := range inventoryJobNameEnv {
+		if value, ok := os.LookupEnv(name); ok {
+			env[name] = value
+		}
+	}
+	if len(env) == 0 {
+		return nil
+	}
+	return env
+}
+
+// inventoryJobPathEnv are the variables naming a directory that the inventory scan resolves
+// through a runtime's own path rules (inventory's *UserDir helpers, and the hooks installers'
+// *PathForHome resolvers it calls), beyond the ones inventoryJobEnv resolves itself.
+var inventoryJobPathEnv = []string{
+	"KIRO_HOME",
+	"KIMI_CODE_HOME",
+	"DSH_HOME",
+	"OH_PERSISTENCE_DIR",
+	"OPENCLAW_STATE_DIR",
+	"XDG_CONFIG_HOME",              // Muse, OpenCode, and VS Code on Linux
+	"OPENCODE_CONFIG_DIR",          // OpenCode
+	"PI_CODING_AGENT_DIR",          // Pi, Oh My Pi's default profile, and OMO's last fallback
+	"OMO_CODING_AGENT_DIR",         // OMO
+	"SENPI_CODING_AGENT_DIR",       // OMO's legacy name
+	"PRIME_AGENT_CODING_AGENT_DIR", // Prime Agent
+	"QWEN_HOME",                    // Qwen Code
+}
+
+// inventoryJobNameEnv are the variables the inventory scan reads as names rather than paths, so
+// they are recorded exactly as set: Oh My Pi's config directory name under the home directory and
+// its active profile.
+var inventoryJobNameEnv = []string{"PI_CONFIG_DIR", "OMP_PROFILE", "PI_PROFILE"}
+
+// inventoryJobPathValue is how one inventoryJobPathEnv value is recorded. A relative path is made
+// absolute against the install's working directory, after trimming, which every resolver that
+// trims ignores. Anything else is recorded exactly as set: an absolute path already means the same
+// thing in the job, an empty value means what unset does, and a leading `~` is left for each
+// resolver to expand against the same HOME the job runs with, as it did at install time.
+func inventoryJobPathValue(value string) string {
+	path := strings.TrimSpace(value)
+	if path == "" || filepath.IsAbs(path) || path == "~" || strings.HasPrefix(path, "~/") || strings.HasPrefix(path, `~\`) {
+		return value
+	}
+	if abs, err := filepath.Abs(path); err == nil {
+		return abs
+	}
+	return value
 }
 
 // inventoryEnabledFromConfigFile reads only the inventory_heartbeat.enabled key. A missing or
@@ -193,16 +311,34 @@ type InstallOptions struct {
 	HTTPPort  int
 	// HealthPort is the collector health_check port. Zero derives it from the OTLP ports
 	// (endpointconfig.DeriveHealthCheckPort), which keeps 13133 for the default ports.
-	HealthPort            int
-	CollectorPath         string
-	StartService          bool
-	IncludeRuntimeMetrics bool
-	IncludeCodexSpans     bool
-	SplunkHEC             *endpointconfig.SplunkHEC
-	FalconHEC             *endpointconfig.FalconHEC
+	HealthPort                int
+	CollectorPath             string
+	StartService              bool
+	IncludeRuntimeMetrics     bool
+	IncludeCodexSpans         bool
+	ClaudeCaptureModelContext bool
+	SplunkHEC                 *endpointconfig.SplunkHEC
+	FalconHEC                 *endpointconfig.FalconHEC
+	// OTLPForward replaces the configured OTLP forward; nil keeps what the existing config has,
+	// so repair and package upgrades carry it.
+	OTLPForward *endpointconfig.OTLPForward
 	// ServiceKind selects the service manager. Empty auto-detects: launchd on macOS,
 	// systemd when it is PID 1, otherwise a supervised child process.
 	ServiceKind service.Kind
+	// LogAccess sets the system log's access mode, "shared" or "restricted". Empty keeps what the
+	// existing config records, so repair and a package upgrade never change it.
+	LogAccess string
+	// LogReaders are accounts to add to the readers group of a restricted system log after the
+	// install. Members are only ever added, never removed, and an account that cannot be added is
+	// reported rather than failing the install. Ignored, and reported, for a shared log.
+	LogReaders []string
+	// SessionSync turns the scheduled session-store sync on or off; nil keeps what the existing
+	// config records (off for a new install), so repair and package upgrades never change it.
+	SessionSync *bool
+	// Dashboard is the administrator's switch for the local dashboard, "enabled" or "disabled".
+	// Empty keeps what the existing config records (enabled for a new install). It applies to a
+	// system install only.
+	Dashboard string
 }
 
 type UninstallOptions struct {
@@ -215,6 +351,10 @@ type UninstallOptions struct {
 	// sets it: it uninstalls and reinstalls the endpoint, and nothing in Install puts those
 	// forwarders back.
 	KeepForwarders bool
+	// KeepManagedIngest leaves the Beacon Cloud forwarder, its config, its Vector checkpoints and
+	// its credentials in place. Repair sets it: Install re-renders that config in place instead,
+	// and nothing short of a re-connect, which rotates the device key, could bring it back.
+	KeepManagedIngest bool
 }
 
 type InstallResult struct {
@@ -233,12 +373,33 @@ type InstallResult struct {
 	LingerRemediation string `json:"linger_remediation,omitempty"`
 	// The scheduled inventory job is reconciled on every install; a host without a scheduler
 	// reports why in InventoryJobDetail and the install still succeeds.
-	InventoryJobPath   string `json:"inventory_job_path,omitempty"`
-	InventoryJobDetail string `json:"inventory_job_detail,omitempty"`
+	InventoryJobPath string `json:"inventory_job_path,omitempty"`
+	// LogAccess is the system log's access mode after the install; empty in user mode.
+	LogAccess string `json:"log_access,omitempty"`
+	// LogReadersGroupCreated is true when this install created the readers group a restricted log
+	// is readable by, which then has no members yet.
+	LogReadersGroupCreated bool `json:"log_readers_group_created,omitempty"`
+	// LogReadersAdded are the LogReaders accounts now in the readers group; LogReaderErrors say why
+	// any others are not, or that they were ignored because the log is shared.
+	LogReadersAdded    []string `json:"log_readers_added,omitempty"`
+	LogReaderErrors    []string `json:"log_reader_errors,omitempty"`
+	InventoryJobDetail string   `json:"inventory_job_detail,omitempty"`
+	// SessionSyncJobPath is the scheduled session sync unit when `session_sync.enabled` is on;
+	// SessionSyncJobDetail says why it is not installed on a host without a scheduler.
+	SessionSyncJobPath   string `json:"session_sync_job_path,omitempty"`
+	SessionSyncJobDetail string `json:"session_sync_job_detail,omitempty"`
+	// ManagedForwarder reports the Beacon Cloud forwarder reconcile. It never fails the install:
+	// a config Vector rejects leaves the running forwarder on its old one and is reported here.
+	ManagedForwarder *asymptote.ReconcileResult `json:"managed_forwarder,omitempty"`
+	// SentinelForwarder reports the managed Sentinel forwarder reconcile on a system install. Like
+	// ManagedForwarder it never fails the install.
+	SentinelForwarder *sentinel.ReconcileResult `json:"sentinel_forwarder,omitempty"`
 }
 
 type Status struct {
-	Version       string                        `json:"version"`
+	Version string `json:"version"`
+	// Edition is set only for a build that is not the default edition (see version.Edition).
+	Edition       string                        `json:"edition,omitempty"`
 	ConfigPath    string                        `json:"config_path"`
 	LogPath       string                        `json:"log_path"`
 	RuntimeLog    RuntimeLogSource              `json:"runtime_log"`
@@ -251,11 +412,40 @@ type Status struct {
 	ManagedIngest asymptote.ManagedIngestStatus `json:"managed_ingest"`
 	// InventoryHeartbeat follows the requested mode, like ManagedIngest: each mode has its own job.
 	InventoryHeartbeat InventoryHeartbeatStatus `json:"inventory_heartbeat"`
+	// SessionSync follows the requested mode too.
+	SessionSync SessionSyncStatus `json:"session_sync"`
+	// ScriptForwarders are the S3, GCS and Falcon forwarders the package helpers install, one entry
+	// per forwarder that is set up on this machine.
+	ScriptForwarders []service.Status `json:"script_forwarders,omitempty"`
+	// SentinelForwarder is the managed Sentinel forwarder, on a system endpoint where one is set up
+	// and this account can read its settings.
+	SentinelForwarder *sentinel.Status `json:"sentinel_forwarder,omitempty"`
+	// LogAccess is the system log's access mode, "shared" or "restricted"; empty in user mode.
+	LogAccess string `json:"log_access,omitempty"`
+	// Dashboard is "enabled" or "disabled": whether the system config lets anyone on this machine
+	// run `beacon endpoint dashboard`. It is reported in both modes, because the system setting
+	// applies to every account. DashboardError says why the setting could not be read, in which
+	// case the dashboard refuses to start and Dashboard reads disabled.
+	Dashboard      string `json:"dashboard"`
+	DashboardError string `json:"dashboard_error,omitempty"`
 }
 
 type DestinationStatus struct {
 	SplunkHEC ConfiguredStatus `json:"splunk_hec"`
 	FalconHEC ConfiguredStatus `json:"falcon_hec"`
+	// OTLPForward reports the endpoint and protocol only; header values can be credentials.
+	OTLPForward OTLPForwardStatus `json:"otlp_forward"`
+}
+
+type OTLPForwardStatus struct {
+	Configured bool     `json:"configured"`
+	Endpoint   string   `json:"endpoint,omitempty"`
+	Protocol   string   `json:"protocol,omitempty"`
+	Harnesses  []string `json:"harnesses,omitempty"`
+	Headers    []string `json:"headers,omitempty"`
+	// HeadersMissing means config.json names headers whose values file is gone, so the forward
+	// sends without them; re-run install or repair with --otlp-forward-header.
+	HeadersMissing bool `json:"headers_missing,omitempty"`
 }
 
 type ConfiguredStatus struct {
@@ -294,6 +484,9 @@ type fileSnapshot struct {
 	Existed bool
 	Data    []byte
 	Mode    os.FileMode
+	// Secret is set for a file that carried sysacl.SecretFileDACL (on Windows, a system file holding
+	// a credential), so restoring it does not hand it the tree's DACL that every user can read.
+	Secret bool
 }
 
 // serviceController is the part of service.Manager that rollback uses.
@@ -311,11 +504,19 @@ type installRollback struct {
 	// it started, so the scheduler is not left registered against rolled-back config.
 	// InventoryWasLoaded records a job that was already scheduled before this install began; a
 	// reinstall that re-enabled it and then failed must bring it back, exactly like the collector.
-	InventoryJob       inventoryJobController
+	InventoryJob       service.ScheduledJob
 	InventoryLoaded    bool
 	InventoryWasLoaded bool
-	Manager            serviceController
-	ServiceLoaded      bool
+	// SessionSyncJob and the two flags beside it do the same for the scheduled session sync.
+	// SessionSyncRemoved records that this install unloaded and removed the job (the setting
+	// turned off): unlike the inventory job, off is an ordinary choice here, so a rollback has to
+	// put back a job that was scheduled before as well as unload one it started.
+	SessionSyncJob       service.ScheduledJob
+	SessionSyncLoaded    bool
+	SessionSyncRemoved   bool
+	SessionSyncWasLoaded bool
+	Manager              serviceController
+	ServiceLoaded        bool
 	// ServiceWasRunning records whether a collector was already up when this install began.
 	//
 	// It decides what rollback owes the machine. Unloading is right for a service this transaction
@@ -324,8 +525,12 @@ type installRollback struct {
 	// it, and on systemd the disable survives reboot, so a machine that was collecting fine before
 	// the attempt is left collecting nothing afterwards.
 	ServiceWasRunning bool
-	files             []string
-	snapshots         map[string]fileSnapshot
+	// RestoreLogAccess puts the system log back in the access mode it had before this install, so
+	// a rollback cannot leave a restricted log world-writable while the restored config and
+	// collector still say restricted, or the reverse. Nil in user mode.
+	RestoreLogAccess func()
+	files            []string
+	snapshots        map[string]fileSnapshot
 }
 
 func newInstallRollback(manager service.Manager) *installRollback {
@@ -366,11 +571,17 @@ func (r *installRollback) Rollback(manifest Manifest) {
 	if r.InventoryLoaded && r.InventoryJob != nil && !r.InventoryWasLoaded {
 		_ = r.InventoryJob.Unload()
 	}
+	if r.SessionSyncLoaded && r.SessionSyncJob != nil && !r.SessionSyncWasLoaded {
+		_ = r.SessionSyncJob.Unload()
+	}
 
 	restoreBackups(manifest.Backups)
 	for i := len(r.files) - 1; i >= 0; i-- {
 		path := r.files[i]
 		restoreFile(path, r.snapshots[path])
+	}
+	if r.RestoreLogAccess != nil {
+		r.RestoreLogAccess()
 	}
 
 	// Bring back a service that was running before this install, now that the configuration it was
@@ -393,6 +604,31 @@ func (r *installRollback) Rollback(manifest Manifest) {
 	if r.InventoryLoaded && r.InventoryWasLoaded && r.InventoryJob != nil {
 		_ = r.InventoryJob.Load()
 	}
+	if (r.SessionSyncLoaded || r.SessionSyncRemoved) && r.SessionSyncWasLoaded && r.SessionSyncJob != nil {
+		_ = r.SessionSyncJob.Load()
+	}
+}
+
+// usableCollectorBinary resolves the collector an install of cfg runs and checks that it has every
+// component cfg's collector config needs.
+func usableCollectorBinary(cfg endpointconfig.Config) (string, error) {
+	collectorBinary, err := endpointcollector.ResolveBinary(cfg.Collector.BinaryPath)
+	if err != nil {
+		return "", err
+	}
+	var extensions []string
+	if cfg.RestrictedLogAccess() {
+		extensions = append(extensions, endpointcollector.IngestExtension)
+	}
+	var processors, exporters []string
+	if cfg.Destinations != nil && cfg.Destinations.OTLPForward != nil && cfg.Destinations.OTLPForward.Enabled {
+		processors = append(processors, endpointcollector.ForwardFilterProcessor)
+		exporters = append(exporters, endpointcollector.OTLPForwardExporters[cfg.Destinations.OTLPForward.Protocol])
+	}
+	if err := endpointcollector.CheckComponentsFor(collectorBinary, extensions, processors, exporters); err != nil {
+		return "", err
+	}
+	return collectorBinary, nil
 }
 
 func Install(opts InstallOptions) (InstallResult, error) {
@@ -401,11 +637,13 @@ func Install(opts InstallOptions) (InstallResult, error) {
 		return InstallResult{}, err
 	}
 	manager := service.Manager{UserMode: cfg.UserMode, Kind: opts.ServiceKind}
-	collectorBinary, err := endpointcollector.ResolveBinary(cfg.Collector.BinaryPath)
+	collectorBinary, err := usableCollectorBinary(cfg)
 	if err != nil {
 		return InstallResult{}, err
 	}
 
+	logReadersGroupCreated := false
+	var restoreLogAccess func()
 	manifest := Manifest{
 		CreatedAt:    time.Now().UTC().Format(time.RFC3339),
 		UserMode:     cfg.UserMode,
@@ -425,13 +663,31 @@ func Install(opts InstallOptions) (InstallResult, error) {
 	// Only for system mode: a user-mode log lives in that user's own profile, which they can
 	// already write, and widening its ACL would hand their prompt text to every interactive
 	// account on the machine.
+	//
+	// Before that, the machine-wide directory itself. On Windows %ProgramData%\Beacon is created --
+	// or, when it already exists, reset -- with Administrators as owner and a protected ACL that
+	// gives ordinary users read and execute only. It holds the config the SYSTEM collector reads and
+	// the hooks binary every user's agent runs, and %ProgramData% lets any user create a
+	// subdirectory, so a directory found here may have been made by someone else before Beacon was
+	// installed. A no-op elsewhere, where root ownership carries the same guarantee.
 	if !cfg.UserMode {
-		if err := writer.EnsureSystemLogWritable(filepath.Dir(cfg.LogPath)); err != nil {
+		root := sysacl.SystemRoot(endpointconfig.SystemBaseDir())
+		if err := sysacl.SecureSystemTree(root, filepath.Dir(cfg.LogPath)); err != nil {
+			return InstallResult{}, fmt.Errorf("secure %s: %w", root, err)
+		}
+		restore := logAccessRestorer(cfg)
+		created, err := prepareSystemLog(cfg)
+		if err != nil {
+			restore()
 			return InstallResult{}, fmt.Errorf("prepare the log directory: %w", err)
 		}
+		logReadersGroupCreated = created
+		restoreLogAccess = restore
 	}
+	logReadersAdded, logReaderErrors := addLogReaders(cfg, opts.LogReaders)
 
 	tx := newInstallRollback(manager)
+	tx.RestoreLogAccess = restoreLogAccess
 	tx.Track(cfg.Collector.ConfigPath)
 	manifest.Files = append(manifest.Files, cfg.Collector.ConfigPath)
 	if err := writeCollectorConfig(cfg); err != nil {
@@ -454,9 +710,17 @@ func Install(opts InstallOptions) (InstallResult, error) {
 	configPath := endpointconfig.ConfigPath(cfg.UserMode)
 	tx.Track(configPath)
 	manifest.Files = append(manifest.Files, configPath)
+	forwardSecretsPath := endpointconfig.OTLPForwardSecretsPath(cfg.UserMode)
+	tx.Track(forwardSecretsPath)
+	// Save writes or removes the dashboard marker beside the system config; a failed install puts it
+	// back as it was, so it keeps matching the config the rollback restores.
+	tx.Track(endpointconfig.DashboardMarkerPath(configPath))
 	if _, err := saveEndpointConfig(cfg); err != nil {
 		tx.Rollback(manifest)
 		return InstallResult{}, err
+	}
+	if _, err := os.Stat(forwardSecretsPath); err == nil {
+		manifest.Files = append(manifest.Files, forwardSecretsPath)
 	}
 
 	// The scheduled inventory job is on by default and reconciled on every install, which is
@@ -482,6 +746,28 @@ func Install(opts InstallOptions) (InstallResult, error) {
 		// Written but not enabled is not installed: report the failure, not the unit path.
 		inventoryResult.UnitPath = ""
 		inventoryDetail = "scheduled inventory job: " + inventoryErr.Error()
+	}
+
+	// The scheduled session sync is opt-in (`session_sync.enabled`) and reconciled the same way:
+	// installed and loaded when on, removed when off, never failing the install.
+	sessionSyncJob := newSessionSyncJob(cfg.UserMode, opts.ServiceKind)
+	for _, path := range sessionSyncJob.UnitPaths() {
+		tx.Track(path)
+	}
+	tx.SessionSyncJob = sessionSyncJob
+	tx.SessionSyncWasLoaded = sessionSyncJob.Status().Loaded
+	sessionSyncResult, sessionSyncErr := reconcileSessionSyncJobWith(sessionSyncJob, InventoryJobOptions{
+		UserMode: cfg.UserMode,
+		Kind:     opts.ServiceKind,
+		Program:  DefaultInventoryJobProgram(cfg.UserMode),
+		LogPath:  cfg.LogPath,
+		Load:     opts.StartService,
+	})
+	tx.SessionSyncLoaded = sessionSyncResult.Loaded
+	tx.SessionSyncRemoved = sessionSyncResult.Removed
+	if sessionSyncErr != nil {
+		sessionSyncResult.UnitPath = ""
+		sessionSyncResult.Skipped = "scheduled session sync job: " + sessionSyncErr.Error()
 	}
 
 	harnessPaths, err := configureHarnesses(cfg)
@@ -565,19 +851,51 @@ func Install(opts InstallOptions) (InstallResult, error) {
 		tx.Rollback(manifest)
 		return InstallResult{}, err
 	}
+	// Bring a connected endpoint's Beacon Cloud forwarder config up to this version's pack, in
+	// place and without re-enrolling. After everything else, so it can never be the reason an
+	// install rolls back; and only when services are started, since it may restart the forwarder
+	// (the macOS package installs with --no-start and runs `beacon endpoint asymptote reconcile`
+	// itself once the collector is back).
+	var managedForwarder *asymptote.ReconcileResult
+	if opts.StartService {
+		reconciled, err := reconcileManagedForwarder(cfg.UserMode, cfg.LogPath)
+		if err != nil && reconciled.Warning == "" {
+			reconciled.Warning = err.Error()
+		}
+		managedForwarder = &reconciled
+	}
+	// Unlike the Beacon Cloud forwarder, this runs without StartService too: an MSI upgrade can be
+	// told not to start services, and its uninstall step removed the registration, which only this
+	// puts back. Without StartService it registers the service and leaves it stopped.
+	var sentinelForwarder *sentinel.ReconcileResult
+	if !cfg.UserMode {
+		reconciled, err := reconcileSentinelForwarder(cfg.LogPath, opts.StartService)
+		if err != nil && reconciled.Warning == "" {
+			reconciled.Warning = err.Error()
+		}
+		sentinelForwarder = &reconciled
+	}
 	return InstallResult{
-		ConfigPath:          configPath,
-		CollectorConfigPath: cfg.Collector.ConfigPath,
-		PlistPath:           plistPath,
-		LogPath:             cfg.LogPath,
-		ManifestPath:        manifestPath,
-		HarnessConfigPaths:  harnessPaths,
-		LingerApplicable:    lingerOutcome.Applicable,
-		LingerEnabled:       lingerOutcome.Enabled,
-		LingerDetail:        lingerOutcome.Detail,
-		LingerRemediation:   lingerOutcome.Remediation,
-		InventoryJobPath:    inventoryResult.UnitPath,
-		InventoryJobDetail:  inventoryDetail,
+		ManagedForwarder:       managedForwarder,
+		SentinelForwarder:      sentinelForwarder,
+		ConfigPath:             configPath,
+		CollectorConfigPath:    cfg.Collector.ConfigPath,
+		PlistPath:              plistPath,
+		LogPath:                cfg.LogPath,
+		ManifestPath:           manifestPath,
+		HarnessConfigPaths:     harnessPaths,
+		LingerApplicable:       lingerOutcome.Applicable,
+		LingerEnabled:          lingerOutcome.Enabled,
+		LingerDetail:           lingerOutcome.Detail,
+		LingerRemediation:      lingerOutcome.Remediation,
+		InventoryJobPath:       inventoryResult.UnitPath,
+		InventoryJobDetail:     inventoryDetail,
+		SessionSyncJobPath:     sessionSyncResult.UnitPath,
+		SessionSyncJobDetail:   sessionSyncResult.Skipped,
+		LogAccess:              logAccessOf(cfg),
+		LogReadersGroupCreated: logReadersGroupCreated,
+		LogReadersAdded:        logReadersAdded,
+		LogReaderErrors:        logReaderErrors,
 	}, nil
 }
 
@@ -598,7 +916,8 @@ func Uninstall(opts UninstallOptions) error {
 	// success. Install has always had this gate; uninstall never did, which is the asymmetry that
 	// let an unprivileged removal look like it worked.
 	if !cfg.UserMode && !HasSystemPrivileges() {
-		return fmt.Errorf("removing a system endpoint needs root: rerun with sudo, or pass --user to remove a user-mode install")
+		return fmt.Errorf("removing a system endpoint needs elevated privileges; %s, or pass --user to remove a user-mode install",
+			SystemPrivilegeHint())
 	}
 
 	var problems []string
@@ -620,23 +939,40 @@ func Uninstall(opts UninstallOptions) error {
 		removeUpdaterJob()
 	}
 	removeInventoryJob(cfg.UserMode)
+	removeSessionSyncJob(cfg.UserMode)
 	// The S3, GCS and Falcon forwarders run from /opt/beacon and read the customer's credentials
 	// from their env files, so they go with the endpoint the same way the managed forwarder does.
 	if !cfg.UserMode && !opts.KeepForwarders {
 		fail("remove package forwarders", removeScriptForwarders(opts.KeepConfig))
+		// The service always goes, so a package upgrade can replace Vector's binary; its settings,
+		// credential and read positions stay with --keep-config, which is how the MSI upgrade runs
+		// the old package's uninstall, so the install that follows brings it back where it was.
+		fail("remove the Sentinel forwarder", removeSentinelForwarder(opts.KeepConfig))
 	}
 	// The managed-ingest forwarder and its credentials go with the endpoint; server-side the
-	// device stays registered until it is revoked from the dashboard.
-	fail("disconnect managed ingest", asymptote.Disconnect(asymptote.DisconnectOptions{
-		UserMode:        cfg.UserMode,
-		LogPath:         cfg.LogPath,
-		KeepCredentials: opts.KeepConfig,
-	}))
+	// device stays registered until it is revoked from the dashboard. Repair keeps all of it.
+	if !opts.KeepManagedIngest {
+		fail("disconnect managed ingest", asymptote.Disconnect(asymptote.DisconnectOptions{
+			UserMode:        cfg.UserMode,
+			LogPath:         cfg.LogPath,
+			KeepCredentials: opts.KeepConfig,
+		}))
+	}
 	manifest, _ := ReadManifest(cfg.UserMode)
 	if !opts.KeepConfig {
 		restoreBackups(manifest.Backups)
 	}
+	// Repair (KeepManagedIngest) keeps config.json so the reinstall carries over what connect,
+	// disconnect and the operator own in it (managed_ingest, inventory, auto_update); without it
+	// a repaired endpoint that kept forwarding read as unconnected on disk. `uninstall
+	// --keep-config` keeps harness settings only, so it still removes Beacon's own config.
+	endpointConfigPath := endpointconfig.ConfigPath(cfg.UserMode)
+	forwardSecretsPath := endpointconfig.OTLPForwardSecretsPath(cfg.UserMode)
 	for _, path := range manifest.Files {
+		// The forward's header values belong with config.json: repair keeps both.
+		if opts.KeepManagedIngest && (path == endpointConfigPath || path == forwardSecretsPath) {
+			continue
+		}
 		fail("remove "+path, os.Remove(path))
 	}
 	if len(manifest.Files) == 0 {
@@ -644,11 +980,28 @@ func Uninstall(opts UninstallOptions) error {
 			fail("remove "+path, os.Remove(path))
 		}
 		fail("remove "+cfg.Collector.ConfigPath, os.Remove(cfg.Collector.ConfigPath))
-		fail("remove endpoint config", os.Remove(endpointconfig.ConfigPath(cfg.UserMode)))
+		if !opts.KeepManagedIngest {
+			fail("remove endpoint config", os.Remove(endpointConfigPath))
+		}
+	}
+	// The forward's header values are a credential, so they go with config.json whether or not the
+	// manifest lists them: an install interrupted before writing it, or one whose manifest was lost,
+	// would otherwise leave the backend's token behind.
+	if !opts.KeepManagedIngest {
+		fail("remove the OTLP forward headers", os.Remove(forwardSecretsPath))
+		// The dashboard marker records config.json's switch, so it goes whenever config.json does,
+		// however that was removed: left behind, a later install's buildConfig would read it as
+		// the switch of a config that no longer exists and come back disabled.
+		fail("remove the dashboard switch marker", os.Remove(endpointconfig.DashboardMarkerPath(endpointConfigPath)))
 	}
 	if !opts.KeepLogs {
 		for _, path := range runtimeLogFiles(cfg.LogPath) {
 			fail("remove "+path, os.Remove(path))
+		}
+		// With the logs gone there is nothing left for the restricted mode to protect, and a
+		// marker left behind would narrow the log a later shared install starts.
+		if !cfg.UserMode {
+			fail("remove the log access marker", os.Remove(asymptoteobserve.LogAccessMarkerPath(cfg.LogPath)))
 		}
 		// The local history holds what the log held, and more, so it goes with the logs. It lives
 		// in the user's own endpoint directory, which a system uninstall does not own.
@@ -692,28 +1045,38 @@ func runtimeLogFiles(logPath string) []string {
 // and everything it does not recreate stays.
 func repairUninstallOptions(opts InstallOptions) UninstallOptions {
 	return UninstallOptions{
-		UserMode:       opts.UserMode,
-		LogPath:        opts.LogPath,
-		KeepLogs:       true,
-		KeepConfig:     true,
-		KeepUpdater:    true,
-		KeepForwarders: true,
+		UserMode:          opts.UserMode,
+		LogPath:           opts.LogPath,
+		KeepLogs:          true,
+		KeepConfig:        true,
+		KeepUpdater:       true,
+		KeepForwarders:    true,
+		KeepManagedIngest: true,
 	}
 }
 
 func Repair(opts InstallOptions) (InstallResult, error) {
 	configPath := endpointconfig.ConfigPath(opts.UserMode)
 	configSnapshot := snapshotFile(configPath)
+	forwardSecretsPath := endpointconfig.OTLPForwardSecretsPath(opts.UserMode)
+	forwardSecretsSnapshot := snapshotFile(forwardSecretsPath)
 	priorAutoUpdateMode := ""
 	if !opts.UserMode {
 		if mode, err := autoUpdateModeFromConfigFile(configPath); err == nil {
 			priorAutoUpdateMode = mode
 		}
 	}
+	// The teardown below removes the collector's unit and config, and a failed install restores
+	// only the endpoint config, so a collector the install would refuse is refused first, while
+	// the endpoint still runs.
+	if _, err := usableCollectorBinary(buildConfig(opts)); err != nil {
+		return InstallResult{}, err
+	}
 	_ = Uninstall(repairUninstallOptions(opts))
 	result, err := Install(opts)
 	if err != nil {
 		restoreFile(configPath, configSnapshot)
+		restoreFile(forwardSecretsPath, forwardSecretsSnapshot)
 		return result, err
 	}
 	if !opts.UserMode {
@@ -768,6 +1131,12 @@ func autoUpdateModeFromConfigFile(path string) (string, error) {
 }
 
 func setAutoUpdateModeInConfigFile(path, mode string) error {
+	return setConfigFileKey(false, path, "auto_update", endpointconfig.AutoUpdate{Mode: mode})
+}
+
+// setConfigFileKey replaces one top-level key of config.json and leaves every other key as it is,
+// where install and repair rebuild the whole config from their flags.
+func setConfigFileKey(userMode bool, path, key string, value any) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return err
@@ -776,20 +1145,23 @@ func setAutoUpdateModeInConfigFile(path, mode string) error {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
-	autoUpdate, err := json.Marshal(endpointconfig.AutoUpdate{Mode: mode})
+	encoded, err := json.Marshal(value)
 	if err != nil {
 		return err
 	}
-	raw["auto_update"] = autoUpdate
+	raw[key] = encoded
 	out, err := json.MarshalIndent(raw, "", "  ")
 	if err != nil {
 		return err
 	}
-	perm := os.FileMode(0644)
-	if info, err := os.Stat(path); err == nil {
-		perm = info.Mode().Perm()
-	}
-	return os.WriteFile(path, out, perm)
+	return endpointconfig.RewriteConfig(userMode, path, out, configIsPrivate(path))
+}
+
+// configIsPrivate reports whether the file at path is readable by its owner only. Only POSIX modes
+// say so; on Windows RewriteSystemConfig decides from the content.
+func configIsPrivate(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && runtime.GOOS != "windows" && info.Mode().Perm()&0o077 == 0
 }
 
 func GetStatus(userMode bool, logPath string) Status {
@@ -821,8 +1193,10 @@ func buildStatus(requestedUserMode bool, effectiveCfg endpointconfig.Config, run
 			Message:  runtimeLog.Warning,
 		})
 	}
+	dashboardMode, dashboardErr := dashboardStatus()
 	return Status{
 		Version:            version.GetVersion(),
+		Edition:            version.ReportedEdition(),
 		ConfigPath:         endpointconfig.ConfigPath(effectiveCfg.UserMode),
 		LogPath:            effectiveCfg.LogPath,
 		RuntimeLog:         runtimeLog,
@@ -834,7 +1208,59 @@ func buildStatus(requestedUserMode bool, effectiveCfg endpointconfig.Config, run
 		Destinations:       destinationStatus(effectiveCfg),
 		ManagedIngest:      asymptote.Status(requestedUserMode, managedOpts),
 		InventoryHeartbeat: inventoryHeartbeatStatus(requestedUserMode, runtimeLog.RequestedLogPath),
+		SessionSync:        sessionSyncStatus(requestedUserMode, runtimeLog.RequestedLogPath),
+		ScriptForwarders:   scriptForwarderStatuses(),
+		SentinelForwarder:  sentinelForwarderStatusFor(requestedUserMode),
+		LogAccess:          logAccessOf(effectiveCfg),
+		Dashboard:          dashboardMode,
+		DashboardError:     dashboardErr,
 	}
+}
+
+// carriedDashboard is the dashboard switch a repair or upgrade keeps from the existing config. A
+// value --dashboard would refuse (one written into config.json by hand, such as "off") is kept as
+// disabled, which is how the dashboard already reads it, rather than carried raw into a preflight
+// that would then fail every repair and package upgrade over a flag nobody passed.
+func carriedDashboard(value string) string {
+	mode, err := endpointconfig.ParseDashboardMode(value)
+	if err != nil {
+		return endpointconfig.DashboardDisabled
+	}
+	return mode
+}
+
+// systemDashboardMarked reports whether the disabled-dashboard marker sits beside the system config.
+// A variable so tests need not write to the system config directory.
+var systemDashboardMarked = func() bool {
+	_, err := os.Stat(endpointconfig.DashboardMarkerPath(endpointconfig.SystemConfigPath()))
+	return err == nil
+}
+
+// systemDashboardDisabled is the seam status reads the administrator's dashboard switch through.
+var systemDashboardDisabled = endpointconfig.SystemDashboardDisabled
+
+// dashboardStatus is the dashboard switch as status reports it. A setting that cannot be read
+// reads disabled, because that is what `beacon endpoint dashboard` then does.
+func dashboardStatus() (string, string) {
+	disabled, err := systemDashboardDisabled()
+	switch {
+	case err != nil:
+		return endpointconfig.DashboardDisabled, err.Error()
+	case disabled:
+		return endpointconfig.DashboardDisabled, ""
+	}
+	return endpointconfig.DashboardEnabled, ""
+}
+
+func sentinelForwarderStatusFor(userMode bool) *sentinel.Status {
+	if userMode {
+		return nil
+	}
+	status := sentinelForwarderStatus()
+	if !status.Installed {
+		return nil
+	}
+	return &status
 }
 
 func ResolveRuntimeLog(userMode bool, logPath string) RuntimeLogSource {
@@ -894,6 +1320,44 @@ func buildConfig(opts InstallOptions) endpointconfig.Config {
 		if existing.Inventory != nil {
 			cfg.Inventory = existing.Inventory
 		}
+		if existing.SessionSync != nil {
+			cfg.SessionSync = existing.SessionSync
+		}
+		// Spool roots are an operator's vouching for where hooks may stage; a repair that dropped
+		// them would leave those sessions' events staged for good.
+		cfg.WorkspaceSpoolRoots = existing.WorkspaceSpoolRoots
+		// The OTLP forward replaces the export a runtime had to another backend before Beacon
+		// pointed it at the collector. An upgrade or repair that dropped it would silently cut that
+		// backend off, so it is kept until --no-otlp-forward removes it.
+		if existing.Destinations != nil && existing.Destinations.OTLPForward != nil {
+			cfg.Destinations = &endpointconfig.Destinations{OTLPForward: existing.Destinations.OTLPForward}
+		}
+		// The log access mode is an operator's security choice; a repair or upgrade that dropped
+		// it would silently make a restricted log world-writable again.
+		cfg.LogAccess = existing.LogAccess
+		// The dashboard switch is an administrator's choice too; an upgrade must not turn it back on.
+		cfg.Dashboard = carriedDashboard(existing.Dashboard)
+	} else if !opts.UserMode {
+		if logIsRestricted(cfg.LogPath) {
+			// No config to carry the mode over from -- an uninstall with --keep-logs removed it, or it
+			// does not load -- but the root-owned marker beside the kept log still records restricted.
+			// Defaulting to shared here would make every kept event world-readable.
+			cfg.LogAccess = asymptoteobserve.LogAccessRestricted
+		}
+		if systemDashboardMarked() {
+			// Likewise a config that no longer loads still has the dashboard marker beside it, so a
+			// repair of a damaged file keeps the dashboard off instead of turning it back on.
+			cfg.Dashboard = endpointconfig.DashboardDisabled
+		}
+	}
+	if opts.LogAccess != "" {
+		cfg.LogAccess = opts.LogAccess
+	}
+	if opts.SessionSync != nil {
+		cfg.SessionSync = &endpointconfig.SessionSync{Enabled: *opts.SessionSync}
+	}
+	if opts.Dashboard != "" {
+		cfg.Dashboard = opts.Dashboard
 	}
 	if opts.Harnesses != nil {
 		cfg.Harnesses = opts.Harnesses
@@ -915,6 +1379,7 @@ func buildConfig(opts InstallOptions) endpointconfig.Config {
 	cfg.Collector.BinaryPath = opts.CollectorPath
 	cfg.Collector.IncludeRuntimeMetrics = opts.IncludeRuntimeMetrics
 	cfg.Collector.IncludeCodexSpans = opts.IncludeCodexSpans
+	cfg.ClaudeCaptureModelContext = opts.ClaudeCaptureModelContext
 	if opts.SplunkHEC != nil {
 		if cfg.Destinations == nil {
 			cfg.Destinations = &endpointconfig.Destinations{}
@@ -926,6 +1391,16 @@ func buildConfig(opts InstallOptions) endpointconfig.Config {
 			cfg.Destinations = &endpointconfig.Destinations{}
 		}
 		cfg.Destinations.FalconHEC = opts.FalconHEC
+	}
+	if opts.OTLPForward != nil {
+		if cfg.Destinations == nil {
+			cfg.Destinations = &endpointconfig.Destinations{}
+		}
+		if opts.OTLPForward.Endpoint == "" && !opts.OTLPForward.Enabled {
+			cfg.Destinations.OTLPForward = nil
+		} else {
+			cfg.Destinations.OTLPForward = opts.OTLPForward
+		}
 	}
 	if cfg.Destinations != nil {
 		endpointconfig.NormalizeDestinations(&cfg)
@@ -963,6 +1438,10 @@ func installDestination(cfg endpointconfig.Config) *schema.DestinationInfo {
 		destination.Type += ",falcon_hec"
 		destination.Mode += ",hec"
 	}
+	if cfg.Destinations != nil && cfg.Destinations.OTLPForward != nil && cfg.Destinations.OTLPForward.Enabled {
+		destination.Type += ",otlp_forward"
+		destination.Mode += ",otlp"
+	}
 	return destination
 }
 
@@ -991,6 +1470,9 @@ func destinationStatus(cfg endpointconfig.Config) DestinationStatus {
 			Sourcetype: falcon.Sourcetype,
 		}
 	}
+	if forward := cfg.Destinations.OTLPForward; forward != nil && forward.Enabled {
+		status.OTLPForward = OTLPForwardStatus{Configured: true, Endpoint: forward.Endpoint, Protocol: forward.Protocol, Harnesses: forward.Harnesses, Headers: forward.HeaderNames, HeadersMissing: forward.HeadersMissing}
+	}
 	return status
 }
 
@@ -1015,6 +1497,7 @@ func snapshotFile(path string) fileSnapshot {
 		if info, statErr := os.Stat(path); statErr == nil {
 			snapshot.Mode = info.Mode().Perm()
 		}
+		snapshot.Secret = sysacl.IsSecretFile(path)
 	}
 	return snapshot
 }
@@ -1024,15 +1507,25 @@ func restoreFile(path string, snapshot fileSnapshot) {
 		_ = os.Remove(path)
 		return
 	}
+	if snapshot.Secret {
+		_ = sysacl.WriteSecretFile(path, snapshot.Data)
+		return
+	}
 	mode := snapshot.Mode
 	if mode == 0 {
 		mode = 0600
 	}
-	_ = os.WriteFile(path, snapshot.Data, mode)
+	_ = atomicfile.Write(path, snapshot.Data, mode)
 }
 
 func preflight(cfg endpointconfig.Config, startService bool, kind service.Kind) error {
 	if err := endpointconfig.ValidateDestinations(cfg.Destinations); err != nil {
+		return err
+	}
+	if err := validateLogAccess(cfg); err != nil {
+		return err
+	}
+	if err := validateDashboard(cfg); err != nil {
 		return err
 	}
 	// Replaces a blanket "macOS only" refusal. What actually matters is whether a service
@@ -1119,7 +1612,7 @@ func configureHarnesses(cfg endpointconfig.Config) ([]string, error) {
 	for _, name := range cfg.Harnesses {
 		switch name {
 		case "claude", "claude_code":
-			path, err := harness.ConfigureClaude(harness.ConfigureOptions{Endpoint: grpcEndpoint, UserMode: cfg.UserMode})
+			path, err := harness.ConfigureClaude(harness.ConfigureOptions{Endpoint: grpcEndpoint, UserMode: cfg.UserMode, CaptureModelContext: cfg.ClaudeCaptureModelContext})
 			if err != nil {
 				return paths, err
 			}

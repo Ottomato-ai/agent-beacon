@@ -25,6 +25,12 @@ type Config struct {
 	ContentRetention      string                     `mapstructure:"content_retention"` // Deprecated no-op; retained for older collector configs.
 	IncludeRuntimeMetrics bool                       `mapstructure:"include_runtime_metrics"`
 	IncludeCodexSpans     bool                       `mapstructure:"include_codex_spans"`
+	// CaptureModelContext is the --claude-capture-model-context opt-in; see beaconevent.Options.
+	CaptureModelContext bool `mapstructure:"capture_model_context"`
+	// PeerUser takes each event's user from the account the beacon_peer processor resolved, as
+	// beaconjson's peer_user does, so LogScale and runtime.jsonl name the same sender; see
+	// beaconevent.Options.PeerUser.
+	PeerUser bool `mapstructure:"peer_user"`
 }
 
 func createDefaultConfig() *Config {

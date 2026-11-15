@@ -85,6 +85,10 @@ BEACON_S3_PREFIX="beacon-prod/runtime" # avoid
 
 ## AWS permission
 
+<Tip>
+  Managing AWS with Terraform? [AWS S3 with Terraform](/log-forwarding/aws-s3-terraform) creates the bucket and an IAM user with this policy. Create its access key with the AWS CLI, then continue here.
+</Tip>
+
 Scope write access to the Beacon prefix:
 
 ```json
@@ -272,12 +276,15 @@ chown "$CONSOLE_USER":wheel "$INVENTORY_LOG" "$INVENTORY_LOG.lock" "$INVENTORY_S
 chmod 755 "$RUNTIME_DIR"
 chmod 644 "$BEACON_HOOK_LOG_PATH" "$BEACON_HOOK_LOG_PATH.lock"
 chmod 664 "$INVENTORY_LOG" "$INVENTORY_LOG.lock" "$INVENTORY_STATE" "$INVENTORY_STATE.lock"
-chmod +a "$CONSOLE_USER allow list,search,add_file,readattr,writeattr" "$RUNTIME_DIR" || true
 chmod +a "$CONSOLE_USER allow read,write,append,readattr,writeattr,readextattr,writeextattr" "$BEACON_HOOK_LOG_PATH" || true
 chmod +a "$CONSOLE_USER allow read,write,append,readattr,writeattr,readextattr,writeextattr" "$BEACON_HOOK_LOG_PATH.lock" || true
 
 /opt/beacon/jamf/scripts/install-cursor-hooks.sh
 ```
+
+<Warning>
+Earlier versions of this script also ran `chmod +a "$CONSOLE_USER allow list,search,add_file,…" "$RUNTIME_DIR"`. That grant lets the user replace the runtime log with a link that the root collector then opens, so remove it on Macs that ran the old version. `ls -led /var/log/beacon-agent` lists the directory's entries by number; remove each `allow` entry that includes `add_file`, `add_subdirectory` or `delete_child` with `sudo chmod -a# <number> /var/log/beacon-agent`, highest number first. The Claude Jamf repair script does this itself.
+</Warning>
 
 Set Jamf parameter labels:
 
@@ -455,7 +462,7 @@ Check the forwarder:
 
 ```bash
 sudo launchctl print system/com.beacon.endpoint.s3-forwarder
-sudo tail -n 100 /tmp/com.beacon.endpoint.s3-forwarder.err
+sudo tail -n 100 /Library/Logs/Beacon/com.beacon.endpoint.s3-forwarder.err
 ```
 
 If `launchctl` reports `Could not find service "com.beacon.endpoint.s3-forwarder"`,

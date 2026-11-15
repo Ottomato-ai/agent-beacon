@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/sessionfs"
 	"io"
 	"io/fs"
 	"os"
@@ -21,7 +22,11 @@ type Store struct {
 	SessionStateDir string
 }
 
+// DefaultCopilotDir is the Copilot CLI state directory: COPILOT_HOME when set, else ~/.copilot.
 func DefaultCopilotDir() (string, error) {
+	if override := strings.TrimSpace(os.Getenv("COPILOT_HOME")); override != "" {
+		return override, nil
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("resolve home directory: %w", err)
@@ -45,13 +50,13 @@ func NewStore(copilotDir string) (*Store, error) {
 }
 
 func (s *Store) Exists() bool {
-	info, err := os.Stat(s.SessionStateDir)
+	info, err := sessionfs.Stat(s.SessionStateDir)
 	return err == nil && info.IsDir()
 }
 
 func (s *Store) List() ([]SessionRef, error) {
 	var refs []SessionRef
-	entries, err := os.ReadDir(s.SessionStateDir)
+	entries, err := sessionfs.ReadDir(s.SessionStateDir)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, nil
@@ -64,7 +69,7 @@ func (s *Store) List() ([]SessionRef, error) {
 		}
 		dir := filepath.Join(s.SessionStateDir, entry.Name())
 		path := filepath.Join(dir, EventsFile)
-		info, err := os.Stat(path)
+		info, err := sessionfs.Stat(path)
 		if err != nil || info.IsDir() {
 			continue
 		}
@@ -94,7 +99,7 @@ func (s *Store) List() ([]SessionRef, error) {
 }
 
 func (s *Store) Read(ref SessionRef) ([]Record, Stats, error) {
-	f, err := os.Open(ref.Path)
+	f, err := sessionfs.Open(ref.Path)
 	if err != nil {
 		return nil, Stats{}, err
 	}
@@ -194,7 +199,7 @@ func decodeRecord(line []byte, lineNo int) (*Record, error) {
 }
 
 func readWorkspaceMeta(path string) *WorkspaceMeta {
-	data, err := os.ReadFile(path)
+	data, err := sessionfs.ReadFile(path)
 	if err != nil {
 		return nil
 	}

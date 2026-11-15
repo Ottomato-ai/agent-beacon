@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
+
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/sessionfs"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/sessionsync"
 
 	_ "modernc.org/sqlite"
 )
@@ -97,7 +99,7 @@ func (s *Store) listGlobalStorage() ([]TraceRef, error) {
 	if !fileExists(s.GlobalDBPath) {
 		return nil, nil
 	}
-	db, err := openSQLiteReadOnly(s.GlobalDBPath)
+	db, err := sessionsync.OpenSQLite(s.GlobalDBPath, "busy_timeout(1000)")
 	if err != nil {
 		return nil, fmt.Errorf("open Cursor global storage: %w", err)
 	}
@@ -152,7 +154,7 @@ func (s *Store) listTranscripts() ([]TraceRef, error) {
 	if !dirExists(s.ProjectsDir) {
 		return nil, nil
 	}
-	projectDirs, err := os.ReadDir(s.ProjectsDir)
+	projectDirs, err := sessionfs.ReadDir(s.ProjectsDir)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, nil
@@ -195,7 +197,7 @@ type transcriptEntry struct {
 }
 
 func listTranscriptFiles(dir string) []transcriptEntry {
-	entries, err := os.ReadDir(dir)
+	entries, err := sessionfs.ReadDir(dir)
 	if err != nil {
 		return nil
 	}
@@ -213,7 +215,7 @@ func listTranscriptFiles(dir string) []transcriptEntry {
 		if !entry.IsDir() {
 			continue
 		}
-		children, err := os.ReadDir(path)
+		children, err := sessionfs.ReadDir(path)
 		if err == nil {
 			for _, child := range children {
 				childPath := filepath.Join(path, child.Name())
@@ -229,7 +231,7 @@ func listTranscriptFiles(dir string) []transcriptEntry {
 }
 
 func listSubagentTranscriptEntries(dir, parentID string) []transcriptEntry {
-	entries, err := os.ReadDir(dir)
+	entries, err := sessionfs.ReadDir(dir)
 	if err != nil {
 		return nil
 	}
@@ -266,7 +268,7 @@ func (s *Store) Read(ref TraceRef) ([]Record, error) {
 }
 
 func (s *Store) readGlobalStorage(ref TraceRef) ([]Record, error) {
-	db, err := openSQLiteReadOnly(s.GlobalDBPath)
+	db, err := sessionsync.OpenSQLite(s.GlobalDBPath, "busy_timeout(1000)")
 	if err != nil {
 		return nil, fmt.Errorf("open Cursor global storage: %w", err)
 	}
@@ -347,7 +349,7 @@ func (s *Store) readGlobalStorage(ref TraceRef) ([]Record, error) {
 	}
 	if summary := compactionSummary(composer); summary != nil {
 		used, limit := contextFromAny(composer, composer.Context, summary)
-		records = append(records, Record{Order: order, NativeID: "compaction:" + stringValue(summary["compacted_through_id"]), Type: "system_event", Subtype: "compaction", TimestampMS: ref.UpdatedAtUnixMS, ContextUsedTokens: used, ContextLimitTokens: limit, Data: summary})
+		records = append(records, Record{Order: 0, NativeID: "compaction:" + stringValue(summary["compacted_through_id"]), Type: "system_event", Subtype: "compaction", TimestampMS: ref.UpdatedAtUnixMS, ContextUsedTokens: used, ContextLimitTokens: limit, Data: summary})
 	}
 	return records, nil
 }
@@ -366,7 +368,7 @@ func readBubble(db *sql.DB, composerID, bubbleID string) (bubbleData, bool) {
 }
 
 func (s *Store) readTranscript(ref TraceRef) ([]Record, error) {
-	data, err := os.ReadFile(ref.SourcePath)
+	data, err := sessionfs.ReadFile(ref.SourcePath)
 	if err != nil {
 		return nil, err
 	}
@@ -426,24 +428,11 @@ func (s *Store) readTranscript(ref TraceRef) ([]Record, error) {
 	return out, nil
 }
 
-func openSQLiteReadOnly(path string) (*sql.DB, error) {
-	uriPath := filepath.ToSlash(path)
-	if !strings.HasPrefix(uriPath, "/") {
-		uriPath = "/" + uriPath
-	}
-	u := url.URL{Scheme: "file", Path: uriPath}
-	q := u.Query()
-	q.Set("mode", "ro")
-	q.Set("_pragma", "busy_timeout(1000)")
-	u.RawQuery = q.Encode()
-	return sql.Open("sqlite", u.String())
-}
-
 func fileExists(path string) bool {
 	if strings.TrimSpace(path) == "" {
 		return false
 	}
-	info, err := os.Stat(path)
+	info, err := sessionfs.Stat(path)
 	return err == nil && info.Mode().IsRegular()
 }
 
@@ -451,6 +440,6 @@ func dirExists(path string) bool {
 	if strings.TrimSpace(path) == "" {
 		return false
 	}
-	info, err := os.Stat(path)
+	info, err := sessionfs.Stat(path)
 	return err == nil && info.IsDir()
 }

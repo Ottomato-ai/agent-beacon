@@ -6,7 +6,6 @@ import (
 	"github.com/asymptote-labs/agent-beacon/cli/beacon-hooks/internal/config"
 	hookdiff "github.com/asymptote-labs/agent-beacon/cli/beacon-hooks/internal/diff"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon-hooks/internal/logging"
-	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve"
 )
 
 // Kiro payload readers and tool taxonomy.
@@ -208,7 +207,7 @@ const kiroMCPToolPrefix = "@"
 // block is exit code 2 with the reason on stderr. There is no response object to return.
 //
 // Beacon's shared commands all finish by writing a JSON object to stdout -- `{}` for most of them,
-// `{"permission":"allow"}` for pre-tool -- which every other runtime reads as "no opinion". On
+// `{"permission":"allow"}` for Cursor's pre-tool -- which every other runtime reads as "no opinion". On
 // Kiro those same bytes are not read at all on the tool events, and are pasted into the model's
 // context on the two events that are. A hook whose job is to observe would be putting `{}` in
 // front of the model at the start of every session and before every prompt: a small amount of
@@ -473,30 +472,6 @@ func kiroToolFailed(toolResponse map[string]interface{}) bool {
 // that mean something else by it.
 func kiroAssistantResponse(input map[string]interface{}) string {
 	return getFirstStr(input, "assistant_response")
-}
-
-// emitKiroAssistantResponse records the agent's final reply as its own event.
-//
-// The shared stop command records that a turn finished; it does not record what the agent said,
-// because most runtimes do not tell it. Kiro does, on the same payload, and dropping it would
-// throw away the one piece of model output this runtime puts on a hook -- the half of a session
-// that prompt.submitted only covers the user's side of.
-//
-// Written in the OTel GenAI output-messages shape with the retention marker beside it, exactly as
-// the agent-thought command writes reasoning, so a reader that already understands one understands
-// the other. `agent.message` rather than `agent.reasoning`: this is the reply, not the thinking,
-// and it is the action the fx and Devin Cloud mappers already use for the same thing.
-func emitKiroAssistantResponse(logger *logging.Logger, input map[string]interface{}, sessionID string) {
-	text := kiroAssistantResponse(input)
-	if text == "" {
-		return
-	}
-	fields := sessionFields(sessionID, input)
-	fields["gen_ai"] = mergeNested(fields["gen_ai"], map[string]interface{}{
-		"output": map[string]interface{}{"messages": asymptoteobserve.TextOutputMessages(text)},
-	})
-	fields["content"] = retainedContentFields(text)
-	emitHookEvent(logger, "agent.message", "session", "info", "Agent response captured", input, fields)
 }
 
 // applyKiroToolResult attaches what the shared toolFieldsWithResponse cannot reach: the operation a

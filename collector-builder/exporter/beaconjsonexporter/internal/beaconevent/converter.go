@@ -46,8 +46,8 @@ var claudeLogEventClassifications = map[string]eventClassification{
 	ClaudeAPIRequest:                      {action: "session.activity", category: "session"},
 	"claude_code.api_error":               {action: "session.error", category: "session"},
 	"claude_code.api_refusal":             {action: "session.status", category: "session"},
-	"claude_code.api_request_body":        {action: "session.activity", category: "session"},
-	"claude_code.api_response_body":       {action: "session.activity", category: "session"},
+	ClaudeAPIRequestBody:                  {action: "session.activity", category: "session"},
+	ClaudeAPIResponseBody:                 {action: "session.activity", category: "session"},
 	ClaudeToolDecision:                    {},
 	"claude_code.permission_mode_changed": {action: "session.status", category: "session"},
 	"claude_code.auth":                    {action: "session.activity", category: "session"},
@@ -89,7 +89,25 @@ var noisyCodexLogMessages = []string{
 type Options struct {
 	IncludeRuntimeMetrics bool
 	IncludeCodexSpans     bool
+	// CaptureModelContext keeps what Beacon records from Claude Code's API bodies. Off, every body
+	// event is dropped; see takeClaudeAPIBody.
+	CaptureModelContext bool
+	// CodexSurfaces remembers which Codex surface (CLI or desktop app) each conversation runs in,
+	// for records that don't say (see codex_surface.go). Nil places each record on its own.
+	CodexSurfaces *CodexSurfaces
+	// PeerUser takes each event's user from the PeerUIDAttribute and PeerUserAttribute resource
+	// attributes. Only a collector whose pipeline runs the beacon_peer processor sets it: that
+	// processor removes whatever a sender put under those names and writes the account the kernel
+	// says owns the sending socket, so without it the attributes are only what the sender claimed.
+	PeerUser bool
 }
+
+const (
+	// PeerUIDAttribute and PeerUserAttribute are the resource attributes the beacon_peer processor
+	// writes: the account id that owns the client socket an export arrived on, and its name.
+	PeerUIDAttribute  = "beacon.peer.uid"
+	PeerUserAttribute = "beacon.peer.user"
+)
 
 type Converter struct {
 	opts Options
@@ -111,7 +129,11 @@ func (c Converter) EventsFromLogs(logs plog.Logs) []Event {
 				if ShouldDropLog(resourceAttrs, record) {
 					continue
 				}
-				events = append(events, c.EventFromLog(resourceAttrs, record))
+				event, keep, listings := c.eventFromLog(resourceAttrs, record)
+				events = append(events, listings...)
+				if keep {
+					events = append(events, event)
+				}
 			}
 		}
 	}
@@ -157,7 +179,12 @@ func (c Converter) EventsFromMetrics(metrics pmetric.Metrics) []Event {
 }
 
 func ShouldDropLog(resourceAttrs map[string]interface{}, record plog.LogRecord) bool {
-	attrs := MergeMaps(resourceAttrs, AttrsToMap(record.Attributes()))
+	attrs := mergeSignalAttrs(resourceAttrs, AttrsToMap(record.Attributes()))
+	if name := ClaudeLogEventName(attrs, record.Body().AsString()); isClaudeAPIBody(name) {
+		// A request body is decided once it is parsed, in eventFromLog: it is kept for a WebFetch
+		// page or for the MCP tools it advertised. Nothing is kept from a response body.
+		return name != ClaudeAPIRequestBody
+	}
 	harness := HarnessName(attrs, record.Body().AsString())
 	if isCodexHarness(harness) {
 		return isNoisyCodexLog(attrs, record.Body().AsString())
@@ -301,19 +328,41 @@ func shouldDropCopilotMetric(resourceAttrs map[string]interface{}, name string, 
 	return true
 }
 
+// statedAction is the first action the attributes state, unless it is one only Beacon itself
+// writes (asymptoteobserve.IsBeaconOnlyAction). Anything that can reach the loopback OTLP
+// receiver can state an action, so one of those arriving over OTLP is not believed and the action
+// is inferred as if none were stated.
+func statedAction(attrs map[string]interface{}, keys ...string) string {
+	action := FirstString(attrs, keys...)
+	if asymptoteobserve.IsBeaconOnlyAction(action) {
+		return ""
+	}
+	return action
+}
+
 func (c Converter) EventFromLog(resourceAttrs map[string]interface{}, record plog.LogRecord) Event {
-	attrs := MergeMaps(resourceAttrs, AttrsToMap(record.Attributes()))
+	event, _, _ := c.eventFromLog(resourceAttrs, record)
+	return event
+}
+
+// eventFromLog converts a log record, and reports whether the event is worth keeping: it is not
+// for a Claude Code API body event that leaves no page text behind once its body is removed.
+// listings are the mcp.tool_listed events for the MCP tools a Claude Code request body advertised,
+// which are kept in its place.
+func (c Converter) eventFromLog(resourceAttrs map[string]interface{}, record plog.LogRecord) (event Event, keep bool, listings []Event) {
+	attrs := mergeSignalAttrs(resourceAttrs, AttrsToMap(record.Attributes()))
 	body := record.Body().AsString()
+	kept, isAPIBody := takeClaudeAPIBody(attrs, ClaudeLogEventName(attrs, body), c.opts.CaptureModelContext)
 	ts := Timestamp(record.Timestamp().AsTime())
 	// An action the record states outright is observed by definition; only the fallback has to
 	// account for how it got there.
-	action := FirstString(attrs, "beacon.event.action", "event.action", "gen_ai.agent.action", "ai.agent.action")
+	action := statedAction(attrs, "beacon.event.action", "event.action", "gen_ai.agent.action", "ai.agent.action")
 	fidelity := asymptoteobserve.FidelityObserved
 	if action == "" {
 		action, fidelity = InferActionWithFidelity(attrs, body)
 	}
 	message := FirstNonEmpty(body, FirstString(attrs, "message", "log.message", "event.name"))
-	event := NewEvent(action, EventCategory(action, FirstString(attrs, "beacon.event.category", "event.category", "category")), Severity(record.SeverityText(), record.SeverityNumber().String()), HarnessName(attrs, message), ts)
+	event = NewEvent(action, EventCategory(action, FirstString(attrs, "beacon.event.category", "event.category", "category")), Severity(record.SeverityText(), record.SeverityNumber().String()), HarnessName(attrs, message), ts)
 	event.Event.Fidelity = fidelity
 	event.Message = message
 	c.PopulateCommon(&event, attrs)
@@ -329,16 +378,19 @@ func (c Converter) EventFromLog(resourceAttrs map[string]interface{}, record plo
 	})
 	c.NormalizeCodexLogEvent(&event, attrs)
 	c.NormalizeClaudeLogEvent(&event, attrs, body)
+	NormalizeGeminiLogEvent(&event, attrs)
+	normalizeClaudeWebFetchInput(&event, kept.webFetch)
 	// Last, so it sees the action and category the normalizers settled on rather
 	// than the ones InferAction guessed.
 	c.PromoteRetainedContent(&event, attrs, body)
-	return event
+	c.opts.CodexSurfaces.settle(&event, attrs)
+	return event, !isAPIBody || kept.webFetch.text != "", c.claudeMCPToolListings(attrs, record, kept.mcpTools)
 }
 
 func (c Converter) EventFromSpan(resourceAttrs map[string]interface{}, span ptrace.Span) Event {
-	attrs := MergeMaps(resourceAttrs, AttrsToMap(span.Attributes()))
+	attrs := mergeSignalAttrs(resourceAttrs, AttrsToMap(span.Attributes()))
 	codexTurnUsage := IsCodexTurnUsageSpan(attrs, span.Name())
-	action := FirstString(attrs, "beacon.event.action", "event.action", "gen_ai.agent.action", "ai.agent.action")
+	action := statedAction(attrs, "beacon.event.action", "event.action", "gen_ai.agent.action", "ai.agent.action")
 	fidelity := asymptoteobserve.FidelityObserved
 	if action == "" {
 		action, fidelity = InferActionWithFidelity(attrs, span.Name())
@@ -377,11 +429,12 @@ func (c Converter) EventFromSpan(resourceAttrs map[string]interface{}, span ptra
 	}
 	event.Raw = c.RawPayload(attrs, rawExtra)
 	c.PromoteRetainedContent(&event, attrs, span.Name())
+	c.opts.CodexSurfaces.settle(&event, attrs)
 	return event
 }
 
 func (c Converter) ShouldDropSpan(resourceAttrs map[string]interface{}, span ptrace.Span) bool {
-	attrs := MergeMaps(resourceAttrs, AttrsToMap(span.Attributes()))
+	attrs := mergeSignalAttrs(resourceAttrs, AttrsToMap(span.Attributes()))
 	harness := HarnessName(attrs, span.Name())
 	if isCodexHarness(harness) {
 		return !c.opts.IncludeCodexSpans && !IsCodexTurnUsageSpan(attrs, span.Name())
@@ -542,42 +595,45 @@ func CodexLogEventName(attrs map[string]interface{}) string {
 	return strings.ToLower(FirstString(attrs, "event.name"))
 }
 
+// NormalizeCodexToolResult applies asymptoteobserve.NormalizeCodexToolResult to a
+// `codex.tool_result` record, the definition `beacon endpoint codex sync` applies to the same call
+// read from the rollout.
+//
+// `output` is read verbatim rather than through FirstString, which trims: it is the text Codex gave
+// the model, and the content hash describes it exactly as the rollout's copy does.
 func NormalizeCodexToolResult(event *Event, attrs map[string]interface{}) {
-	toolName := FirstString(attrs, "tool.name", "tool_name", "function_name", "tool", "mcp_server")
-	args := FirstString(attrs, "arguments", "function_args", "tool.command", "command")
-	event.Event.Action = "tool.invoked"
-	event.Event.Category = "tool"
-	if event.Tool == nil {
-		event.Tool = &ToolInfo{}
+	output, _ := attrs["output"].(string)
+	truncated, _ := BoolAttr(attrs, "output_truncated")
+	success, reported := BoolAttr(attrs, "success")
+	duration, _ := Int64Attr(attrs, "duration_ms")
+	var args interface{}
+	if text := FirstString(attrs, "arguments", "function_args"); text != "" {
+		args = text
 	}
-	event.Tool.Name = toolName
-	event.Tool.Command = args
-	if command := codexShellCommand(toolName, args); command != "" {
-		event.Event.Action = "command.executed"
-		event.Event.Category = "command"
-		event.Command = &CommandInfo{Command: command}
+	fields := asymptoteobserve.NormalizeCodexToolResult(asymptoteobserve.CodexToolResult{
+		Name:            FirstString(attrs, "tool_name", "tool.name", "function_name", "tool"),
+		Namespace:       FirstString(attrs, "tool_namespace"),
+		CallID:          ToolCallID(attrs),
+		Arguments:       args,
+		Output:          output,
+		OutputTruncated: truncated,
+		Failed:          reported && !success,
+		DurationMS:      duration,
+	})
+	event.Event.Action = fields.Action
+	event.Event.Category = fields.Category
+	event.Message = fields.Message
+	event.Severity = fields.Severity
+	event.Tool = fields.Tool
+	event.Command = fields.Command
+	if fields.MCP != nil {
+		event.MCP = fields.MCP
 	}
-	event.Message = FirstNonEmpty(toolName, "Codex tool result")
-}
-
-func codexShellCommand(toolName, args string) string {
-	if strings.EqualFold(toolName, "shell") {
-		if cmd := codexArgumentCommand(args); cmd != "" {
-			return cmd
-		}
-		return args
+	event.Content = fields.Content
+	if event.GenAI == nil {
+		event.GenAI = &GenAIInfo{}
 	}
-	return codexArgumentCommand(args)
-}
-
-func codexArgumentCommand(args string) string {
-	var payload struct {
-		Cmd string `json:"cmd"`
-	}
-	if err := json.Unmarshal([]byte(args), &payload); err != nil {
-		return ""
-	}
-	return strings.TrimSpace(payload.Cmd)
+	event.GenAI.Tool = fields.GenAITool
 }
 
 func isClaudeOTelLogHarness(name string) bool {
@@ -593,10 +649,10 @@ func (c Converter) NormalizeClaudeLogEvent(event *Event, attrs map[string]interf
 	if event == nil || !isClaudeOTelLogHarness(event.Harness.Name) {
 		return
 	}
-	normalizeClaudeCoworkContext(event, attrs)
+	normalizeClaudeCoworkContext(event, attrs, c.opts.PeerUser)
 	originalAction := event.Event.Action
 	originalCategory := event.Event.Category
-	preserveAction := FirstString(attrs, "beacon.event.action", "event.action", "gen_ai.agent.action", "ai.agent.action") != ""
+	preserveAction := statedAction(attrs, "beacon.event.action", "event.action", "gen_ai.agent.action", "ai.agent.action") != ""
 	preserveCategory := preserveAction || FirstString(attrs, "beacon.event.category", "event.category", "category") != ""
 
 	originalFidelity := event.Event.Fidelity
@@ -645,10 +701,14 @@ func (c Converter) NormalizeClaudeLogEvent(event *Event, attrs map[string]interf
 }
 
 func ClaudeLogEventName(attrs map[string]interface{}, body string) string {
+	return claudeLogEventName(FirstString(attrs, "event.name"), body)
+}
+
+func claudeLogEventName(eventName, body string) string {
 	if normalized := strings.ToLower(strings.TrimSpace(body)); strings.HasPrefix(normalized, "claude_code.") {
 		return normalized
 	}
-	normalized := strings.ToLower(strings.TrimSpace(FirstString(attrs, "event.name")))
+	normalized := strings.ToLower(strings.TrimSpace(eventName))
 	if strings.HasPrefix(normalized, "claude_code.") {
 		return normalized
 	}
@@ -744,7 +804,19 @@ func NormalizeClaudeToolResult(event *Event, attrs map[string]interface{}) {
 	}
 }
 
-func normalizeClaudeCoworkContext(event *Event, attrs map[string]interface{}) {
+// normalizeClaudeCoworkContext applies what Claude Cowork reports about itself: where it ran and,
+// unless peerUser is set, the cloud identity it names in place of the collector's account.
+//
+// With peerUser (beacon_peer in the pipeline) a Cowork event has no user. Neither answer at hand is
+// the person: Cowork runs in the cloud and Claude Desktop does not ship for Linux, so its export
+// reaches the collector through a relay (`beacon endpoint cowork --ngrok`, a reverse proxy) and the
+// kernel names the relay's local account, the same one for every member of the org; and the cloud
+// identity attributes are whatever the sender wrote, behind a harness that is only a service name,
+// so honoring them would let any local account record an event as uid 0 / root by calling itself
+// Cowork. An empty user is unknown rather than wrong. Both answers stay in the event's raw
+// attributes: the cloud identity as Cowork sent it, and the relaying account as beacon.peer.uid and
+// beacon.peer.user.
+func normalizeClaudeCoworkContext(event *Event, attrs map[string]interface{}, peerUser bool) {
 	if event.Harness.Name != "claude_cowork" {
 		return
 	}
@@ -753,6 +825,10 @@ func normalizeClaudeCoworkContext(event *Event, attrs map[string]interface{}) {
 		event.Origin = asymptoteobserve.OriginCloud
 	case "local", "desktop":
 		event.Origin = asymptoteobserve.OriginLocal
+	}
+	if peerUser {
+		event.User = UserInfo{}
+		return
 	}
 	if name := FirstString(attrs, "user.email", "enduser.id", "user.account_id", "user.account_uuid", "user.id"); name != "" {
 		event.User.Name = name
@@ -847,8 +923,8 @@ func JSONMapAttr(attrs map[string]interface{}, key string) map[string]interface{
 }
 
 func (c Converter) EventFromMetric(resourceAttrs map[string]interface{}, metric pmetric.Metric) Event {
-	attrs := MergeMaps(resourceAttrs, map[string]interface{}{})
-	action := FirstString(attrs, "beacon.event.action", "event.action")
+	attrs := mergeSignalAttrs(resourceAttrs, map[string]interface{}{})
+	action := statedAction(attrs, "beacon.event.action", "event.action")
 	if action == "" {
 		action = "metric.observed"
 	}
@@ -864,6 +940,7 @@ func (c Converter) EventFromMetric(resourceAttrs map[string]interface{}, metric 
 		"metric_description": metric.Description(),
 		"metric_unit":        metric.Unit(),
 	})
+	c.opts.CodexSurfaces.settle(&event, attrs)
 	return event
 }
 
@@ -927,16 +1004,16 @@ func (c Converter) eventsFromUsageMetric(resourceAttrs map[string]interface{}, m
 	var events []Event
 	// Codex reports input tokens inclusive of both cached_input and
 	// cache_write_input. Beacon's gen_ai.usage keeps uncached input, cache read,
-	// and cache creation disjoint, so reduce input by both per-turn subsets;
-	// otherwise totals double-count cached prompt tokens. Returns nil (no-op)
-	// for every other usage metric.
-	inputSubsetsByTurn := codexInputSubsetsByTimestamp(metric)
+	// and cache creation disjoint, so reduce input by both subsets of the same
+	// series; otherwise totals double-count cached prompt tokens. Returns nil
+	// (no-op) for every other usage metric.
+	inputSubsetsBySeries := codexInputSubsetsBySeries(metric)
 	adjustValue := func(dpAttrs pcommon.Map, ts pcommon.Timestamp, value float64) float64 {
-		if inputSubsetsByTurn == nil {
+		if inputSubsetsBySeries == nil {
 			return value
 		}
-		if tt := FirstString(AttrsToMap(dpAttrs), "token_type"); strings.EqualFold(tt, "input") {
-			subsets := inputSubsetsByTurn[ts.AsTime().UnixNano()]
+		if scope, tokenType := tokenSeriesScope(dpAttrs, ts, codexTokenTypeAttribute); tokenType == "input" {
+			subsets := inputSubsetsBySeries[scope]
 			if value -= subsets.cached + subsets.cacheWrite; value < 0 {
 				value = 0
 			}
@@ -951,9 +1028,16 @@ func (c Converter) eventsFromUsageMetric(resourceAttrs map[string]interface{}, m
 			"metric_temporality": sum.AggregationTemporality().String(),
 			"metric_monotonic":   sum.IsMonotonic(),
 		}
+		// Gemini CLI's input series includes its cache series and its output series
+		// leaves out its thought series; see gemini_usage.go. Nil for every other metric.
+		geminiSeries := geminiTokenSeriesByScope(metric)
 		for i := 0; i < sum.DataPoints().Len(); i++ {
 			dp := sum.DataPoints().At(i)
-			events = append(events, c.usageEventFromDataPoint(resourceAttrs, metric, dp.Attributes(), dp.Timestamp(), adjustValue(dp.Attributes(), dp.Timestamp(), numberDataPointValue(dp)), extra))
+			event := c.usageEventFromDataPoint(resourceAttrs, metric, dp.Attributes(), dp.Timestamp(), adjustValue(dp.Attributes(), dp.Timestamp(), numberDataPointValue(dp)), extra)
+			if geminiSeries != nil {
+				geminiSeries.apply(&event, dp.Attributes(), dp.Timestamp(), numberDataPointValue(dp))
+			}
+			events = append(events, event)
 		}
 	case pmetric.MetricTypeGauge:
 		gauge := metric.Gauge()
@@ -985,26 +1069,28 @@ type codexInputSubsets struct {
 	cacheWrite float64
 }
 
-// codexInputSubsetsByTimestamp collects each turn's cached and cache-write
+const codexTokenTypeAttribute = "token_type"
+
+// codexInputSubsetsBySeries collects each series' cached and cache-write
 // datapoints so Codex's inclusive input count can be reduced to the canonical
 // uncached remainder. Returns nil for every other metric.
-func codexInputSubsetsByTimestamp(metric pmetric.Metric) map[int64]codexInputSubsets {
+func codexInputSubsetsBySeries(metric pmetric.Metric) map[string]codexInputSubsets {
 	if !strings.EqualFold(strings.TrimSpace(metric.Name()), "codex.turn.token_usage") {
 		return nil
 	}
 	if metric.Type() != pmetric.MetricTypeHistogram {
 		return nil
 	}
-	out := map[int64]codexInputSubsets{}
+	out := map[string]codexInputSubsets{}
 	dps := metric.Histogram().DataPoints()
-	for i := 0; i < dps.Len(); i++ {
+	for i := range dps.Len() {
 		dp := dps.At(i)
 		if !dp.HasSum() {
 			continue
 		}
-		key := dp.Timestamp().AsTime().UnixNano()
-		subsets := out[key]
-		switch strings.ToLower(FirstString(AttrsToMap(dp.Attributes()), "token_type")) {
+		scope, tokenType := tokenSeriesScope(dp.Attributes(), dp.Timestamp(), codexTokenTypeAttribute)
+		subsets := out[scope]
+		switch tokenType {
 		case "cached_input":
 			subsets.cached += dp.Sum()
 		case "cache_write_input":
@@ -1012,9 +1098,31 @@ func codexInputSubsetsByTimestamp(metric pmetric.Metric) map[int64]codexInputSub
 		default:
 			continue
 		}
-		out[key] = subsets
+		out[scope] = subsets
 	}
 	return out
+}
+
+// tokenSeriesScope returns a token-usage datapoint's series identity without its token type,
+// plus the type (lowercased). Every other attribute and the timestamp are part of the identity,
+// so sibling datapoints of one series share a scope while two sessions or two models in one
+// export never do.
+func tokenSeriesScope(attrs pcommon.Map, ts pcommon.Timestamp, typeAttribute string) (string, string) {
+	values := AttrsToMap(attrs)
+	tokenType := strings.ToLower(strings.TrimSpace(FirstString(values, typeAttribute)))
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		if key != typeAttribute {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d", ts.AsTime().UnixNano())
+	for _, key := range keys {
+		fmt.Fprintf(&b, "\x00%s=%v", key, values[key])
+	}
+	return b.String(), tokenType
 }
 
 func numberDataPointValue(dp pmetric.NumberDataPoint) float64 {
@@ -1025,7 +1133,7 @@ func numberDataPointValue(dp pmetric.NumberDataPoint) float64 {
 }
 
 func (c Converter) usageEventFromDataPoint(resourceAttrs map[string]interface{}, metric pmetric.Metric, dpAttrs pcommon.Map, ts pcommon.Timestamp, value float64, extra map[string]interface{}) Event {
-	attrs := MergeMaps(resourceAttrs, AttrsToMap(dpAttrs))
+	attrs := mergeSignalAttrs(resourceAttrs, AttrsToMap(dpAttrs))
 	action := "token.usage"
 	if IsCostUsageMetric(metric.Name()) {
 		action = "cost.usage"
@@ -1066,6 +1174,7 @@ func (c Converter) usageEventFromDataPoint(resourceAttrs map[string]interface{},
 		rawExtra[k] = v
 	}
 	event.Raw = c.RawPayload(attrs, rawExtra)
+	c.opts.CodexSurfaces.settle(&event, attrs)
 	return event
 }
 
@@ -1106,6 +1215,7 @@ func ApplyTokenUsage(event *Event, tokenType string, value int64) {
 
 func (c Converter) PopulateCommon(event *Event, attrs map[string]interface{}) {
 	populateRunContext(event, attrs)
+	c.applyPeerUser(event, attrs)
 	// A runtime that numbers its own telemetry gets that number preserved; the exporter
 	// stamps its own emission counter for everything else (see beaconExporter.
 	// stampSequence). Zero and negative values are ignored -- zero is the schema's
@@ -1121,6 +1231,11 @@ func (c Converter) PopulateCommon(event *Event, attrs map[string]interface{}) {
 	event.Repository = FirstString(attrs, "vcs.repository.url", "repository", "repo.path", "workspace.repository")
 	event.Branch = FirstString(attrs, "vcs.branch.name", "git.branch", "branch")
 	event.UserAgent = UserAgentFromAttrs(attrs)
+	// A sender that cut a field to fit (the browser extension) says so on the record; promoted, so
+	// the flag survives metadata-only forwarding, which drops raw attributes.
+	if truncated, _ := BoolAttr(attrs, "beacon.field_truncated"); truncated {
+		event.Truncated = true
+	}
 	if id := FirstString(attrs, "gen_ai.conversation.id", "beacon.session.id", "copilot_chat.session_id", "copilot_chat.chat_session_id", "conversation.id", "conversation_id", "session.id"); id != "" || FirstString(attrs, "cwd", "working_directory", "workspace") != "" {
 		event.Session = &SessionInfo{
 			ID:               id,
@@ -1137,7 +1252,7 @@ func (c Converter) PopulateCommon(event *Event, attrs map[string]interface{}) {
 	path := FirstString(attrs, "file.path", "file_path", "code.filepath")
 	operation := FirstString(attrs, "file.operation", "operation")
 	if path == "" {
-		path = FilePathFromURI(FirstString(attrs, "mcp.resource.uri"))
+		path = asymptoteobserve.FilePathFromURI(FirstString(attrs, "mcp.resource.uri"))
 		if path != "" && operation == "" && event.Event.Action == "file.read" {
 			operation = "read"
 		}
@@ -1177,8 +1292,17 @@ func (c Converter) PopulateCommon(event *Event, attrs map[string]interface{}) {
 	}
 	if event.Event.Category == "prompt" {
 		if text := FirstNonEmpty(FirstTextAttr(attrs, PromptTextKeys...), FirstMessageText(event.GenAI)); text != "" {
-			event.Prompt = &PromptInfo{Text: text}
+			SetPromptText(event, text)
 		}
+	}
+	// The prompt this event belongs to. Claude Code writes it as prompt.id on every event of a
+	// turn, Gemini CLI as prompt_id, Codex as turn.id; the alias list is shared with the hook path
+	// so both capture paths put one turn under one value.
+	if id := asymptoteobserve.PromptIDFrom(attrs); id != "" {
+		if event.Prompt == nil {
+			event.Prompt = &PromptInfo{}
+		}
+		event.Prompt.ID = id
 	}
 }
 
@@ -1250,7 +1374,7 @@ func GenAIFromAttrs(attrs map[string]interface{}) *GenAIInfo {
 		genai.Retrieval = &GenAIRetrievalInfo{QueryText: query}
 	}
 	if instructions, ok := AnyAttr(attrs, "gen_ai.system_instructions"); ok {
-		genai.SystemInstructions = instructions
+		genai.SystemInstructions = SystemInstructionParts(instructions)
 	}
 	if tokenType := FirstString(attrs, "gen_ai.token.type"); tokenType != "" {
 		genai.Token = &GenAITokenInfo{Type: tokenType}
@@ -1354,20 +1478,59 @@ func GenAIToolFromAttrs(attrs map[string]interface{}) *GenAIToolInfo {
 	return tool
 }
 
+// inclusiveInputTokenKeys are the input-count names whose value includes cached
+// prompt tokens. The OTel GenAI semconv says of gen_ai.usage.input_tokens "This
+// value SHOULD include all types of input tokens, including cached tokens", and
+// of each cache count "The value SHOULD be included in gen_ai.usage.input_tokens".
+// The deprecated prompt_tokens spellings it replaced carry OpenAI's prompt_tokens,
+// which counts prompt_tokens_details.cached_tokens too. Claude Code's bare
+// input_tokens is deliberately absent: it is Anthropic's usage.input_tokens,
+// which already excludes cache reads and writes.
+var inclusiveInputTokenKeys = []string{"gen_ai.usage.input_tokens", "llm.usage.prompt_tokens", "gen_ai.usage.prompt_tokens"}
+
 // GenAIUsageFromAttrs normalizes runtime token usage into the canonical
 // gen_ai.usage struct. Alongside the OTel GenAI and legacy llm.usage.* semconv
 // names it accepts Claude Code's bare claude_code.llm_request span attribute
 // names (input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens)
 // so span-level usage and the per-step session drilldown carry real counts.
+//
+// Beacon keeps input, cache read and cache creation disjoint, so an inclusive
+// input count (see inclusiveInputTokenKeys) is reduced by the cache counts
+// reported beside it, the same reduction the Codex turn span gets. The raw
+// attributes keep the value as reported.
 func GenAIUsageFromAttrs(attrs map[string]interface{}) *GenAIUsageInfo {
 	usage := &GenAIUsageInfo{}
-	if value, ok := Int64Attr(attrs, "gen_ai.usage.cache_creation.input_tokens", "gen_ai.usage.cache_creation_input_tokens", "cache_creation_tokens"); ok {
-		usage.CacheCreation = &GenAIUsageCacheCreationInfo{InputTokens: &value}
+	var cached int64
+	if value, ok := Int64Attr(attrs, "gen_ai.usage.cache_creation.input_tokens", "gen_ai.usage.cache_write.input_tokens", "gen_ai.usage.cache_creation_input_tokens", "cache_creation_tokens"); ok {
+		// The one-hour subset of the writes, from the browser extension's Claude adapter.
+		// Claude Code's own api_request log reports only the cache_creation_tokens total.
+		var oneHour *int64
+		if h, ok := Int64Attr(attrs, "gen_ai.usage.cache_creation.ephemeral_1h_input_tokens"); ok {
+			oneHour = &h
+		}
+		usage.CacheCreation = asymptoteobserve.NewCacheCreationUsage(value, oneHour)
+		if value > 0 {
+			cached += value
+		}
 	}
 	if value, ok := Int64Attr(attrs, "gen_ai.usage.cache_read.input_tokens", "gen_ai.usage.cache_read_input_tokens", "cache_read_tokens"); ok {
 		usage.CacheRead = &GenAIUsageCacheReadInfo{InputTokens: &value}
+		if value > 0 {
+			cached += value
+		}
 	}
-	if value, ok := Int64Attr(attrs, "gen_ai.usage.input_tokens", "llm.usage.prompt_tokens", "gen_ai.usage.prompt_tokens", "input_tokens"); ok {
+	if value, ok := Int64Attr(attrs, inclusiveInputTokenKeys...); ok {
+		// Guard: an input smaller than its own cache counts cannot contain
+		// them, so that source already reports uncached input (Anthropic's
+		// shape under semconv names) and is stored as reported rather than
+		// having real tokens erased. The semconv names both cache reads and
+		// cache writes as part of input, so both are removed; an emitter that
+		// folds in only one of them undercounts input by the other.
+		if cached > 0 && value >= cached {
+			value -= cached
+		}
+		usage.InputTokens = &value
+	} else if value, ok := Int64Attr(attrs, "input_tokens"); ok {
 		usage.InputTokens = &value
 	}
 	if value, ok := Int64Attr(attrs, "gen_ai.usage.output_tokens", "llm.usage.completion_tokens", "gen_ai.usage.completion_tokens", "output_tokens"); ok {
@@ -1870,30 +2033,30 @@ func FirstMessageText(genai *GenAIInfo) string {
 	return firstTextFromAny(genai.Input.Messages)
 }
 
+// firstTextFromAny is the first meaningful text part in a messages, parts or prompt value, read the
+// way every Beacon reader reads one.
 func firstTextFromAny(value interface{}) string {
-	switch typed := value.(type) {
-	case string:
-		return meaningfulText(typed)
-	case []interface{}:
-		for _, item := range typed {
-			if text := firstTextFromAny(item); text != "" {
-				return text
-			}
-		}
-	case map[string]interface{}:
-		if content, ok := typed["content"]; ok {
-			if text := firstTextFromAny(content); text != "" {
-				return text
-			}
-		}
-		if parts, ok := typed["parts"]; ok {
-			return firstTextFromAny(parts)
-		}
-		if messages, ok := typed["messages"]; ok {
-			return firstTextFromAny(messages)
+	for _, text := range asymptoteobserve.GenAIText(value, "", asymptoteobserve.GenAIPartTypeText) {
+		if text = meaningfulText(text); text != "" {
+			return text
 		}
 	}
 	return ""
+}
+
+// SystemInstructionParts puts a gen_ai.system_instructions value in the semconv shape, a list of
+// parts. Producers that predate the convention send the instructions as one string, and AnyAttr
+// keeps a value that is not JSON as that string. Stored as is, the field would hold a string on
+// some events and a list on others, and a typed log index such as Elasticsearch's rejects every
+// event whose shape differs from the first it saw. A single part object becomes a one-part list.
+func SystemInstructionParts(value interface{}) interface{} {
+	switch typed := value.(type) {
+	case string:
+		return asymptoteobserve.SystemInstructionParts(typed)
+	case map[string]interface{}:
+		return []interface{}{typed}
+	}
+	return value
 }
 
 func meaningfulText(value string) string {
@@ -2062,6 +2225,14 @@ func HasToolCall(attrs map[string]interface{}) bool {
 	return IsMeaningfulValue(attrs["gen_ai.tool.call.arguments"])
 }
 
+// SetPromptText records an event's prompt text, keeping the prompt id already on it.
+func SetPromptText(event *Event, text string) {
+	if event.Prompt == nil {
+		event.Prompt = &PromptInfo{}
+	}
+	event.Prompt.Text = text
+}
+
 // ToolCallID reads the runtime's own identifier for one tool invocation.
 //
 // Claude Code writes it as tool_use_id and Codex as call_id; neither name was
@@ -2101,18 +2272,7 @@ func IsMeaningfulValue(value interface{}) bool {
 }
 
 func IsFileURI(value string) bool {
-	return FilePathFromURI(value) != ""
-}
-
-func FilePathFromURI(value string) string {
-	parsed, err := url.Parse(value)
-	if err != nil || parsed.Scheme != "file" {
-		return ""
-	}
-	if parsed.Host != "" && parsed.Host != "localhost" {
-		return "//" + parsed.Host + parsed.Path
-	}
-	return parsed.Path
+	return asymptoteobserve.FilePathFromURI(value) != ""
 }
 
 func HasPromptLikeContent(attrs map[string]interface{}) bool {
@@ -2215,4 +2375,52 @@ func EventCategory(action, explicit string) string {
 	default:
 		return ""
 	}
+}
+
+// applyPeerUser records the account that sent an export in place of the collector's own.
+//
+// Without it every OTLP event carries the collector process's account, which on a system install
+// is root for everyone: a prompt typed by one person on a shared machine reads as root's. The
+// beacon_peer processor resolves the sender from the kernel; this only copies what it found, and
+// changes nothing when it found nobody, so an unattributed event is the collector's account as it
+// always was rather than someone's guess. With it on, nothing a sender reports replaces the kernel's
+// answer; a Claude Cowork event of any signal, which arrives through a relay, gets no user instead
+// (see normalizeClaudeCoworkContext).
+func (c Converter) applyPeerUser(event *Event, attrs map[string]interface{}) {
+	if !c.opts.PeerUser {
+		return
+	}
+	// With the processor in the pipeline, the collector's own account is never a fallback: on a
+	// system install it is root, and a sender that closed its connection before the lookup would
+	// otherwise be recorded exactly like root's own, kernel-attributed exports. An event whose sender
+	// could not be identified carries no user at all.
+	uid := FirstString(attrs, PeerUIDAttribute)
+	// Claude Cowork reaches the collector only through a relay (see normalizeClaudeCoworkContext),
+	// so the kernel's answer is the relay's account, not the person. That holds for every signal,
+	// including the spans and metric datapoints that never pass through the log normalizer.
+	if uid == "" || event.Harness.Name == "claude_cowork" {
+		event.User = UserInfo{}
+		return
+	}
+	event.User.UID = uid
+	// An account the system cannot name is still recorded by its id, rather than keeping the
+	// collector's name beside someone else's uid.
+	event.User.Name = FirstString(attrs, PeerUserAttribute)
+}
+
+// mergeSignalAttrs is MergeMaps(resource, signal) for one record, span or datapoint, except that the
+// peer attributes come from the resource alone. beacon_peer writes them on the resource, and in a
+// plain merge a record, span or datapoint attribute of the same name would win, letting a sender
+// name any account it liked. The processor also strips them below the resource; this keeps the
+// converter right on its own.
+func mergeSignalAttrs(resource, signal map[string]interface{}) map[string]interface{} {
+	merged := MergeMaps(resource, signal)
+	for _, key := range []string{PeerUIDAttribute, PeerUserAttribute} {
+		if value, ok := resource[key]; ok {
+			merged[key] = value
+		} else {
+			delete(merged, key)
+		}
+	}
+	return merged
 }

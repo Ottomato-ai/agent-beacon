@@ -77,10 +77,6 @@ var pack = siempack.Pack{
 // mustRead returns the embedded asset at path or panics. Retained for test use.
 func mustRead(path string) string { return pack.MustRead(path) }
 
-// filesFromFS builds the file list from the supplied FS; tests use it to inject
-// read-error conditions.
-func filesFromFS(fsys fs.FS) ([]File, error) { return pack.WithFS(fsys).Files() }
-
 // Files returns all pack files, propagating any embedded asset read error.
 func Files() ([]File, error) { return pack.Files() }
 
@@ -142,7 +138,7 @@ func RenderVectorConfig(opts RenderOptions) (string, error) {
 		}
 		content = strings.Replace(content, privacyTransformMarker, strings.TrimSpace(string(transforms)), 1)
 		content = strings.Replace(content,
-			"[sinks.asymptote_runtime]\ntype = \"http\"\ninputs = [\"beacon_runtime\"]",
+			"[sinks.asymptote_runtime]\ntype = \"http\"\ninputs = [\"beacon_runtime\", \"beacon_backfill\"]",
 			"[sinks.asymptote_runtime]\ntype = \"http\"\ninputs = [\"beacon_runtime_metadata\"]", 1)
 		content = strings.Replace(content,
 			"[sinks.asymptote_inventory]\ntype = \"http\"\ninputs = [\"beacon_inventory\"]",

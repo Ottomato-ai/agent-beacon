@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/testenv"
 )
 
 // These tests run the harnesses' own CLIs against the configs `beacon mcp connect` writes, in a
@@ -21,6 +23,9 @@ func realCLI(t *testing.T, name string) string {
 	if testing.Short() {
 		t.Skip("real-CLI tests are skipped in -short mode")
 	}
+	// The point is the CLI as the user installed it, interpreter and all, so this test gets the
+	// machine's whole PATH rather than the empty one the package runs with.
+	testenv.UseHostPath(t)
 	path, err := exec.LookPath(name)
 	if err != nil {
 		t.Skipf("%s is not installed", name)
@@ -160,6 +165,24 @@ func TestMCPConnectEndToEndOpenCode(t *testing.T) {
 	_, _ = runCLI(t, fx.home, bin, "mcp", "list")
 	if !containsString(fx.auth.all(), "Bearer "+e2eToken) {
 		t.Fatalf("OpenCode did not send the token from BEACON_MCP_TOKEN; saw %q", fx.auth.all())
+	}
+}
+
+// Oh My Pi lists its MCP servers with `/mcp list`, a slash command inside a session, and has no CLI
+// subcommand a test can run instead. `omp read mcp://…` loads the configured MCP servers the way a
+// session does -- discovery, ${VAR} expansion, stored credentials -- and connects to each before it
+// looks the resource up, so a request reaching the fixture carrying the token proves the entry was
+// loaded at the connected URL with the token taken from the environment. The read itself fails: no
+// server has that resource. Starting omp is slow, so one probe covers both properties; disconnect
+// restoring the config is covered without the real CLI.
+func TestMCPConnectEndToEndOhMyPi(t *testing.T) {
+	bin := realCLI(t, "omp")
+	fx := realCLIFixture(t, "omp")
+	t.Setenv("BEACON_MCP_TOKEN", e2eToken)
+	connectReal(t, fx, "omp", "--token-env", "BEACON_MCP_TOKEN")
+	_, _ = runCLI(t, fx.home, bin, "read", "mcp://beacon-e2e/probe")
+	if got := fx.auth.all(); !containsString(got, "Bearer "+e2eToken) {
+		t.Fatalf("Oh My Pi did not connect to %s with the token from BEACON_MCP_TOKEN; saw %q", fx.url, got)
 	}
 }
 

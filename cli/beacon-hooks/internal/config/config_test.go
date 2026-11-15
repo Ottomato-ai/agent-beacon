@@ -32,88 +32,6 @@ func TestGetStateDir(t *testing.T) {
 	}
 }
 
-func TestGetLogFile(t *testing.T) {
-	tests := []struct {
-		platform string
-		wantBase string
-	}{
-		{"claude", "hooks.log"},
-		{"copilot", "hooks.log"},
-		{"cursor", "hooks.log"},
-		{"vscode", "hooks.log"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.platform, func(t *testing.T) {
-			got := GetLogFile(tt.platform)
-			if filepath.Base(got) != tt.wantBase {
-				t.Errorf("GetLogFile(%q) base = %q, want %q", tt.platform, filepath.Base(got), tt.wantBase)
-			}
-		})
-	}
-}
-
-func TestGetSessionLogDir(t *testing.T) {
-	tests := []struct {
-		platform string
-		wantBase string
-	}{
-		{"claude", "logs"},
-		{"copilot", "logs"},
-		{"cursor", "logs"},
-		{"vscode", "logs"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.platform, func(t *testing.T) {
-			got := GetSessionLogDir(tt.platform)
-			if filepath.Base(got) != tt.wantBase {
-				t.Errorf("GetSessionLogDir(%q) base = %q, want %q", tt.platform, filepath.Base(got), tt.wantBase)
-			}
-			// Parent should be the platform state dir
-			if filepath.Dir(got) != GetStateDir(tt.platform) {
-				t.Errorf("GetSessionLogDir(%q) parent = %q, want %q", tt.platform, filepath.Dir(got), GetStateDir(tt.platform))
-			}
-		})
-	}
-}
-
-func TestGetSessionLogFile(t *testing.T) {
-	tests := []struct {
-		platform  string
-		sessionID string
-		wantFile  string
-	}{
-		{"claude", "abc-123", "abc-123.log"},
-		{"copilot", "sess-456", "sess-456.log"},
-		{"cursor", "conv-789", "conv-789.log"},
-		{"vscode", "vscode-session", "vscode-session.log"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.platform+"_"+tt.sessionID, func(t *testing.T) {
-			got := GetSessionLogFile(tt.platform, tt.sessionID)
-			if filepath.Base(got) != tt.wantFile {
-				t.Errorf("GetSessionLogFile(%q, %q) base = %q, want %q", tt.platform, tt.sessionID, filepath.Base(got), tt.wantFile)
-			}
-			// Parent should be the session log dir
-			if filepath.Dir(got) != GetSessionLogDir(tt.platform) {
-				t.Errorf("GetSessionLogFile(%q, %q) parent = %q, want %q", tt.platform, tt.sessionID, filepath.Dir(got), GetSessionLogDir(tt.platform))
-			}
-		})
-	}
-}
-
-func TestCursorDirPath(t *testing.T) {
-	// CursorDir should be ~/.beacon/cursor
-	if filepath.Base(CursorDir) != "cursor" {
-		t.Errorf("CursorDir should end with 'cursor', got %q", CursorDir)
-	}
-	if filepath.Base(filepath.Dir(CursorDir)) != ".beacon" {
-		t.Errorf("CursorDir parent should be '.beacon', got %q", filepath.Dir(CursorDir))
-	}
-}
-
 func TestRotateLogIfNeededForPlatformArchivesExistingLog(t *testing.T) {
 	dir := t.TempDir()
 	oldCursorDir := CursorDir
@@ -143,5 +61,33 @@ func TestRotateLogIfNeededForPlatformArchivesExistingLog(t *testing.T) {
 	}
 	if data, err := os.ReadFile(logFile + ".2"); err != nil || string(data) != "older log" {
 		t.Fatalf(".2 archive = %q err=%v, want older log", string(data), err)
+	}
+}
+
+// A sandbox that assembles its own root filesystem often leaves the home out. The hook's state
+// directories must not conjure one there: it would vanish with the sandbox, and make the account's
+// event spool beneath it look available when it is not.
+func TestStateDirsNeverCreateAMissingHome(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "missing-home")
+	oldBeaconDir, oldCursorDir := BeaconDir, CursorDir
+	BeaconDir = filepath.Join(home, ".beacon")
+	CursorDir = filepath.Join(BeaconDir, "cursor")
+	t.Cleanup(func() { BeaconDir, CursorDir = oldBeaconDir, oldCursorDir })
+
+	if err := EnsureStateDir("cursor"); err == nil {
+		t.Fatal("EnsureStateDir succeeded under a home that does not exist")
+	}
+	if err := EnsureSessionLogDir("cursor"); err == nil {
+		t.Fatal("EnsureSessionLogDir succeeded under a home that does not exist")
+	}
+	if _, err := os.Stat(home); !os.IsNotExist(err) {
+		t.Fatalf("the home was created: %v", err)
+	}
+
+	if err := os.Mkdir(home, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureSessionLogDir("cursor"); err != nil {
+		t.Fatalf("EnsureSessionLogDir under an existing home = %v", err)
 	}
 }

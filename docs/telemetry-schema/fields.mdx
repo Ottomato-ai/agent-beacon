@@ -13,7 +13,7 @@ Beacon models each event as an action plus a set of typed entities. The [`event`
 |--------|---------|---------------|
 | `endpoint` | Device and agent context for the machine where telemetry was collected | `hostname`, `os`, `agent_version` |
 | `user` | Local operating system user context | `name`, `uid` |
-| `harness` | Agent harness that produced the signal | `name`, `version`, `executable_path`, `config_path` |
+| `harness` | Agent harness that produced the signal | `name`, `version`, `executable_path`, `config_path`, `profile` |
 | `origin` | Event origin for local endpoint, cloud, or CI telemetry | `local`, `cloud`, `ci` |
 | `run` | CI or ephemeral run context | `provider`, `run_id`, `run_attempt`, `workflow`, `job`, `event_name`, `commit`, `repository`, `branch`, `pr`, `pr_number`, `actor`, `ephemeral` |
 | `session` | Conversation or runtime session context | `id`, `working_directory` |
@@ -28,14 +28,16 @@ Beacon models each event as an action plus a set of typed entities. The [`event`
 | `mcp` | MCP server, tool, method, protocol, resource, and session context | `server`, `tool`, `method.name`, `protocol.version`, `resource.uri`, `session.id` |
 | `approval` | Approval or policy decision context | `required`, `decision`, `reason` |
 | `handoff` | On a `session.handoff` event, the session this one continues from a [handoff brief](/cli/handoff#linking-a-new-session-to-the-one-it-continues) | `source_harness`, `source_session_id` |
+| `share` | On a `session.share_requested` event, the visibility [auto-share](/cli/share#auto-share) asks beacon.sh to publish the session with | `visibility` (`direct`, `private`, `public`) |
 | `policy` | Policy metadata when available from a runtime or integration | `id`, `name`, `decision`, `enforcement`, `reason` |
 | `prompt` | Prompt text when the source emits it and content handling allows it | `text` |
+| `system_context` | On a `session.context` event, what the runtime gave the model outside the conversation. Metadata, so it is kept when content is not; the text is in `gen_ai.system_instructions` | `kind` (`skill_listing`), `source` (`system_prompt`, `transcript`), `skills[].skill_name`, `skills[].skill_name_hash` |
 | `content` | Content handling state for the event | `retention`, `included`, `redacted`, `truncated` |
 | `gen_ai` | OpenTelemetry GenAI semantic convention context | `agent`, `conversation`, `input`, `output`, `provider`, `request`, `response`, `retrieval`, `system_instructions`, `tool`, `usage`, `workflow` |
 | `destination` | Output or validation destination state | `type`, `mode`, `status` |
 | `health` | Endpoint or component health state | `component`, `status`, `reason` |
 | `user_agent` | Browser that produced a browser chat event, as the browser names itself | `name`, `version` |
-| `vcs` | On a `session.commit_linked` event, the commit a session was [linked to](/cli/git), in the OpenTelemetry VCS shape | `ref.head.revision`, `ref.head.name`, `ref.head.type`, `repository.url.full`, `attribution.method`, `attribution.changed_files`, `attribution.matched_files` |
+| `vcs` | On a `session.commit_linked` event, the commit a session was [linked to](/cli/git), in the OpenTelemetry VCS shape. On a `git.hook_budget_exceeded` event, the [git hook run that ran out of time](/cli/git#hook-runs-that-run-out-of-time) | `ref.head.revision`, `ref.head.name`, `ref.head.type`, `repository.url.full`, `attribution.method`, `attribution.changed_files`, `attribution.matched_files`, `hook.name`, `hook.phase`, `hook.budget_ms`, `hook.elapsed_ms`, `hook.phase_elapsed_ms`, `hook.git_spawns`, `hook.cut_short` |
 
 Top-level `sequence`, `model`, `repository`, `branch`, `message`, `raw`, and `field_truncated` fields add shared context that can apply across multiple entities. For example, a command event can include both `tool` and `command`; a file edit can include `file`, `session`, `repository`, and `branch`; a CI event can include `origin` and `run`; and a GenAI tool call can include both `tool` and nested `gen_ai.tool` metadata.
 
@@ -51,8 +53,9 @@ When a runtime emits OpenTelemetry GenAI semantic convention attributes, Beacon 
 |-------|--------|
 | `gen_ai.request` | Request settings such as `model`, `max_tokens`, `temperature`, `top_p`, `top_k`, `seed`, `stream`, `choice_count`, `encoding_formats`, and `stop_sequences` |
 | `gen_ai.response` | Response metadata such as `id`, `model`, `finish_reasons`, and `time_to_first_chunk` |
-| `gen_ai.usage` | Token counters such as `input_tokens`, `output_tokens`, `cache_creation.input_tokens`, `cache_read.input_tokens`, and `reasoning.output_tokens`, plus runtime-reported `cost_usd` |
+| `gen_ai.usage` | Token counters such as `input_tokens`, `output_tokens`, `cache_creation.input_tokens` (with its optional one-hour subset `cache_creation.ephemeral_1h_input_tokens`), `cache_read.input_tokens`, and `reasoning.output_tokens`, plus runtime-reported `cost_usd` |
 | `gen_ai.input.messages`, `gen_ai.output.messages` | Message arrays or objects emitted by the runtime |
+| `gen_ai.system_instructions` | Instructions given to the model outside the conversation, as a list of parts (`type`, `content`). A skill index on `session.context` has one `text` part per skill, so each skill is limited on its own |
 | `gen_ai.tool` | Tool metadata such as `name`, `type`, `description`, `definitions`, and `call.id`, `call.arguments`, or `call.result` |
 | `gen_ai.retrieval` | Retrieval context such as `query_text` and `documents` |
 | `gen_ai.evaluation` | Evaluation metadata such as `name`, `explanation`, `score.label`, and `score.value` |
@@ -75,6 +78,7 @@ Optional context fields add detail when available:
 | `jsonrpc`, `rpc`, `network`, `server`, `error` | MCP client-span context projected from OpenTelemetry semantic conventions when available |
 | `approval` | Approval requirement, decision, or reason |
 | `handoff` | The session a handed-off session continues: source harness and session id |
+| `share` | Auto-share request visibility |
 | `policy` | Policy ID, name, decision, enforcement mode, or reason |
 | `content` | Content inclusion, redaction, and truncation state |
 | `gen_ai` | OpenTelemetry GenAI request, response, usage, message, tool, retrieval, evaluation, provider, and workflow metadata |

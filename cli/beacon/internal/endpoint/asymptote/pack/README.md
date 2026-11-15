@@ -11,8 +11,10 @@ and Vector has been started.
 
 ## What leaves the machine
 
-Every line of `runtime.jsonl` written after the forwarder starts, and every
-line of `inventory_state.jsonl`, exactly as Beacon wrote them locally. Local
+Every line of `runtime.jsonl` written after the forwarder starts, every line
+of `inventory_state.jsonl`, and every line of `cloud-backfill.jsonl` (the
+bounded session backfill each `beacon endpoint connect` stages;
+absent otherwise), exactly as Beacon wrote them locally. Local
 redaction, retention and size limits apply before a line is written, so they
 apply to what is forwarded. The ingest service adds a `tenant` block
 (organization, device, approving user, receive time) server-side and ignores
@@ -22,8 +24,11 @@ history.
 
 This hand-run pack uses Standard privacy. `beacon endpoint connect
 --privacy-mode metadata-only` renders an endpoint-specific config that removes
-retained text, raw fields, diffs, inventory content, and MCP definitions before
-buffering or upload.
+retained text, raw fields, diffs, tool definitions, retrieval documents, approval
+and policy reasons, inventory content, and MCP definitions before buffering or
+upload. It keeps metadata: on a `session.context` skill index, the
+`system_context` block that says what the event is and names each listed skill,
+while the index text in `gen_ai.system_instructions` is removed.
 
 ## Prerequisites
 
@@ -56,7 +61,8 @@ The generated files point at the Beacon log path selected by the CLI:
 - System mode: `/var/log/beacon-agent/runtime.jsonl`
 - Custom mode: the value passed with `--log-path`
 
-The inventory log is the sibling `inventory_state.jsonl` in the same directory.
+The inventory log is the sibling `inventory_state.jsonl` in the same directory,
+and the staged session backfill is the sibling `cloud-backfill.jsonl`.
 
 ## Run Vector by hand
 

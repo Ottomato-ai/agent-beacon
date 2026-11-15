@@ -45,6 +45,7 @@ Top-level Agent Beacon CLI commands.
 | [`beacon rules`](/cli/rules) | Manage and author Beacon threat-detection rules. |
 | [`beacon scan`](/cli/scan) | Run threat-detection rules over local endpoint telemetry. |
 | [`beacon status`](/cli/endpoint-status) | Alias for `beacon endpoint status`. |
+| `beacon docs --output <dir>` | Write the CLI's own command reference as Markdown, one file per command, generated from the installed binary. |
 | [`beacon token-usage`](/cli/token-usage) | Report token usage and attribution from Beacon runtime logs. |
 | [`beacon traces`](/cli/endpoint-traces) | Open the interactive local trace browser; redirected I/O falls back to a bounded trace list. |
 | [`beacon version`](/cli/version) | Display the installed Agent Beacon CLI version. |
@@ -120,8 +121,8 @@ Configure provider-managed cloud agent telemetry setup helpers.
 |---------|-------------|
 | [`beacon cloud claude-web print-setup`](/cli/cloud-claude-web-print-setup) | Print a Claude Code cloud environment setup script. |
 | [`beacon cloud claude-web print-hooks`](/cli/cloud-claude-web-print-hooks) | Print Claude hook settings for a cloud sandbox. |
-| [`beacon cloud cursor print-setup`](/cli/cloud-cursor-print-setup) | Print a Cursor cloud agent binary setup script. |
-| [`beacon cloud cursor print-hooks`](/cli/cloud-cursor-print-hooks) | Print Cursor project hook settings to commit for cloud agents. |
+| [`beacon cloud cursor print-setup`](/cli/cloud-cursor-print-setup) | Print a Cursor cloud environment install script that installs Beacon and its hooks. |
+| [`beacon cloud cursor print-hooks`](/cli/cloud-cursor-print-hooks) | Print Cursor project hook settings for cloud agents, to commit or merge yourself. |
 | [`beacon cloud gcs setup`](/cli/cloud-gcs-setup) | Create or print GCS setup commands for cloud-agent telemetry. |
 | [`beacon cloud s3 setup`](/cli/cloud-s3-setup) | Create or print S3 setup commands for cloud-agent telemetry. |
 
@@ -180,9 +181,11 @@ Manage the local endpoint agent and inspect supported agent harness telemetry.
 | [`beacon endpoint hooks`](/cli/hooks) | Manage supported hook-based endpoint telemetry. |
 | [`beacon endpoint opencode`](/cli/endpoint-opencode) | Collect endpoint telemetry from OpenCode session records on this machine. |
 | [`beacon endpoint pi`](/cli/endpoint-pi) | Collect endpoint telemetry from Pi session records on this machine. |
+| [`beacon endpoint cursor`](/cli/endpoint-cursor) | Collect Cursor telemetry from its local session stores, and token usage from the Cursor Admin API. |
 | [`beacon endpoint copilot`](/cli/endpoint-copilot) | Collect endpoint telemetry from GitHub Copilot CLI session records on this machine. |
 | [`beacon endpoint dsh`](/cli/endpoint-dsh) | Collect endpoint telemetry from DeepSeek Harness session records on this machine. |
 | [`beacon endpoint fx`](/cli/endpoint-fx) | Collect endpoint telemetry from fx session records on this machine. |
+| [`beacon endpoint harness2`](/cli/endpoint-harness2) | Collect endpoint telemetry from Harness² rollouts recorded under its runs directory. |
 | [`beacon endpoint integrations openclaw`](/cli/openclaw) | Set up and validate OpenClaw Gateway OTLP export. |
 | [`beacon endpoint integrations claude-cowork`](/cli/claude-cowork) | Set up and validate Claude Cowork OTLP export. |
 

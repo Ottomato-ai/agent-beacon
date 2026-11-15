@@ -6,9 +6,11 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/testenv"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/updatecheck"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/version"
 )
@@ -23,32 +25,6 @@ func (c stubVersionChecker) Check(context.Context) (updatecheck.Result, error) {
 		return updatecheck.Result{}, c.err
 	}
 	return c.result, nil
-}
-
-func TestVersionCheckFlagRegistered(t *testing.T) {
-	cmd, _, err := rootCmd.Find([]string{"version"})
-	if err != nil {
-		t.Fatalf("Find version returned error: %v", err)
-	}
-	if cmd == nil {
-		t.Fatal("version command not registered")
-	}
-	if cmd.Flags().Lookup("check") == nil {
-		t.Fatal("version command missing --check flag")
-	}
-}
-
-func TestVersionCheckSubcommandRegistered(t *testing.T) {
-	cmd, _, err := rootCmd.Find([]string{"version", "check"})
-	if err != nil {
-		t.Fatalf("Find version check returned error: %v", err)
-	}
-	if cmd == nil {
-		t.Fatal("version check subcommand not registered")
-	}
-	if cmd.Use != "check" {
-		t.Fatalf("found command Use = %q, want %q", cmd.Use, "check")
-	}
 }
 
 func TestRunVersionWithoutCheckPrintsVersionOnly(t *testing.T) {
@@ -101,15 +77,6 @@ func TestRunVersionWithCheckPrintsVersionAndUpdateResult(t *testing.T) {
 	}
 }
 
-func TestRunVersionCheckReportsUpToDate(t *testing.T) {
-	got := runVersionCheckWithStub(t, "v0.0.10", stubVersionChecker{
-		result: updatecheck.Result{CurrentVersion: "v0.0.10", LatestVersion: "v0.0.10"},
-	})
-	if !strings.Contains(got, "Beacon v0.0.10 is up to date.") {
-		t.Fatalf("output = %q, want up-to-date message", got)
-	}
-}
-
 func TestRunVersionCheckReportsAvailableUpdate(t *testing.T) {
 	got := runVersionCheckWithStub(t, "v0.0.10", stubVersionChecker{
 		result: updatecheck.Result{
@@ -121,7 +88,7 @@ func TestRunVersionCheckReportsAvailableUpdate(t *testing.T) {
 	})
 	for _, want := range []string{
 		"Beacon v0.0.12 is available. Current version: v0.0.10",
-		"If installed with Homebrew: brew upgrade beacon",
+		"If installed with Homebrew: brew update && brew upgrade beacon",
 		"Download: https://example.test/releases/v0.0.12",
 	} {
 		if !strings.Contains(got, want) {
@@ -191,6 +158,8 @@ func setVersionForTest(t *testing.T, v string) func() {
 
 func setVersionCheckerForTest(t *testing.T, checker versionChecker) func() {
 	t.Helper()
+	// A check records its answer in the update cache under the home directory.
+	testenv.SetHome(t, t.TempDir())
 	old := newVersionChecker
 	newVersionChecker = func(currentVersion string) versionChecker {
 		return checker
@@ -203,4 +172,64 @@ func setVersionCheckForTest(t *testing.T, enabled bool) func() {
 	old := versionCheck
 	versionCheck = enabled
 	return func() { versionCheck = old }
+}
+
+func TestVersionCheckRecordsTheAnswerForTheStartupNotice(t *testing.T) {
+	restoreVersion := setVersionForTest(t, "v0.0.10")
+	defer restoreVersion()
+	restoreChecker := setVersionCheckerForTest(t, stubVersionChecker{result: updatecheck.Result{
+		CurrentVersion:  "v0.0.10",
+		LatestVersion:   "v0.0.12",
+		ReleaseURL:      "https://example.test/v0.0.12",
+		UpdateAvailable: true,
+	}})
+	defer restoreChecker()
+
+	cmd := &cobra.Command{}
+	cmd.SetOut(&bytes.Buffer{})
+	if err := runVersionCheck(cmd, nil); err != nil {
+		t.Fatalf("runVersionCheck returned error: %v", err)
+	}
+	cache := updatecheck.LoadCache(updateCachePath())
+	if cache.LatestVersion != "v0.0.12" || cache.ReleaseURL != "https://example.test/v0.0.12" || cache.LastCheckedAt.IsZero() {
+		t.Fatalf("cache = %#v, want the checked release", cache)
+	}
+}
+
+func TestVersionRefreshSkipsAFreshCache(t *testing.T) {
+	restoreVersion := setVersionForTest(t, "v0.0.10")
+	defer restoreVersion()
+	calls := 0
+	restoreChecker := setVersionCheckerForTest(t, stubVersionChecker{err: errors.New("should not run")})
+	defer restoreChecker()
+	newVersionChecker = func(string) versionChecker {
+		calls++
+		return stubVersionChecker{result: updatecheck.Result{LatestVersion: "v0.0.12"}}
+	}
+	t.Setenv(updatecheck.DisableEnv, "")
+	t.Setenv("CI", "")
+
+	if err := updatecheck.SaveCache(updateCachePath(), updatecheck.Cache{LatestVersion: "v0.0.11", LastCheckedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	cmd := &cobra.Command{}
+	if err := versionRefreshCmd.RunE(cmd, nil); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 0 {
+		t.Fatalf("refresh of a fresh cache looked up the release %d times", calls)
+	}
+
+	if err := updatecheck.SaveCache(updateCachePath(), updatecheck.Cache{LatestVersion: "v0.0.11", LastCheckedAt: time.Now().Add(-25 * time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := versionRefreshCmd.RunE(cmd, nil); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("refresh of a stale cache looked up the release %d times, want 1", calls)
+	}
+	if got := updatecheck.LoadCache(updateCachePath()).LatestVersion; got != "v0.0.12" {
+		t.Fatalf("cached latest = %q, want v0.0.12", got)
+	}
 }

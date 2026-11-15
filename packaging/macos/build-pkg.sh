@@ -63,6 +63,7 @@ mkdir -p "$OUT_DIR" "$PKG_ROOT/opt/beacon/bin" "$PKG_ROOT/opt/beacon/scripts" \
 copy_file "$BEACON_BIN" "$PKG_ROOT/opt/beacon/bin/beacon"
 copy_file "$COLLECTOR_BIN" "$PKG_ROOT/opt/beacon/bin/beacon-otelcol"
 copy_file "$ROOT_DIR/packaging/macos/install-endpoint.sh" "$PKG_ROOT/opt/beacon/scripts/install-endpoint.sh"
+copy_file "$ROOT_DIR/packaging/macos/beacon-settings.sh" "$PKG_ROOT/opt/beacon/scripts/beacon-settings.sh"
 copy_file "$ROOT_DIR/packaging/macos/uninstall-endpoint.sh" "$PKG_ROOT/opt/beacon/scripts/uninstall-endpoint.sh"
 copy_file "$ROOT_DIR/packaging/macos/scripts/postinstall" "$PKG_SCRIPTS/postinstall"
 copy_file "$ROOT_DIR/packaging/macos/scripts/preinstall" "$PKG_SCRIPTS/preinstall"
@@ -152,5 +153,7 @@ if [ -n "${NOTARYTOOL_PROFILE:-}" ]; then
   xcrun stapler staple "$PKG_PATH"
 fi
 
-shasum -a 256 "$PKG_PATH" > "$PKG_PATH.sha256"
+# Hash from the package's directory so the sidecar names the file, not this machine's path, and
+# `shasum -a 256 -c` works beside the downloaded package.
+(cd "$(dirname "$PKG_PATH")" && shasum -a 256 "$(basename "$PKG_PATH")") > "$PKG_PATH.sha256"
 echo "$PKG_PATH"

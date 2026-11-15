@@ -26,9 +26,10 @@ type MapOptions struct {
 }
 
 type codexToolCall struct {
-	ID    string
-	Name  string
-	Input interface{}
+	ID        string
+	Name      string
+	Namespace string
+	Input     interface{}
 }
 
 type mapper struct {
@@ -37,6 +38,8 @@ type mapper struct {
 	out       []MappedEvent
 	tools     map[string]codexToolCall
 	sessionID string
+	// harness is the Codex surface the rollout's session_meta names, codex_cli until it does.
+	harness   string
 	workspace string
 	model     string
 	turnID    string
@@ -62,6 +65,7 @@ func MapSession(ref SessionRef, records []Record, opts MapOptions) []MappedEvent
 		opts:             opts,
 		tools:            map[string]codexToolCall{},
 		sessionID:        ref.ID,
+		harness:          asymptoteobserve.CodexSurface(""),
 		workspace:        ref.Workspace,
 		tokenRecordTurns: tokenRecordTurns,
 	}
@@ -97,6 +101,9 @@ func (m *mapper) consumeSessionMeta(record Record, emit bool) {
 	if meta.CWD != "" {
 		m.workspace = meta.CWD
 	}
+	if meta.Originator != "" {
+		m.harness = asymptoteobserve.CodexSurface(meta.Originator)
+	}
 	if emit && !m.opts.SkipSessionStarted && !m.started {
 		ev := m.base(record, "session.started", "session", schema.SeverityInfo, schema.FidelityObserved, "Codex session started")
 		ev.Raw = map[string]interface{}{"codex_session": m.raw(record)}
@@ -124,7 +131,7 @@ func (m *mapper) consumeResponseItem(record Record, emit bool) {
 	case "message":
 		m.consumeMessage(record, item, emit)
 	case "custom_tool_call":
-		call := codexToolCall{ID: item.CallID, Name: item.Name, Input: item.Input}
+		call := codexToolCall{ID: item.CallID, Name: item.Name, Namespace: item.Namespace, Input: item.Input}
 		if call.ID != "" {
 			m.tools[call.ID] = call
 		}
@@ -137,7 +144,7 @@ func (m *mapper) consumeResponseItem(record Record, emit bool) {
 		}
 	case "function_call":
 		input := parseFunctionArguments(item.Arguments, item.Input)
-		call := codexToolCall{ID: item.CallID, Name: item.Name, Input: input}
+		call := codexToolCall{ID: item.CallID, Name: item.Name, Namespace: item.Namespace, Input: input}
 		if call.ID != "" {
 			m.tools[call.ID] = call
 		}
@@ -155,16 +162,71 @@ func (m *mapper) consumeMessage(record Record, item *ResponseItem, emit bool) {
 	if !emit {
 		return
 	}
-	text := strings.TrimSpace(textFromContent(item.Content))
-	if text == "" {
-		return
-	}
 	switch strings.ToLower(item.Role) {
 	case "user":
-		m.emitPrompt(record, text)
+		if text := userPromptText(item); text != "" {
+			m.emitPrompt(record, text)
+		}
 	case "assistant":
-		m.emitAgentMessage(record, text, item.ID)
+		if text := strings.TrimSpace(textFromContent(item.Content)); text != "" {
+			m.emitAgentMessage(record, text, item.ID)
+		}
 	}
+}
+
+// injectedContextPrefixes open the user-role messages Codex writes itself at the start of a
+// session or turn: the environment it runs in, the repository's AGENTS.md, and the person's
+// configured instructions. None of them is something the person typed.
+var injectedContextPrefixes = []string{
+	"<environment_context>",
+	"<user_instructions>",
+	"# AGENTS.md instructions for",
+}
+
+func injectedContext(text string) bool {
+	text = strings.TrimSpace(text)
+	for _, prefix := range injectedContextPrefixes {
+		if strings.HasPrefix(text, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// userPromptText is what the person typed in a user-role message, or "" when the message is only
+// context Codex injected. Recording that context as a prompt titled every backfilled session after
+// its environment or AGENTS.md. Newer builds name each block's kind, and a message with kinds but
+// no "user.text" among them is injected context whatever its text says; blocks are otherwise
+// recognized by the prefixes Codex writes.
+func userPromptText(item *ResponseItem) string {
+	if kinds := item.contentItemKinds(); len(kinds) > 0 && !containsString(kinds, "user.text") {
+		return ""
+	}
+	blocks, ok := item.Content.([]interface{})
+	if !ok {
+		text := textFromContent(item.Content)
+		if injectedContext(text) {
+			return ""
+		}
+		return text
+	}
+	kept := make([]interface{}, 0, len(blocks))
+	for _, raw := range blocks {
+		if block, ok := raw.(map[string]interface{}); ok && injectedContext(firstString(block, "text", "content")) {
+			continue
+		}
+		kept = append(kept, raw)
+	}
+	return textFromContent(kept)
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *mapper) consumeEventMessage(record Record, emit bool) {
@@ -290,7 +352,7 @@ func (m *mapper) consumeTokenUsageRecord(record Record, emit bool) {
 
 func (m *mapper) emitPrompt(record Record, text string) {
 	ev := m.base(record, "prompt.submitted", "prompt", schema.SeverityInfo, schema.FidelityObserved, "Prompt submitted to Codex")
-	ev.Prompt = &schema.PromptInfo{Text: text}
+	ev.Prompt = &schema.PromptInfo{ID: m.turnID, Text: text}
 	ev.Content = contentMarker(text)
 	ev.GenAI = mergeGenAI(ev.GenAI, &schema.GenAIInfo{Input: &schema.GenAIInputInfo{Messages: asymptoteobserve.TextInputMessages(text)}})
 	m.append(record, "prompt", ev)
@@ -316,35 +378,39 @@ func (m *mapper) emitToolInvoked(record Record, call codexToolCall) {
 		return
 	}
 	ev := m.base(record, "tool.invoked", "tool", schema.SeverityInfo, schema.FidelityObserved, "Codex tool invocation observed")
-	ev.Tool = &schema.ToolInfo{Name: call.Name}
-	ev.GenAI = mergeGenAI(ev.GenAI, &schema.GenAIInfo{Tool: &schema.GenAIToolInfo{Name: call.Name, Call: &schema.GenAIToolCallInfo{ID: call.ID, Arguments: call.Input}}})
+	name := asymptoteobserve.CodexToolName(call.Name, call.Namespace)
+	ev.Tool = &schema.ToolInfo{Name: name}
+	ev.GenAI = mergeGenAI(ev.GenAI, &schema.GenAIInfo{Tool: &schema.GenAIToolInfo{Name: name, Call: &schema.GenAIToolCallInfo{ID: call.ID, Arguments: call.Input}}})
 	if command := commandFromTool(call); command != "" {
 		ev.Tool.Command = command
 	}
 	m.append(record, "tool.invoked."+firstNonEmpty(call.ID, itoa(record.Line)), ev)
 }
 
+// emitToolResult records a tool call's result as asymptoteobserve.NormalizeCodexToolResult defines
+// it, the definition the live collector applies to the same call's codex.tool_result record.
 func (m *mapper) emitToolResult(record Record, item *ResponseItem) {
 	call := m.tools[item.CallID]
 	if call.ID == "" {
 		call.ID = item.CallID
 	}
-	output := toolOutputText(item.Output)
-	if isCommandTool(call) {
-		ev := m.base(record, "command.executed", "command", severityForStatus(item.Status), schema.FidelityObserved, "Codex command completed")
-		ev.Command = &schema.CommandInfo{Command: commandFromTool(call), Output: output}
-		ev.Tool = &schema.ToolInfo{Name: call.Name, Command: commandFromTool(call)}
-		ev.GenAI = toolResultGenAI(call, output)
-		m.append(record, "tool.result."+firstNonEmpty(call.ID, itoa(record.Line)), ev)
-		return
+	if call.Name == "" {
+		call.Name, call.Namespace = item.Name, item.Namespace
 	}
-	action := "tool.completed"
-	if isErrorStatus(item.Status) {
-		action = "tool.failed"
-	}
-	ev := m.base(record, action, "tool", severityForStatus(item.Status), schema.FidelityObserved, "Codex tool completed")
-	ev.Tool = &schema.ToolInfo{Name: call.Name}
-	ev.GenAI = toolResultGenAI(call, output)
+	fields := asymptoteobserve.NormalizeCodexToolResult(asymptoteobserve.CodexToolResult{
+		Name:      call.Name,
+		Namespace: call.Namespace,
+		CallID:    call.ID,
+		Arguments: call.Input,
+		Output:    toolOutputText(item.Output),
+		Failed:    isErrorStatus(item.Status),
+	})
+	ev := m.base(record, fields.Action, fields.Category, fields.Severity, schema.FidelityObserved, fields.Message)
+	ev.Tool = fields.Tool
+	ev.Command = fields.Command
+	ev.MCP = fields.MCP
+	ev.Content = fields.Content
+	ev.GenAI = mergeGenAI(ev.GenAI, &schema.GenAIInfo{Tool: fields.GenAITool})
 	m.append(record, "tool.result."+firstNonEmpty(call.ID, itoa(record.Line)), ev)
 }
 
@@ -356,7 +422,7 @@ func (m *mapper) base(record Record, action, category string, severity schema.Se
 		Fidelity: fidelity,
 		Message:  message,
 		Origin:   schema.OriginLocal,
-		Harness:  schema.HarnessInfo{Name: Harness, CollectionMethod: schema.CollectionMethodPoll},
+		Harness:  schema.HarnessInfo{Name: m.harness, CollectionMethod: schema.CollectionMethodPoll},
 	})
 	if ts := eventTimestamp(record.Entry); ts != "" {
 		ev.Timestamp = ts
@@ -368,6 +434,10 @@ func (m *mapper) base(record Record, action, category string, severity schema.Se
 	if m.model != "" {
 		ev.Model = m.model
 	}
+	// Codex brackets each turn with TurnStarted and TurnComplete, both carrying turn_id, and
+	// records the user's message inside the bracket, so the turn being read is the prompt every
+	// event here belongs to.
+	asymptoteobserve.SetPromptID(&ev, m.turnID)
 	return ev
 }
 
@@ -486,7 +556,7 @@ func commandFromTool(call codexToolCall) string {
 	case string:
 		return strings.TrimSpace(v)
 	case map[string]interface{}:
-		return firstStringOrJoinedArray(v, "command", "cmd", "shell_command")
+		return asymptoteobserve.ToolCommandLine(call.Name, v)
 	default:
 		if call.Input == nil {
 			return ""
@@ -494,49 +564,6 @@ func commandFromTool(call codexToolCall) string {
 		data, _ := json.Marshal(call.Input)
 		return string(data)
 	}
-}
-
-func firstStringOrJoinedArray(m map[string]interface{}, keys ...string) string {
-	for _, key := range keys {
-		val, ok := m[key]
-		if !ok {
-			continue
-		}
-		switch v := val.(type) {
-		case string:
-			if v != "" {
-				return v
-			}
-		case []interface{}:
-			if s := joinStringSlice(v); s != "" {
-				return s
-			}
-		}
-	}
-	return ""
-}
-
-func joinStringSlice(arr []interface{}) string {
-	parts := make([]string, 0, len(arr))
-	for _, v := range arr {
-		if s, ok := v.(string); ok {
-			parts = append(parts, s)
-		}
-	}
-	return strings.TrimSpace(strings.Join(parts, " "))
-}
-
-func isCommandTool(call codexToolCall) bool {
-	switch strings.ToLower(call.Name) {
-	case "exec", "exec_command", "shell", "bash":
-		return true
-	default:
-		return false
-	}
-}
-
-func toolResultGenAI(call codexToolCall, result string) *schema.GenAIInfo {
-	return &schema.GenAIInfo{Tool: &schema.GenAIToolInfo{Name: call.Name, Call: &schema.GenAIToolCallInfo{ID: call.ID, Arguments: call.Input, Result: result}}}
 }
 
 func usageFromCodex(raw *TokenUsage) *schema.GenAIUsageInfo {
@@ -616,13 +643,6 @@ func mergeGenAI(base, next *schema.GenAIInfo) *schema.GenAIInfo {
 		base.Conversation = next.Conversation
 	}
 	return base
-}
-
-func severityForStatus(status string) schema.Severity {
-	if isErrorStatus(status) {
-		return schema.SeverityMedium
-	}
-	return schema.SeverityInfo
 }
 
 func isErrorStatus(status string) bool {

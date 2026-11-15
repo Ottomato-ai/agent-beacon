@@ -3,8 +3,8 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Beacon Endpoint Agent Activity</title>
-    <link rel="icon" type="image/svg+xml" href="/logo.svg" />
+    <title>Beacon | Self‑improving memory for coding agents</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body data-page="sessions">
@@ -52,14 +52,16 @@
         <div id="last-updated" class="muted"></div>
       </section>
 
-      <section id="activity-detailed" class="panel search-panel activity-view">
+      <section class="panel search-panel">
         <form id="filters" class="search-form">
           <div class="filter-section">
             <div class="session-filter-tabs" aria-label="Session filters">
               <button type="button" data-session-state="all">All sessions</button>
               <button type="button" data-session-state="captured" class="active" aria-pressed="true">Captured sessions</button>
+              <button type="button" data-session-state="recurring">Recurring sessions</button>
               <button type="button" data-session-state="empty">Empty sessions</button>
             </div>
+            <p class="session-filter-help muted">Recurring sessions are repeated executions of the same prompt in the same repository and agent harness by the same user.</p>
             <div class="session-filter-grid">
               <label>
                 <select id="range-filter" aria-label="Date range">
@@ -155,7 +157,6 @@
         </form>
         <div id="active-filters" class="chips"></div>
         <div id="notice" class="notice" hidden></div>
-        <button type="button" id="new-events" class="new-events" hidden></button>
         <div class="table-wrap">
           <table>
             <thead>
@@ -177,15 +178,6 @@
       </section>
 
     </main>
-
-    <aside id="drawer" class="drawer" aria-hidden="true">
-      <div class="drawer-head">
-        <h2>Session Detail</h2>
-        <button id="close-drawer">Close</button>
-      </div>
-      <div id="event-summary" class="event-summary"></div>
-      <pre id="event-json"></pre>
-    </aside>
 
     <script src="/app.js"></script>
   </body>

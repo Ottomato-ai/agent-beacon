@@ -181,17 +181,17 @@ func TestAddLinksCreatesMergesAndIsIdempotent(t *testing.T) {
 	if note, err := ReadNote(ctx, g, sha); err != nil || note != "" {
 		t.Fatalf("fresh repo note %q, %v", note, err)
 	}
-	changed, err := AddLinks(ctx, g, sha, []Link{{"codex", "s1"}})
+	changed, err := AddLinks(ctx, g, sha, []Link{{Harness: "codex", SessionID: "s1"}})
 	if err != nil || !changed {
 		t.Fatalf("first add: %v %v", changed, err)
 	}
 	// A person's own note line on the same commit survives Beacon's update.
 	r.git("notes", "--ref="+NotesRef, "append", "-m", "Reviewed-by: someone", sha)
-	changed, err = AddLinks(ctx, g, sha, []Link{{"codex", "s1"}, {"claude_code", "s2"}})
+	changed, err = AddLinks(ctx, g, sha, []Link{{Harness: "codex", SessionID: "s1"}, {Harness: "claude_code", SessionID: "s2"}})
 	if err != nil || !changed {
 		t.Fatalf("second add: %v %v", changed, err)
 	}
-	changed, err = AddLinks(ctx, g, sha, []Link{{"claude_code", "s2"}})
+	changed, err = AddLinks(ctx, g, sha, []Link{{Harness: "claude_code", SessionID: "s2"}})
 	if err != nil || changed {
 		t.Fatalf("repeat add changed=%v err=%v", changed, err)
 	}
@@ -203,7 +203,7 @@ func TestAddLinksCreatesMergesAndIsIdempotent(t *testing.T) {
 	if refs := r.git("for-each-ref", "--format=%(refname)", "refs/notes/"); refs != NotesRef {
 		t.Fatalf("leftover refs:\n%s", refs)
 	}
-	if changed, err := AddLinks(ctx, g, sha, []Link{{"Bad Harness", "x"}}); err != nil || changed {
+	if changed, err := AddLinks(ctx, g, sha, []Link{{Harness: "Bad Harness", SessionID: "x"}}); err != nil || changed {
 		t.Fatalf("invalid links must be ignored: %v %v", changed, err)
 	}
 }
@@ -211,13 +211,16 @@ func TestAddLinksCreatesMergesAndIsIdempotent(t *testing.T) {
 func TestAddLinksConcurrentWritersLoseNothing(t *testing.T) {
 	r := newTestRepo(t)
 	ctx := context.Background()
+	// Every commit's note lives in the one notes ref, so any two writers race on the same
+	// compare-and-swap; four writers on each of two commits keep that race (same commit and
+	// across commits) without paying for a long queue of retries.
 	var shas []string
-	for i := 0; i < 3; i++ {
+	for i := range 2 {
 		r.write("f", fmt.Sprint(i))
 		shas = append(shas, r.commitAt(fmt.Sprint("c", i), t0.Add(time.Duration(i)*time.Minute)))
 	}
 	g := r.gitClient()
-	const writers = 6
+	const writers = 4
 	var wg sync.WaitGroup
 	errs := make(chan error, writers*len(shas))
 	for w := 0; w < writers; w++ {
@@ -228,7 +231,7 @@ func TestAddLinksConcurrentWritersLoseNothing(t *testing.T) {
 				// Retries are bounded, so a writer may legitimately give up under this much
 				// contention; it must then say so rather than drop the link silently.
 				for attempt := 0; attempt < 10; attempt++ {
-					_, err := AddLinks(ctx, g, sha, []Link{{"codex", fmt.Sprint("w", w)}})
+					_, err := AddLinks(ctx, g, sha, []Link{{Harness: "codex", SessionID: fmt.Sprint("w", w)}})
 					if err == nil {
 						return
 					}
@@ -266,6 +269,60 @@ func TestAddLinksConcurrentWritersLoseNothing(t *testing.T) {
 	}
 }
 
+func TestAddLinksWaitsForPackedRefsLock(t *testing.T) {
+	r := newTestRepo(t)
+	r.write("f", "1")
+	sha := r.commitAt("c", t0)
+	// With git told not to wait for packed-refs.lock at all, the transaction's ref deletion only
+	// survives another writer holding the lock if Beacon passes its own, longer wait.
+	r.git("config", "core.packedRefsTimeout", "0")
+	lock := filepath.Join(r.root, ".git", "packed-refs.lock")
+	if err := os.WriteFile(lock, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Hold the lock until the swap has landed -- the deletion runs right after it -- and a moment
+	// longer, so the deletion meets the held lock.
+	released := make(chan struct{})
+	go func() {
+		defer close(released)
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, err := os.Stat(filepath.Join(r.root, ".git", filepath.FromSlash(NotesRef))); err == nil {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		time.Sleep(100 * time.Millisecond)
+		_ = os.Remove(lock)
+	}()
+	if _, err := AddLinks(context.Background(), r.gitClient(), sha, []Link{{Harness: "codex", SessionID: "s"}}); err != nil {
+		t.Fatal(err)
+	}
+	<-released
+	if refs := r.git("for-each-ref", "--format=%(refname)", "refs/notes/"); refs != NotesRef {
+		t.Fatalf("leftover transaction refs:\n%s", refs)
+	}
+}
+
+func TestAddLinksCleanupKeepsCallerDeadline(t *testing.T) {
+	r := newTestRepo(t)
+	r.write("f", "1")
+	sha := r.commitAt("c", t0)
+	if err := os.WriteFile(filepath.Join(r.root, ".git", "packed-refs.lock"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	start := time.Now()
+	if _, err := AddLinks(ctx, r.gitClient(), sha, []Link{{Harness: "codex", SessionID: "s"}}); err != nil {
+		t.Fatal(err)
+	}
+	// The deadline plus one second of lock wait, not the five a caller without a deadline gets.
+	if elapsed := time.Since(start); elapsed > 4*time.Second {
+		t.Fatalf("AddLinks took %v under a 1s deadline", elapsed)
+	}
+}
+
 func TestListLinked(t *testing.T) {
 	r := newTestRepo(t)
 	ctx := context.Background()
@@ -279,10 +336,10 @@ func TestListLinked(t *testing.T) {
 	r.commitAt("second (unlinked)", t0.Add(time.Minute))
 	r.write("a", "3")
 	third := r.commitAt("third", t0.Add(2*time.Minute))
-	if _, err := AddLinks(ctx, g, first, []Link{{"cursor", "c1"}}); err != nil {
+	if _, err := AddLinks(ctx, g, first, []Link{{Harness: "cursor", SessionID: "c1"}}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := AddLinks(ctx, g, third, []Link{{"codex", "x"}, {"claude_code", "y"}}); err != nil {
+	if _, err := AddLinks(ctx, g, third, []Link{{Harness: "codex", SessionID: "x"}, {Harness: "claude_code", SessionID: "y"}}); err != nil {
 		t.Fatal(err)
 	}
 	// A note on the ref that is not Beacon's is not a linked commit.

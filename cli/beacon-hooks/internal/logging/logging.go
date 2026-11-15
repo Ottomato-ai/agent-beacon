@@ -11,11 +11,15 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"testing"
 	"time"
 
 	"github.com/asymptote-labs/agent-beacon/cli/beacon-hooks/internal/config"
 	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve"
+	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve/activesession"
 	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve/filelock"
+	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve/localingest"
+	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve/shareauto"
 )
 
 // endpointSequence numbers the endpoint events emitted by this hook process, in the order
@@ -24,9 +28,23 @@ var endpointSequence asymptoteobserve.Sequencer
 
 const (
 	defaultEndpointRotateBytes    = 10 * 1024 * 1024
-	defaultEndpointRotateArchives = 5
-	endpointRuntimeFileMode       = 0666
+	defaultEndpointRotateArchives = asymptoteobserve.DefaultRuntimeLogRotateArchives
+	// endpointRuntimeFileMode is the shared (system-mode) log's mode. A log inside the current
+	// user's home is private instead; asymptoteobserve.RuntimeLogModes decides, identically in all
+	// three writers.
+	endpointRuntimeFileMode = asymptoteobserve.SharedRuntimeLogFileMode
 )
+
+// endpointEventsSuppressed stops this process writing endpoint events. A hook sets it when another
+// hook of Beacon's records the same event, as when Cursor runs Beacon's Claude Code hooks next to
+// its own.
+var endpointEventsSuppressed bool
+
+// SuppressEndpointEvents turns endpoint event writes off (true) or back on (false) for the rest of
+// this process.
+func SuppressEndpointEvents(suppress bool) {
+	endpointEventsSuppressed = suppress
+}
 
 // Logger provides structured JSON logging for hook events
 type Logger struct {
@@ -115,6 +133,9 @@ func (l *Logger) EndpointEvent(action, category, severity, message string, field
 // approval from a pre-tool notification, for instance -- so those events are distinguishable from
 // the ones a runtime actually reported.
 func (l *Logger) EndpointEventWithFidelity(action, category, severity, message, fidelity string, fields map[string]interface{}) error {
+	if endpointEventsSuppressed {
+		return nil
+	}
 	path := endpointLogPath()
 	if path == "" {
 		return nil
@@ -132,11 +153,293 @@ func (l *Logger) EndpointEventWithFidelity(action, category, severity, message, 
 	normalizeEventModel(event)
 	attachDerivedTrace(event)
 	if err := writeEndpointJSON(path, event); err != nil {
+		// A hook inside a sandbox that confines writes to the session workspace cannot reach the
+		// runtime log (DeepSeek Harness first, #605; container and operator sandboxes since, #1284)
+		// but can write the workspace. Staging the event there keeps capture live; a sweep, `beacon
+		// endpoint spool drain`, or this session's next hook that can reach the log drains it. A
+		// staged event is not reported as lost; the first one a session stages prints one note
+		// saying where it waits (stageInWorkspaceSpool). When staging fails too -- read-only mode,
+		// no workspace, unsafe ids, a full spool, a Beacon-only action -- the NOT-recorded
+		// explanation below fires unchanged, which is the honest report for an event nothing
+		// captured.
+		if l.stageInWorkspaceSpool(event, path) {
+			return nil
+		}
 		fmt.Fprintf(os.Stderr, "logging: failed to write endpoint event to %s: %v\n", path, err)
 		reportEndpointWriteFailure(os.Stderr, l.platform, path, err)
 		return err
 	}
+	l.drainOwnWorkspaceSpool(path, event)
+	recordActiveSession(event)
+	l.requestShareOnce(event)
 	return nil
+}
+
+// ShareSettingsPath locates the user's share settings. It is never taken from the environment,
+// which a repository can supply; tests replace it.
+var ShareSettingsPath = shareauto.HookPath
+
+// requestShareOnce writes one session.share_requested event for the event's session when the person
+// turned auto-share on for its working directory (`beacon share auto enable`). It is the first event
+// of the session the hooks see -- SessionStart where the runtime has one -- and never more than one
+// per session, deduplicated under a lock in the active-session record.
+//
+// The event is only written to the local runtime log. Beacon Cloud forwarding ships it like any
+// other line, and beacon.sh publishes the session when it receives it; without forwarding it is an
+// inert record. Nothing here touches the network. It is event.fidelity=inferred because Beacon
+// originated it: no runtime reported a share request.
+func (l *Logger) requestShareOnce(event map[string]interface{}) {
+	info, _ := event["event"].(map[string]interface{})
+	if action, _ := info["action"].(string); action == asymptoteobserve.ActionShareRequested {
+		return
+	}
+	session, _ := event["session"].(map[string]interface{})
+	harness, _ := event["harness"].(map[string]interface{})
+	if session == nil || harness == nil {
+		return
+	}
+	id, _ := session["id"].(string)
+	dir, _ := session["working_directory"].(string)
+	name, _ := harness["name"].(string)
+	if id == "" || dir == "" || name == "" {
+		return
+	}
+	decision := shareauto.ForHook(ShareSettingsPath(), dir)
+	if !decision.Enabled {
+		return
+	}
+	recordPath := activesession.DefaultPath()
+	markedAt := time.Now()
+	first, err := activesession.MarkShareRequested(recordPath, name, id, markedAt)
+	if err != nil || !first {
+		return
+	}
+	fields := map[string]interface{}{
+		"session": map[string]interface{}{"id": id, "working_directory": dir},
+	}
+	if visibility := decision.Visibility; visibility == "public" || visibility == "direct" || visibility == "private" {
+		fields["share"] = map[string]interface{}{"visibility": visibility}
+	}
+	if repo, _ := event["repository"].(string); repo != "" {
+		fields["repository"] = repo
+	}
+	if branch, _ := event["branch"].(string); branch != "" {
+		fields["branch"] = branch
+	}
+	if err := l.EndpointEventWithFidelity(asymptoteobserve.ActionShareRequested, "session", "info", "Auto-share requested for this session", asymptoteobserve.FidelityInferred, fields); err != nil {
+		// The request was not written (a read-only log, a sandbox): take the mark back so the next
+		// hook of the session asks again, rather than leave the session marked and never requested.
+		// Like the rest of this path it stays silent and never fails the hook.
+		_ = activesession.UnmarkShareRequested(recordPath, name, id, markedAt)
+	}
+}
+
+// recordActiveSession notes the event's session as the one its runtime is running in its working
+// directory, for `beacon share --current`. It is a local file write and never fails the hook: the
+// record is a convenience, the event above is what matters. Nothing here touches the network.
+func recordActiveSession(event map[string]interface{}) {
+	session, _ := event["session"].(map[string]interface{})
+	harness, _ := event["harness"].(map[string]interface{})
+	if session == nil || harness == nil {
+		return
+	}
+	id, _ := session["id"].(string)
+	dir, _ := session["working_directory"].(string)
+	name, _ := harness["name"].(string)
+	if id == "" || dir == "" || name == "" {
+		return
+	}
+	// Silent on failure: stderr is shown to the person on some runtimes, and a missing record
+	// only means `beacon share --current` falls back to the newest session in the directory.
+	_ = activesession.Record(activesession.DefaultPath(), name, id, dir, time.Now())
+}
+
+// stageInWorkspaceSpool stages one event this hook could not write to the runtime log at logPath
+// in its session's workspace spool (asymptoteobserve.WorkspaceSpoolDir), and reports whether it
+// did.
+//
+// Every harness stages, because every harness's spool has a drain: the sweep, `beacon endpoint
+// spool drain`, and the session's own next hook that reaches the log. It began as DeepSeek
+// Harness's alone (#605) and became general once other sandboxes showed the same shape (#1284).
+// The session id and harness name must be safe directory names on BOTH the writing and the
+// draining side (ValidSpoolName is what they share), so a hook without a session id stages
+// nothing. The workspace comes from the event's own session.working_directory -- the directory a
+// sandbox confines writes to -- with the process cwd as the fallback for callers that did not
+// carry the field.
+//
+// An action only Beacon writes (IsBeaconOnlyAction) is never staged: every drain refuses it, as it
+// must refuse one a repository planted, so staging would only turn a write the caller can retry
+// (requestShareOnce takes its mark back) into one silently lost.
+//
+// The spool is a localingest.Spool, the store a restricted-mode hook already falls back to, not the
+// runtime log's writer: it is private to this account wherever the workspace lives, bounded, and
+// waits at most its short lock timeout for a drain under way, so a hook never holds the agent up
+// behind one. A hook running as root never stages in a workspace another account owns
+// (rootInAnotherAccountsWorkspace): that account could never drain the root-owned files.
+func (l *Logger) stageInWorkspaceSpool(event map[string]interface{}, logPath string) bool {
+	if l == nil || l.sessionID == "" {
+		return false
+	}
+	if info, _ := event["event"].(map[string]interface{}); info != nil {
+		if action, _ := info["action"].(string); asymptoteobserve.IsBeaconOnlyAction(action) {
+			return false
+		}
+	}
+	harness := asymptoteobserve.NormalizeHarnessName(l.platform)
+	workspace := spoolWorkspace(event)
+	dir, ok := asymptoteobserve.WorkspaceSpoolDir(workspace, harness, l.sessionID)
+	// A workspace on the sandbox's own root filesystem (a cwd the sandbox never mounted) would
+	// hold the spool only as long as the sandbox lives.
+	if !ok || rootInAnotherAccountsWorkspace(workspace) || asymptoteobserve.OnSandboxRoot(dir) || !spoolPathIsReal(dir, true) {
+		return false
+	}
+	line, err := encodeEndpointLine(event)
+	if err != nil {
+		return false
+	}
+	// <ws>/.beacon/spool, two levels above <harness>/<session>. Nothing is staged unless its
+	// .gitignore keeps the spool out of git (ensureSpoolGitignore).
+	spoolRoot := filepath.Dir(filepath.Dir(dir))
+	if !ensureSpoolGitignore(spoolRoot) {
+		return false
+	}
+	spool := localingest.Spool{Dir: dir}
+	pending, _, err := spool.Pending()
+	first := err != nil || pending == 0
+	if dropped, err := spool.Append([][]byte{line}); err != nil || dropped > 0 {
+		return false
+	}
+	ensureSpoolGitExclude(spoolRoot)
+	if first {
+		reportStagedSession(os.Stderr, harness, l.sessionID, logPath, dir, workspace)
+	}
+	return true
+}
+
+// reportStagedSession prints, once for each session's spool (when it starts holding events), where
+// this session's events now wait and what delivers them. Not on every event: a hook runs as one
+// process per event, and every note lands in the runtime's hook stderr stream. Nothing tells the
+// hook whether a drain will find the session -- that needs Beacon to have recorded it outside the
+// sandbox, or the workspace under workspace_spool_roots -- so the note names the drain the person
+// can always run. That command names this session alone and the log this hook writes, shell-quoted
+// to paste as it is: pasted, it vouches for one session, never for every spool a cloned repository
+// planted beside it, and delivers to the log the hook meant, whatever mode the command runs in.
+// DeepSeek Harness is the exception: `beacon endpoint dsh sync` finds its sessions through its own
+// store, so its staging stays silent as it always was.
+func reportStagedSession(w io.Writer, harness, sessionID, logPath, dir, workspace string) {
+	if harness == dshHarnessName {
+		return
+	}
+	fmt.Fprintf(w, "beacon-hooks: cannot write the Beacon runtime log %s here; this session's events are held in %s until Beacon drains them.\n", logPath, dir)
+	fmt.Fprintf(w, "beacon-hooks: they are delivered by this session's next hook that reaches the log, or by running this outside the sandbox: beacon endpoint spool drain --log-path %s --workspace %s --harness %s --session %s\n",
+		shellQuote(logPath), shellQuote(workspace), shellQuote(harness), shellQuote(sessionID))
+}
+
+// shellQuote quotes s for a POSIX shell, so a path with spaces, quotes or `$(...)` pastes as one
+// literal argument.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// spoolWorkspace is the workspace an event's session runs in: its session.working_directory, or
+// the process cwd when the caller did not carry one.
+func spoolWorkspace(event map[string]interface{}) string {
+	cwd := ""
+	if session, ok := event["session"].(map[string]interface{}); ok {
+		cwd, _ = session["working_directory"].(string)
+	}
+	if strings.TrimSpace(cwd) == "" {
+		cwd, _ = os.Getwd()
+	}
+	return cwd
+}
+
+// spoolPathIsReal reports whether the components WorkspaceSpoolDir adds below the workspace --
+// .beacon, spool, <harness> and <session> -- are real directories and the spool file, if present,
+// a regular file no larger than a spool can grow. allowMissing lets components that do not exist
+// yet pass, for a writer that creates them.
+//
+// The sandboxed agent can write the workspace and knows its own session id, so it can plant the
+// session directory as a link to the account's own spool; the hook's drain, running outside the
+// sandbox, would then remove the lines it refuses from that spool. Spool.Append never lets the
+// file outgrow DefaultSpoolMaxBytes, so a larger one was written by hand and is not read. Lstat
+// checks the components themselves, from the session directory up, so a missing spool costs a
+// drain one stat.
+func spoolPathIsReal(dir string, allowMissing bool) bool {
+	file := localingest.Spool{Dir: dir}.FilePath()
+	for i := 0; i < 4; i, dir = i+1, filepath.Dir(dir) {
+		info, err := os.Lstat(dir)
+		switch {
+		case err == nil:
+			if !info.IsDir() {
+				return false
+			}
+		case allowMissing && os.IsNotExist(err):
+		default:
+			return false
+		}
+	}
+	info, err := os.Lstat(file)
+	return err != nil || (info.Mode().IsRegular() && info.Size() <= localingest.DefaultSpoolMaxBytes)
+}
+
+// ownSpoolDrainBatch bounds how many staged lines one hook delivers, so a long-sandboxed session's
+// backlog never makes a single hook slow; what is left waits for a sweep or a later process.
+const ownSpoolDrainBatch = 256
+
+// drainedOwnSpools remembers the spool directories this process has already drained, so a hook
+// that emits several events drains once rather than once per event.
+var drainedOwnSpools sync.Map
+
+// drainOwnWorkspaceSpool delivers, after this hook reached the runtime log at path, one batch of
+// what earlier hooks of the same session staged when they could not -- a session that leaves its
+// sandbox, or whose log comes back, catches up without waiting for a sweep.
+//
+// Only this hook's own session spool is drained: the hook knows its own session id is genuine, and
+// cannot know that of any other directory under the workspace, which anything able to write the
+// workspace (a cloned repository included) may have planted. Lines are untrusted all the same, so
+// each passes AdmitStagedLine first; a refused one counts as processed, discarded rather than
+// retried forever. A delivery error leaves it and the rest staged for the next drain.
+//
+// Everything here is best-effort and quiet: it never stages, never goes back through
+// EndpointEventWithFidelity, never writes stderr and never fails the hook. It drains only through
+// real directories (spoolPathIsReal), and Spool.Drain skips without waiting when another drainer
+// holds the spool. Each admitted line is decoded and written again through encodeEndpointLine, as
+// every line this hook writes is -- redacted, size-capped and stamped -- never appended byte for
+// byte. Like staging, a hook running as root never drains in a workspace another account owns:
+// the rewrite would leave that account's pending.jsonl root's.
+func (l *Logger) drainOwnWorkspaceSpool(path string, event map[string]interface{}) {
+	if l == nil || l.sessionID == "" {
+		return
+	}
+	harness := asymptoteobserve.NormalizeHarnessName(l.platform)
+	workspace := spoolWorkspace(event)
+	dir, ok := asymptoteobserve.WorkspaceSpoolDir(workspace, harness, l.sessionID)
+	if !ok || rootInAnotherAccountsWorkspace(workspace) {
+		return
+	}
+	if _, done := drainedOwnSpools.LoadOrStore(dir, true); done || !spoolPathIsReal(dir, false) {
+		return
+	}
+	_, _ = localingest.Spool{Dir: dir}.Drain(ownSpoolDrainBatch, func(lines [][]byte) (int, error) {
+		for i, line := range lines {
+			if !asymptoteobserve.AdmitStagedLine(line, harness, l.sessionID) {
+				continue
+			}
+			var staged map[string]interface{}
+			if err := json.Unmarshal(line, &staged); err != nil {
+				continue
+			}
+			encoded, err := encodeEndpointLine(staged)
+			if err != nil {
+				continue
+			}
+			if err := deliverEndpointLine(path, encoded); err != nil {
+				return i, err
+			}
+		}
+		return len(lines), nil
+	})
 }
 
 // reportedWriteFailures remembers which runtime log paths this process has already explained a
@@ -388,130 +691,86 @@ func firstEnv(keys ...string) string {
 	return ""
 }
 
-func writeEndpointJSON(path string, event map[string]interface{}) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return err
+// writeEndpointJSON appends one endpoint event to the runtime log. A variable so a test can make one
+// write fail.
+var writeEndpointJSON = writeEndpointJSONFile
+
+func writeEndpointJSONFile(path string, event map[string]interface{}) error {
+	_, dirMode, _ := asymptoteobserve.RuntimeLogModes(path)
+	if asymptoteobserve.RuntimeLogDirCreatable(path) {
+		if err := os.MkdirAll(filepath.Dir(path), dirMode); err != nil {
+			return err
+		}
 	}
-	data, err := json.Marshal(sanitizeEndpointMap(event))
+	data, err := encodeEndpointLine(event)
 	if err != nil {
 		return err
 	}
-	if len(data) > 64*1024 {
-		event["field_truncated"] = true
-		event["raw"] = nil
-		event["message"] = truncateEndpoint(fmt.Sprint(event["message"]), 1024)
-		data, err = json.Marshal(sanitizeEndpointMap(event))
-		if err != nil {
-			return err
-		}
-	}
-	if len(data) > 64*1024 {
-		compactEndpointContent(event)
-		data, err = json.Marshal(sanitizeEndpointMap(event))
-		if err != nil {
-			return err
-		}
-	}
-	if len(data) > 64*1024 {
-		event = minimalEndpointEvent(event)
-		data, err = json.Marshal(sanitizeEndpointMap(event))
-		if err != nil {
-			return err
-		}
-	}
-	if len(data) > 64*1024 {
-		return fmt.Errorf("endpoint event exceeds 64 KiB after metadata fallback")
-	}
-	// Stamped last, over the bytes that are actually about to be written, so
-	// none of the size fallbacks above can leave the ID describing an event that
-	// no longer exists.
-	if data, err = withEndpointEventID(event, data); err != nil {
-		return err
-	}
-	return appendEndpointJSONL(path, append(data, '\n'), defaultEndpointRotateBytes, defaultEndpointRotateArchives)
+	return deliverEndpointLine(path, data)
 }
 
-// withEndpointEventID fills event.id on an event assembled as a map and returns
-// its re-marshalled line. line must be the marshalled form of event with no ID
-// on it, which is what EventIDForLine is derived from.
-func withEndpointEventID(event map[string]interface{}, line []byte) ([]byte, error) {
-	info, ok := event["event"].(map[string]interface{})
-	if !ok {
-		return line, nil
-	}
-	if id, _ := info["id"].(string); strings.TrimSpace(id) != "" {
-		return line, nil
-	}
-	info["id"] = asymptoteobserve.EventIDForLine(line)
+// encodeEndpointLine is the line an endpoint event is written as: sanitized, then fitted to the
+// event size limit and stamped with its event.id the way every writer does (FitEventLine).
+func encodeEndpointLine(event map[string]interface{}) ([]byte, error) {
 	data, err := json.Marshal(sanitizeEndpointMap(event))
 	if err != nil {
 		return nil, err
 	}
-	// An event already at the size limit keeps its bytes and goes without an ID:
-	// the limit is a hard contract, and refusing to write an event over forty
-	// bytes of identity would be the worse trade.
-	if len(data) > 64*1024 {
-		return line, nil
+	var stamp func(id string) ([]byte, error)
+	if info, ok := event["event"].(map[string]interface{}); ok {
+		if id, _ := info["id"].(string); strings.TrimSpace(id) == "" {
+			stamp = func(id string) ([]byte, error) {
+				info["id"] = id
+				return json.Marshal(sanitizeEndpointMap(event))
+			}
+		}
 	}
-	return data, nil
+	return asymptoteobserve.FitEventLine(data, asymptoteobserve.DefaultMaxEventBytes, stamp)
 }
 
-func compactEndpointContent(event map[string]interface{}) {
-	if file, ok := event["file"].(map[string]interface{}); ok {
-		delete(file, "diff")
+// EndpointIngest delivers to the system log through the collector when the endpoint is in the
+// restricted log access mode. Tests point it at a socket and spool of their own; nothing else
+// changes it.
+var EndpointIngest = defaultEndpointIngest()
+
+// defaultEndpointIngest is the real socket and the account's spool, except in a test binary, where
+// a test writing a system log as an ordinary account must never reach the machine's collector or
+// leave lines in the developer's own spool.
+func defaultEndpointIngest() localingest.Deliverer {
+	if !testing.Testing() {
+		return localingest.Deliverer{}
 	}
-	if command, ok := event["command"].(map[string]interface{}); ok {
-		delete(command, "output")
+	dir := filepath.Join(os.TempDir(), fmt.Sprintf("beacon-hooks-test-%d", os.Getpid()))
+	socket := filepath.Join(dir, "no-collector.sock")
+	if runtime.GOOS == "windows" {
+		socket = fmt.Sprintf(`\\.\pipe\beacon-hooks-test-%d-none`, os.Getpid())
 	}
-	if genAI, ok := event["gen_ai"].(map[string]interface{}); ok {
-		delete(genAI, "input")
-		delete(genAI, "output")
-		if tool, ok := genAI["tool"].(map[string]interface{}); ok {
-			if call, ok := tool["call"].(map[string]interface{}); ok {
-				delete(call, "arguments")
-				delete(call, "result")
-			}
-		}
-	}
-	if content, ok := event["content"].(map[string]interface{}); ok {
-		content["included"] = false
-		content["truncated"] = true
+	return localingest.Deliverer{
+		Client: localingest.Client{SocketPath: socket},
+		Spool:  localingest.Spool{Dir: filepath.Join(dir, "spool")},
 	}
 }
 
-func minimalEndpointEvent(event map[string]interface{}) map[string]interface{} {
-	out := map[string]interface{}{"field_truncated": true}
-	for _, key := range []string{
-		"timestamp", "sequence", "vendor", "product", "schema_version", "event", "severity",
-		"endpoint", "user", "harness", "origin", "run", "session", "trace",
-		"error", "tool", "file", "command", "mcp", "approval", "policy",
-		"content", "destination", "health", "model", "repository",
-		"branch", "message",
-	} {
-		if value, ok := event[key]; ok && value != nil {
-			out[key] = value
-		}
-	}
-	if genAI, ok := event["gen_ai"].(map[string]interface{}); ok {
-		summary := map[string]interface{}{}
-		for _, key := range []string{"operation", "usage", "response", "provider"} {
-			if value := genAI[key]; value != nil {
-				summary[key] = value
-			}
-		}
-		if tool, ok := genAI["tool"].(map[string]interface{}); ok {
-			toolSummary := map[string]interface{}{"name": tool["name"], "type": tool["type"]}
-			if call, ok := tool["call"].(map[string]interface{}); ok {
-				toolSummary["call"] = map[string]interface{}{"id": call["id"]}
-			}
-			summary["tool"] = toolSummary
-		}
-		if len(summary) > 0 {
-			out["gen_ai"] = summary
-		}
-	}
-	out["message"] = truncateEndpoint(fmt.Sprint(out["message"]), 1024)
-	return out
+// deliverEndpointLine writes one finished line to the runtime log at path.
+//
+// A hook writing the system log as an ordinary account hands the line to the collector over the
+// local ingest socket when the endpoint has one (the restricted log access mode, in which the log
+// is not writable by this account at all), and otherwise appends directly, as hooks always have.
+// Only a direct append the log refuses -- a restricted endpoint whose collector is restarting --
+// puts the line in this account's private spool, and it reaches the log with a later event
+// instead of being lost. Root and per-user logs are always written directly. See
+// localingest.Deliverer.Write.
+func deliverEndpointLine(path string, data []byte) error {
+	return EndpointIngest.Write(path, data, func(line []byte) error {
+		return appendEndpointJSONL(path, append(line[:len(line):len(line)], '\n'), defaultEndpointRotateBytes, defaultEndpointRotateArchives)
+	})
+}
+
+// EndpointLogConfigured reports whether this process has a runtime log to write to. Without one,
+// EndpointEvent records nothing and returns nil, so a caller reporting what it recorded checks this
+// rather than reading a nil error as a write.
+func EndpointLogConfigured() bool {
+	return endpointLogPath() != ""
 }
 
 func endpointLogPath() string {
@@ -528,10 +787,6 @@ func endpointLogPath() string {
 	return filepath.Join(home, ".beacon", "endpoint", "logs", "runtime.jsonl")
 }
 
-func redactEndpointString(value string) string {
-	return asymptoteobserve.RedactString(value)
-}
-
 func sanitizeEndpointMap(input map[string]interface{}) map[string]interface{} {
 	return asymptoteobserve.SanitizeMap(input, asymptoteobserve.PrivacyOptions{
 		RedactSecrets: true,
@@ -546,16 +801,16 @@ func sanitizeEndpointSlice(input []interface{}) []interface{} {
 	})
 }
 
-func truncateEndpoint(value string, limit int) string {
-	return asymptoteobserve.TruncateString(value, limit)
-}
-
-// Keep this rotation contract mirrored with the endpoint CLI and beaconjson exporter.
+// Keep this file-mode contract mirrored with the endpoint CLI and beaconjson exporter; the rotation
+// itself is asymptoteobserve.RotateRuntimeLog for all three.
 func appendEndpointJSONL(path string, line []byte, rotateBytes int64, rotateArchives int) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return err
+	_, dirMode, _ := asymptoteobserve.RuntimeLogModes(path)
+	if asymptoteobserve.RuntimeLogDirCreatable(path) {
+		if err := os.MkdirAll(filepath.Dir(path), dirMode); err != nil {
+			return err
+		}
 	}
-	lock, err := openEndpointRuntimeFile(path+".lock", os.O_CREATE|os.O_RDWR)
+	lock, err := openEndpointRuntimeFileAs(path+".lock", path, os.O_CREATE|os.O_RDWR)
 	if err != nil {
 		return err
 	}
@@ -570,9 +825,15 @@ func appendEndpointJSONL(path string, line []byte, rotateBytes int64, rotateArch
 	if asymptoteobserve.IsDuplicateEndpointEvent(path, line, asymptoteobserve.EndpointDuplicateWindow) {
 		return nil
 	}
-	if err := rotateEndpointLogIfNeeded(path, rotateBytes, rotateArchives, int64(len(line))); err != nil {
-		return err
-	}
+	// A rotation that cannot happen now is deferred, never fatal, and the event is appended past the
+	// size limit for a later write to rotate. A hook usually runs as the person at the keyboard, and
+	// on a system-mode log it may not rename or delete anything in the directory: the directory is
+	// root-owned 0755 on POSIX, and on Windows its ACL gives ordinary users no right to add, rename or
+	// delete entries -- the rights that would let one redirect a SYSTEM write. Rotation is the
+	// privileged writers' job there. And on Windows a reader holding the log open without delete
+	// sharing blocks the rename for every writer until it lets go. asymptoteobserve.RotateRuntimeLog
+	// moves nothing in either case.
+	_ = asymptoteobserve.RotateRuntimeLog(path, rotateBytes, rotateArchives, int64(len(line)))
 	f, err := openEndpointRuntimeFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY)
 	if err != nil {
 		return err
@@ -583,77 +844,15 @@ func appendEndpointJSONL(path string, line []byte, rotateBytes int64, rotateArch
 }
 
 func openEndpointRuntimeFile(path string, flag int) (*os.File, error) {
-	existed := true
-	if _, err := os.Stat(path); err != nil {
-		if !os.IsNotExist(err) {
-			return nil, err
-		}
-		existed = false
-	}
-	f, err := os.OpenFile(path, flag, endpointRuntimeFileMode)
-	if err != nil {
-		return nil, err
-	}
-	if err := os.Chmod(path, endpointRuntimeFileMode); err != nil && !existed {
-		_ = f.Close()
-		return nil, err
-	}
-	return f, nil
+	return openEndpointRuntimeFileAs(path, path, flag)
 }
 
-func rotateEndpointLogIfNeeded(path string, maxSize int64, archives int, nextWriteBytes int64) error {
-	if maxSize <= 0 {
-		return nil
-	}
-	if archives < 1 {
-		archives = defaultEndpointRotateArchives
-	}
-	info, err := os.Stat(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	if info.Size() == 0 || info.Size()+nextWriteBytes <= maxSize {
-		return nil
-	}
-	if err := removeOverflowEndpointArchives(path, archives); err != nil {
-		return err
-	}
-	for i := archives - 1; i >= 1; i-- {
-		from := path + fmt.Sprintf(".%d", i)
-		to := path + fmt.Sprintf(".%d", i+1)
-		if err := os.Rename(from, to); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-	}
-	return os.Rename(path, path+".1")
-}
-
-func removeOverflowEndpointArchives(path string, archives int) error {
-	dir := filepath.Dir(path)
-	base := filepath.Base(path)
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return err
-	}
-	prefix := base + "."
-	for _, entry := range entries {
-		name := entry.Name()
-		suffix, ok := strings.CutPrefix(name, prefix)
-		if !ok {
-			continue
-		}
-		index, err := strconv.Atoi(suffix)
-		if err != nil || index < archives {
-			continue
-		}
-		if err := os.Remove(filepath.Join(dir, name)); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-	}
-	return nil
+// openEndpointRuntimeFileAs opens path (the log or its lock) with the mode logPath calls for, and
+// settles its mode through asymptoteobserve.OpenRuntimeLogFile: a new file gets that mode
+// whatever the umask, an existing one is only ever narrowed toward it, by its owner, and root never
+// follows a symlink or opens anything but a regular file there.
+func openEndpointRuntimeFileAs(path, logPath string, flag int) (*os.File, error) {
+	return asymptoteobserve.OpenRuntimeLogFile(path, logPath, flag)
 }
 
 // Debug logs a debug message

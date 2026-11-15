@@ -1,6 +1,11 @@
 package cmd
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+
+	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve"
+)
 
 // piFamilyRuntimes is every runtime the shared Pi-family mapper serves. Tests that assert a
 // property of the shape rather than of one product walk this, so a runtime added later inherits
@@ -52,25 +57,77 @@ func TestPiFamilyPromotesTheToolCallIDOnBothHalves(t *testing.T) {
 	}
 }
 
+func TestOmpContextEventMapsSkillListingAsSystemContext(t *testing.T) {
+	listing := "- oracle-index: Lists conventions. Canary BCN-2AFE23-C01I.\n- oracle-probe: Runs the probe."
+	events := ompRuntime.endpointEvents(map[string]interface{}{
+		"type":         "context",
+		"skillListing": listing,
+	}, "sess-1")
+	if len(events) != 1 || events[0].action != "session.context" || events[0].category != "session" {
+		t.Fatalf("events = %+v, want one session.context", events)
+	}
+	want := asymptoteobserve.ParseSkillListing(asymptoteobserve.SystemContextSourceSystemPrompt, listing, nil).Fields(asymptoteobserve.DefaultStringLimit)
+	genAI, _ := events[0].fields["gen_ai"].(map[string]interface{})
+	if !reflect.DeepEqual(genAI, want["gen_ai"]) {
+		t.Fatalf("gen_ai = %#v, want only the listing's system_instructions, one part per skill", genAI)
+	}
+	if !reflect.DeepEqual(events[0].fields["system_context"], want["system_context"]) || !reflect.DeepEqual(events[0].fields["content"], want["content"]) {
+		t.Fatalf("system_context = %#v content = %#v, want the shared builder's", events[0].fields["system_context"], events[0].fields["content"])
+	}
+	if _, ok := events[0].fields["prompt"]; ok {
+		t.Fatalf("session context was mislabeled as operator prompt: %#v", events[0].fields["prompt"])
+	}
+	raw, _ := events[0].fields["raw"].(map[string]interface{})
+	if !reflect.DeepEqual(raw, map[string]interface{}{"omp": map[string]interface{}{"type": "context"}}) {
+		t.Fatalf("raw = %#v, want event-type metadata without a copy of the listing", raw)
+	}
+}
+
+// One context payload can carry both listings. The skill index keeps its own event, and each route
+// is built from the envelope rather than from the skill event's fields.
+func TestOmpContextEventMapsSkillListingAndMCPRoutesApart(t *testing.T) {
+	events := ompRuntime.endpointEvents(map[string]interface{}{
+		"type":         "context",
+		"skillListing": "- deploy: Deploy applications.",
+		"mcpToolRoutes": []interface{}{
+			map[string]interface{}{"name": "mcp__notes_save_note", "description": "Saves a note."},
+		},
+	}, "sess-1")
+	if len(events) != 2 || events[0].action != "session.context" || events[1].action != "mcp.tool_listed" {
+		t.Fatalf("events = %+v, want session.context then mcp.tool_listed", events)
+	}
+	if _, ok := events[1].fields["system_context"]; ok {
+		t.Fatalf("route listing inherited the skill listing's system_context: %#v", events[1].fields)
+	}
+	genAI, _ := events[1].fields["gen_ai"].(map[string]interface{})
+	if _, ok := genAI["system_instructions"]; ok {
+		t.Fatalf("route listing inherited the skill listing's system_instructions: %#v", genAI)
+	}
+}
+
 // The call ID must survive onto whatever action the completion resolved to, not just onto the
 // generic tool.completed. A file.modified with no join key cannot be tied back to the tool.invoked
-// that proposed the edit, which is exactly the link an investigation follows.
+// that proposed the edit, which is exactly the link an investigation follows. A failure is the
+// case an investigation is most likely to be reading, so it gets the join key too.
 func TestPiFamilyToolCallIDSurvivesOntoFileAndCommandActions(t *testing.T) {
 	for _, runtime := range piFamilyRuntimes {
 		for _, tc := range []struct {
-			tool   string
-			args   map[string]interface{}
-			action string
+			tool    string
+			args    map[string]interface{}
+			isError bool
+			action  string
 		}{
-			{"edit", map[string]interface{}{"path": "/repo/main.go"}, "file.modified"},
-			{"write", map[string]interface{}{"path": "/repo/new.go"}, "file.created"},
-			{"read", map[string]interface{}{"path": "/repo/main.go"}, "file.read"},
-			{"bash", map[string]interface{}{"command": "ls"}, "command.executed"},
-			{"grep", map[string]interface{}{"pattern": "TODO"}, "tool.completed"},
+			{"edit", map[string]interface{}{"path": "/repo/main.go"}, false, "file.modified"},
+			{"write", map[string]interface{}{"path": "/repo/new.go"}, false, "file.created"},
+			{"read", map[string]interface{}{"path": "/repo/main.go"}, false, "file.read"},
+			{"bash", map[string]interface{}{"command": "ls"}, false, "command.executed"},
+			{"grep", map[string]interface{}{"pattern": "TODO"}, false, "tool.completed"},
+			{"bash", map[string]interface{}{"command": "false"}, true, "tool.failed"},
 		} {
-			t.Run(runtime.platform+"/"+tc.tool, func(t *testing.T) {
+			t.Run(runtime.platform+"/"+tc.action, func(t *testing.T) {
 				events := runtime.endpointEvents(map[string]interface{}{
 					"type": "tool_result", "toolName": tc.tool, "toolCallId": "call-9", "input": tc.args,
+					"isError": tc.isError,
 				}, "sess-1")
 				if len(events) != 1 || events[0].action != tc.action {
 					t.Fatalf("events = %v, want a single %s", events, tc.action)
@@ -80,25 +137,6 @@ func TestPiFamilyToolCallIDSurvivesOntoFileAndCommandActions(t *testing.T) {
 				}
 			})
 		}
-	}
-}
-
-// A failed tool still gets the join key. A failure is the case an investigation is most likely to
-// be reading, and it is the one where the tool.invoked that preceded it matters most.
-func TestPiFamilyFailedToolKeepsTheToolCallID(t *testing.T) {
-	for _, runtime := range piFamilyRuntimes {
-		t.Run(runtime.platform, func(t *testing.T) {
-			events := runtime.endpointEvents(map[string]interface{}{
-				"type": "tool_result", "toolName": "bash", "toolCallId": "call-5",
-				"input": map[string]interface{}{"command": "false"}, "isError": true,
-			}, "sess-1")
-			if len(events) != 1 || events[0].action != "tool.failed" {
-				t.Fatalf("events = %v, want a single tool.failed", events)
-			}
-			if got := piFamilyToolCallID(t, events[0]); got != "call-5" {
-				t.Fatalf("gen_ai.tool.call.id = %q, want call-5", got)
-			}
-		})
 	}
 }
 

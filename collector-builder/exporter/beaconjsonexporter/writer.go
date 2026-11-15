@@ -2,15 +2,11 @@ package beaconjsonexporter
 
 import (
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
 
-	"github.com/asymptote-labs/agent-beacon/collector-builder/exporter/beaconjsonexporter/internal/beaconevent"
+	"github.com/asymptote-labs/agent-beacon/collector-builder/exporter/beaconjsonexporter/internal/runtimelog"
 	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve"
-	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve/filelock"
 )
 
 type jsonlWriter struct {
@@ -27,275 +23,81 @@ func (w jsonlWriter) append(event beaconEvent) error {
 	if err != nil {
 		return err
 	}
-	if len(data) > w.maxEventBytes {
-		event.Raw = nil
-		event.Message = asymptoteobserve.TruncateString(event.Message, 1024)
-		event.Truncated = true
-		data, err = json.Marshal(event)
-		if err != nil {
-			return err
-		}
-	}
-	if len(data) > w.maxEventBytes {
-		// Retained content is the next thing to go after raw, mirroring the hook
-		// writer's compactEndpointContent. Before this path existed the only step
-		// past dropping raw was the hard error below, which was survivable while
-		// no OTLP event carried a turn's text and is not now that they do.
-		compactRetainedContent(&event)
-		data, err = json.Marshal(event)
-		if err != nil {
-			return err
-		}
-	}
-	if len(data) > w.maxEventBytes {
-		return fmt.Errorf("event exceeds maximum size after truncation: %d bytes", len(data))
-	}
-	// Stamped last, over the bytes that are actually about to be written, so a
-	// size fallback above cannot leave the ID describing an event that no longer
-	// exists. Marshalling twice is the cost of an identity derived from the
-	// event rather than asserted about it. An event already at the size limit
-	// keeps its bytes and goes without one.
+	var stamp func(id string) ([]byte, error)
 	if event.Event.ID == "" {
-		event.Event.ID = asymptoteobserve.EventIDForLine(data)
-		stamped, err := json.Marshal(event)
-		if err != nil {
-			return err
-		}
-		if len(stamped) <= w.maxEventBytes {
-			data = stamped
+		stamp = func(id string) ([]byte, error) {
+			event.Event.ID = id
+			return json.Marshal(event)
 		}
 	}
-	if err := os.MkdirAll(filepath.Dir(w.path), 0755); err != nil {
+	data, err = asymptoteobserve.FitEventLine(data, w.maxEventBytes, stamp)
+	if err != nil {
+		return err
+	}
+	_, dirMode, _ := asymptoteobserve.RuntimeLogModes(w.path)
+	if err := os.MkdirAll(filepath.Dir(w.path), dirMode); err != nil {
 		return err
 	}
 	return appendJSONL(w.path, append(data, '\n'), w.rotateBytes, w.rotateArchives)
 }
 
-// compactRetainedContent drops an event's retained text and records that it did,
-// so a reader can still tell what the event was about and that its content was
-// held back rather than never captured. The hash and byte count in the content
-// marker describe the original text and stay put.
-func compactRetainedContent(event *beaconEvent) {
-	if event.File != nil {
-		event.File.Diff = ""
-	}
-	if event.Command != nil {
-		event.Command.Output = ""
-	}
-	if event.Prompt != nil {
-		event.Prompt.Text = ""
-	}
-	if event.GenAI != nil {
-		event.GenAI.Input = nil
-		event.GenAI.Output = nil
-		if event.GenAI.Tool != nil && event.GenAI.Tool.Call != nil {
-			event.GenAI.Tool.Call.Arguments = nil
-			event.GenAI.Tool.Call.Result = nil
-		}
-		// An event whose only gen_ai content was the turn text drops the object
-		// rather than writing "gen_ai":{}.
-		if beaconevent.IsZeroJSON(event.GenAI) {
-			event.GenAI = nil
-		}
-	}
-	if event.Content != nil {
-		event.Content.Included = false
-		event.Content.Truncated = true
-	}
-}
-
+// sanitize is asymptoteobserve.SanitizeEventWith with the exporter's choices: secret redaction as
+// configured (redact_secrets), and a browser chat answer kept to browserResponseStringLimit with its
+// duplicate in raw dropped.
 func (w jsonlWriter) sanitize(event beaconEvent) beaconEvent {
-	event.Message = w.cleanString(event.Message, asymptoteobserve.DefaultStringLimit)
-	if event.Tool != nil {
-		event.Tool.Command = w.cleanString(event.Tool.Command, asymptoteobserve.DefaultStringLimit)
-		event.Tool.Path = asymptoteobserve.TruncateString(event.Tool.Path, asymptoteobserve.DefaultRawStringLimit)
+	opts := asymptoteobserve.EventSanitizeOptions{RedactSecrets: w.redactSecrets}
+	if event.GenAI != nil && event.GenAI.Output != nil && browserChatHarnesses[event.Harness.Name] {
+		opts.GenAIOutputLimit = browserResponseStringLimit
+		event.Raw = withoutRawAnswer(event.Raw)
 	}
-	if event.Command != nil {
-		event.Command.Command = w.cleanString(event.Command.Command, asymptoteobserve.DefaultStringLimit)
-		event.Command.Output = w.cleanString(event.Command.Output, asymptoteobserve.DefaultStringLimit)
-	}
-	// Mirrors SanitizeEvent: retained bulk content gets the prompt-text limit and
-	// secret redaction, not the shorter raw-attribute limit.
-	if event.File != nil {
-		event.File.Diff = w.cleanString(event.File.Diff, asymptoteobserve.DefaultStringLimit)
-	}
-	if event.Approval != nil {
-		event.Approval.Reason = w.cleanString(event.Approval.Reason, asymptoteobserve.DefaultStringLimit)
-	}
-	if event.Policy != nil {
-		event.Policy.Reason = w.cleanString(event.Policy.Reason, asymptoteobserve.DefaultStringLimit)
-	}
-	if event.Prompt != nil {
-		event.Prompt.Text = w.cleanString(event.Prompt.Text, asymptoteobserve.DefaultStringLimit)
-	}
-	if event.MCP != nil {
-		event.MCP = sanitizeTyped(event.MCP, w.sanitizeMap)
-	}
-	if event.GenAI != nil {
-		event.GenAI = sanitizeTyped(event.GenAI, w.sanitizeMap)
-	}
-	if event.Raw != nil {
-		event.Raw = w.sanitizeMap(event.Raw)
-	}
-	if data, err := json.Marshal(event); err == nil && len(data) > w.maxEventBytes {
-		event.Truncated = true
-	}
+	event.Base = asymptoteobserve.SanitizeEventWith(event.Base, w.maxEventBytes, opts)
 	return event
 }
 
-func (w jsonlWriter) sanitizeMap(input map[string]interface{}) map[string]interface{} {
-	return asymptoteobserve.SanitizeMap(input, asymptoteobserve.PrivacyOptions{
-		RedactSecrets: w.redactSecrets,
-		StringLimit:   asymptoteobserve.DefaultRawStringLimit,
-	})
+// A claude.ai or chatgpt.com answer is what a browser chat event is about, and most run past the
+// 2 KB raw-attribute limit the rest of gen_ai keeps, so the log keeps up to 16 KB of it. A coding
+// agent's reply rarely needs more, and its OTLP gen_ai fields can carry whole message histories.
+const browserResponseStringLimit = 16 * 1024
+
+var browserChatHarnesses = map[string]bool{"claude_web": true, "chatgpt_web": true}
+
+// withoutRawAnswer is raw without the answer's copy in its attributes: the answer is in
+// gen_ai.output.messages already, so the raw copy would only add its first 2 KB to the line again.
+// It copies what it changes and leaves the caller's maps alone. It runs before sanitizing, so the
+// field_truncated decision sees the line as it will be written.
+func withoutRawAnswer(raw map[string]interface{}) map[string]interface{} {
+	attrs, ok := raw["attributes"].(map[string]interface{})
+	if !ok {
+		return raw
+	}
+	if _, ok := attrs["gen_ai.output.messages"]; !ok {
+		return raw
+	}
+	trimmed := make(map[string]interface{}, len(attrs))
+	for key, value := range attrs {
+		if key != "gen_ai.output.messages" {
+			trimmed[key] = value
+		}
+	}
+	out := make(map[string]interface{}, len(raw))
+	for key, value := range raw {
+		out[key] = value
+	}
+	out["attributes"] = trimmed
+	return out
 }
 
-func (w jsonlWriter) sanitizeSlice(input []interface{}) []interface{} {
-	return asymptoteobserve.SanitizeSlice(input, asymptoteobserve.PrivacyOptions{
-		RedactSecrets: w.redactSecrets,
-		StringLimit:   asymptoteobserve.DefaultRawStringLimit,
-	})
-}
+// In system mode the collector runs as root, while agent hooks append to the
+// same runtime log as the console user, so the shared runtime files must stay
+// writable by both regardless of which process creates them first. A user-mode
+// collector writes a log inside its user's home, which is private (0600 in a
+// 0700 directory): asymptoteobserve.RuntimeLogModes decides from the path,
+// identically in all three writers.
+const runtimeFileMode = asymptoteobserve.SharedRuntimeLogFileMode
 
-func (w jsonlWriter) cleanString(value string, limit int) string {
-	return asymptoteobserve.CleanString(value, limit, w.redactSecrets)
-}
-
-func sanitizeTyped[T any](input *T, sanitize func(map[string]interface{}) map[string]interface{}) *T {
-	if input == nil {
-		return nil
-	}
-	data, err := json.Marshal(input)
-	if err != nil {
-		out := *input
-		return &out
-	}
-	var raw map[string]interface{}
-	if err := json.Unmarshal(data, &raw); err != nil {
-		out := *input
-		return &out
-	}
-	raw = sanitize(raw)
-	data, err = json.Marshal(raw)
-	if err != nil {
-		out := *input
-		return &out
-	}
-	var out T
-	if err := json.Unmarshal(data, &out); err != nil {
-		fallback := *input
-		return &fallback
-	}
-	return &out
-}
-
-// The collector usually runs as root, while agent hooks append to the same
-// runtime log as the console user, so shared runtime files must stay
-// writable by both regardless of which process creates them first.
-const runtimeFileMode = 0666
-
-// Keep this rotation contract mirrored with the endpoint CLI and hook writer.
+// Keep this rotation and file-mode contract mirrored with the endpoint CLI and hook writer. The
+// implementation lives in internal/runtimelog so the beacon_ingest extension appends through the
+// same lock, rotation and file-mode handling as the exporter.
 func appendJSONL(path string, line []byte, rotateBytes int64, rotateArchives int) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return err
-	}
-	lock, err := openRuntimeFile(path+".lock", os.O_CREATE|os.O_RDWR)
-	if err != nil {
-		return err
-	}
-	held, err := filelock.Exclusive(lock)
-	if err != nil {
-		_ = lock.Close()
-		return err
-	}
-	// Unlock before closing: LIFO defer ordering means the close listed first runs last.
-	defer lock.Close()
-	defer held.Release()
-	if asymptoteobserve.IsDuplicateEndpointEvent(path, line, asymptoteobserve.EndpointDuplicateWindow) {
-		return nil
-	}
-	if err := rotateIfNeeded(path, rotateBytes, rotateArchives, int64(len(line))); err != nil {
-		return err
-	}
-	f, err := openRuntimeFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	_, err = f.Write(line)
-	return err
-}
-
-func openRuntimeFile(path string, flag int) (*os.File, error) {
-	existed := true
-	if _, err := os.Stat(path); err != nil {
-		if !os.IsNotExist(err) {
-			return nil, err
-		}
-		existed = false
-	}
-	f, err := os.OpenFile(path, flag, runtimeFileMode)
-	if err != nil {
-		return nil, err
-	}
-	if err := os.Chmod(path, runtimeFileMode); err != nil && !existed {
-		_ = f.Close()
-		return nil, err
-	}
-	return f, nil
-}
-
-func rotateIfNeeded(path string, maxSize int64, archives int, nextWriteBytes int64) error {
-	if maxSize <= 0 {
-		return nil
-	}
-	if archives < 1 {
-		archives = defaultRotateArchives
-	}
-	info, err := os.Stat(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	if info.Size() == 0 || info.Size()+nextWriteBytes <= maxSize {
-		return nil
-	}
-	if err := removeOverflowArchives(path, archives); err != nil {
-		return err
-	}
-	for i := archives - 1; i >= 1; i-- {
-		from := path + fmt.Sprintf(".%d", i)
-		to := path + fmt.Sprintf(".%d", i+1)
-		if err := os.Rename(from, to); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-	}
-	return os.Rename(path, path+".1")
-}
-
-func removeOverflowArchives(path string, archives int) error {
-	dir := filepath.Dir(path)
-	base := filepath.Base(path)
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return err
-	}
-	prefix := base + "."
-	for _, entry := range entries {
-		name := entry.Name()
-		suffix, ok := strings.CutPrefix(name, prefix)
-		if !ok {
-			continue
-		}
-		index, err := strconv.Atoi(suffix)
-		if err != nil || index < archives {
-			continue
-		}
-		if err := os.Remove(filepath.Join(dir, name)); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-	}
-	return nil
+	return runtimelog.Append(path, line, rotateBytes, rotateArchives)
 }

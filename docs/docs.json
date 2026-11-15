@@ -57,42 +57,33 @@
             "pages": [
               "deployment/hosting-options",
               "deployment/open-source",
-              "deployment/managed"
+              "deployment/managed",
+              "deployment/plans"
             ]
           },
           {
-            "group": "How Beacon Works",
-            "icon": "book-open",
+            "group": "Beacon Cloud",
+            "icon": "cloud",
             "pages": [
-              "concepts/core-concepts",
               {
-                "group": "System Architecture",
-                "root": "architecture/system-architecture",
+                "group": "Onboarding",
                 "pages": [
-                  "architecture/architecture",
-                  "concepts/vector-forwarding"
+                  "cloud/devices",
+                  "manage/profile"
                 ]
               },
-              "concepts/cross-harness-memory",
-              "concepts/beacon-skills",
-              "concepts/session-handoff",
-              {
-                "group": "Unified Telemetry Schema",
-                "root": "telemetry-schema/event-schema",
-                "pages": [
-                  "telemetry-schema/normalization",
-                  "telemetry-schema/fields",
-                  "telemetry-schema/examples"
-                ]
-              },
-              "concepts/faq"
-            ]
-          },
-          {
-            "group": "Manage Beacon",
-            "icon": "sliders",
-            "pages": [
+              "cloud/sessions",
+              "cloud/findings",
               "deployment/managed-mcp",
+              {
+                "group": "Lenses",
+                "pages": [
+                  "cloud/lenses/adding-lenses",
+                  "cloud/lenses/creating-lenses",
+                  "cloud/lenses/managing-lenses",
+                  "cloud/lenses/lenses-mcp"
+                ]
+              },
               {
                 "group": "Inventory",
                 "root": "guides/inventory",
@@ -114,11 +105,61 @@
             ]
           },
           {
+            "group": "Sharing Sessions",
+            "icon": "share-nodes",
+            "pages": [
+              "sharing/index",
+              "sharing/cli",
+              "sharing/agent-skills",
+              "sharing/agent-hooks",
+              "sharing/git-hooks",
+              "sharing/api-key"
+            ]
+          },
+          {
+            "group": "How Beacon Works",
+            "icon": "book-open",
+            "pages": [
+              "concepts/core-concepts",
+              {
+                "group": "System Architecture",
+                "root": "architecture/system-architecture",
+                "pages": [
+                  "architecture/architecture",
+                  "concepts/vector-forwarding"
+                ]
+              },
+              "concepts/cross-harness-memory",
+              "concepts/beacon-skills",
+              "concepts/session-handoff",
+              "concepts/lenses",
+              {
+                "group": "Unified Telemetry Schema",
+                "root": "telemetry-schema/event-schema",
+                "pages": [
+                  "telemetry-schema/normalization",
+                  "telemetry-schema/fields",
+                  "telemetry-schema/examples"
+                ]
+              },
+              "concepts/faq"
+            ]
+          },
+          {
             "group": "Agent Harness Integrations",
             "icon": "list-check",
             "pages": [
               "runtimes/index",
               "runtimes/integration-model",
+              {
+                "group": "LLM Gateways",
+                "root": "runtimes/llm-gateway",
+                "pages": [
+                  "runtimes/gateways/litellm",
+                  "runtimes/gateways/envoy",
+                  "runtimes/gateways/portkey"
+                ]
+              },
               {
                 "group": "Local Agents",
                 "pages": [
@@ -139,6 +180,7 @@
                       "runtimes/github-copilot-cli",
                       "runtimes/goose",
                       "runtimes/grok-build",
+                      "runtimes/harness2",
                       "runtimes/kimi-code",
                       "runtimes/kiro",
                       "runtimes/muse-code",
@@ -166,6 +208,7 @@
                 "group": "Browser Chat",
                 "pages": [
                   "runtimes/browser-extension",
+                  "runtimes/browser-extension-chrome-policy",
                   "runtimes/browser-extension-chromium",
                   "runtimes/claude-web",
                   "runtimes/chatgpt-web"
@@ -205,6 +248,7 @@
               "security/data-inventory",
               "security/retention-redaction",
               "security/endpoint-operations",
+              "security/restricted-log-access",
               "security/policy"
             ]
           },
@@ -241,7 +285,8 @@
                   "platforms/macos",
                   "platforms/linux",
                   "platforms/linux-deployment-profile",
-                  "platforms/windows"
+                  "platforms/windows",
+                  "platforms/fleet-deployment"
                 ]
               },
               "cli/upgrade",
@@ -301,9 +346,13 @@
                   "cli/endpoint-onboarding",
                   "cli/endpoint-opencode",
                   "cli/endpoint-pi",
+                  "cli/endpoint-cursor",
                   "cli/endpoint-copilot",
+                  "cli/endpoint-devin",
                   "cli/endpoint-dsh",
                   "cli/endpoint-fx",
+                  "cli/endpoint-harness2",
+                  "cli/endpoint-spool",
                   "cli/endpoint-traces",
                   "cli/dashboard",
                   "cli/wazuh",
@@ -337,6 +386,7 @@
                 ]
               },
               "cli/memory",
+              "cli/skills",
               {
                 "group": "beacon rules",
                 "root": "cli/rules",
@@ -357,9 +407,13 @@
                   "cli/scan-ci-gates"
                 ]
               },
+              "cli/intel",
               "cli/handoff",
+              "cli/share",
+              "cli/lenses",
               "cli/git",
               "cli/token-usage",
+              "cli/pricing",
               "cli/version"
             ]
           }
@@ -464,14 +518,17 @@
                   "log-forwarding/cloudwatch",
                   "log-forwarding/customer-managed",
                   "log-forwarding/datadog",
-                  "log-forwarding/elastic"
+                  "log-forwarding/elastic",
+                  "log-forwarding/rsyslog"
                 ]
               },
               {
                 "group": "Object Storage",
                 "expanded": true,
                 "pages": [
-                  "guides/macos-object-storage-system"
+                  "guides/macos-object-storage-system",
+                  "log-forwarding/aws-s3-terraform",
+                  "log-forwarding/gcs-terraform"
                 ]
               },
               {
@@ -497,7 +554,9 @@
                   "guides/jamf-anthropic-openai-cursor-mdm",
                   "guides/jamf-gcs-mdm",
                   "guides/jamf-s3-mdm",
-                  "guides/jamf-falcon-mdm"
+                  "guides/jamf-falcon-mdm",
+                  "guides/jamf-sentinel-mdm",
+                  "guides/workspace-one-sentinel-mdm"
                 ]
               },
               {
@@ -514,6 +573,13 @@
                 "root": "mdm/fleet",
                 "pages": [
                   "guides/fleet-s3-mdm"
+                ]
+              },
+              {
+                "group": "Kandji",
+                "expanded": true,
+                "pages": [
+                  "guides/kandji-otlp-forward-mdm"
                 ]
               }
             ]
@@ -593,6 +659,7 @@
             "icon": "clock",
             "pages": [
               "changelog/cli",
+              "changelog/cloud",
               "changelog/sdk"
             ]
           }
@@ -624,7 +691,7 @@
     "primary": {
       "type": "button",
       "label": "Sign In",
-      "href": "https://beacon.sh/signin"
+      "href": "https://beacon.sh/sign-in"
     }
   },
   "contextual": {
@@ -639,7 +706,17 @@
       "vscode"
     ]
   },
+  "integrations": {
+    "posthog": {
+      "apiKey": "phc_mAC6ywfI3poAo9dBeuNJUJySdxYdJzvoYapN5Wn9cVN",
+      "apiHost": "https://us.i.posthog.com"
+    }
+  },
   "redirects": [
+    {
+      "source": "/manage/configure-s3-data-connector",
+      "destination": "https://docs.asymptotelabs.ai/deployment/self-hosted-s3"
+    },
     {
       "source": "/log-forwarding/s3",
       "destination": "/guides/macos-object-storage-system"
@@ -655,6 +732,14 @@
     {
       "source": "/guides/claude-s3-system",
       "destination": "/guides/macos-object-storage-system"
+    },
+    {
+      "source": "/pricing",
+      "destination": "/deployment/plans"
+    },
+    {
+      "source": "/cloud-changelog",
+      "destination": "/changelog/cloud"
     },
     {
       "source": "/product-changelog",

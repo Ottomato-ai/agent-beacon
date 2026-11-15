@@ -3,6 +3,7 @@ package dashboard
 import (
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"net"
@@ -12,9 +13,12 @@ import (
 	"time"
 
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/auth"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/detect"
 	endpointhooks "github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/hooks"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/inventory"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/lensstore"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/lifecycle"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/pricing"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/tokens"
 	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve"
 )
@@ -28,6 +32,16 @@ type Options struct {
 	Addr     string
 	LogPath  string
 	UserMode bool
+	// LensFiles are lens files served alongside the built-ins, read from disk on every request.
+	// They are for developing a lens; the dashboard never writes them.
+	LensFiles []string
+	// Token is this launch's secret (NewToken). ListenAndServe refuses to start without one and
+	// serves only requests that carry it (RequireToken); print it only inside LaunchURL.
+	Token string
+	// Ready runs after the port is bound and before requests are served. The dashboard command
+	// and lens preview print the launch URL and open the browser from here, so a failed bind
+	// never discloses the token. A non-nil error closes the listener and is returned.
+	Ready func(addr net.Addr) error
 }
 
 type StatusResponse struct {
@@ -88,6 +102,14 @@ func Handler(opts Options) (http.Handler, error) {
 	if err != nil {
 		return nil, err
 	}
+	lenses, err := loadBuiltinLenses(builtinLensFiles)
+	if err != nil {
+		return nil, err
+	}
+	if err := lenses.addLensFiles(opts.LensFiles); err != nil {
+		return nil, err
+	}
+	lenses.storeDir = lensstore.Dir(rulesUserMode)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -230,6 +252,50 @@ func Handler(opts Options) (http.Handler, error) {
 		}
 		writeJSON(w, trace)
 	})
+	mux.HandleFunc("/api/lenses", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w)
+			return
+		}
+		writeJSON(w, lenses.list())
+	})
+	mux.HandleFunc(lensFramePrefix, lenses.serveLensFrame)
+	// Lens data is what one lens frame receives from window.beacon.getTrace(). The session page
+	// fetches it and hands it to the frame over a MessageChannel; the frame itself never calls
+	// this route, because its sandbox and CSP give it no network.
+	mux.HandleFunc("/api/lens-data", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w)
+			return
+		}
+		// The session page asks by session (the events it lists); other callers ask by trace.
+		trace := strings.TrimSpace(r.URL.Query().Get("trace"))
+		session := strings.TrimSpace(r.URL.Query().Get("session"))
+		if (trace == "") == (session == "") {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("exactly one of trace or session is required"))
+			return
+		}
+		lensOpts := LensDataOptions{UserMode: rulesUserMode}
+		var (
+			data LensDataV1
+			ok   bool
+			err  error
+		)
+		if trace != "" {
+			data, ok, err = BuildLensData(opts.LogPath, trace, lensOpts)
+		} else {
+			data, ok, err = BuildSessionLensData(opts.LogPath, session, lensOpts)
+		}
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if !ok {
+			writeError(w, http.StatusNotFound, fmt.Errorf("trace not found"))
+			return
+		}
+		writeJSON(w, data)
+	})
 	mux.HandleFunc("/api/memory", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			methodNotAllowed(w)
@@ -256,7 +322,13 @@ func Handler(opts Options) (http.Handler, error) {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		writeJSON(w, tokens.AggregateScopedWithContexts(events, contexts, "", tokenOptions(r)))
+		tokenOpts := tokenOptions(r)
+		// The same overrides file `beacon token-usage` reads by default, re-read on every request
+		// so an edit shows on the next reload. The dashboard only reads it. An invalid file does
+		// not fail the view: the estimate falls back to list prices and the response's
+		// pricing.overrides.error says why.
+		tokenOpts.Pricer, _ = pricing.LoadPricer(pricing.Default(), pricing.DefaultOverridesPath(rulesUserMode), false)
+		writeJSON(w, tokens.AggregateScopedWithContexts(events, contexts, "", tokenOpts))
 	})
 	// Coverage answers a different question from the rollup above -- "is this all of it" rather
 	// than "what did it cost" -- so it gets its own route rather than a flag on /api/tokens. A
@@ -302,6 +374,15 @@ func Handler(opts Options) (http.Handler, error) {
 		}
 		q := r.URL.Query()
 		resp, err := RunScan(rulesUserMode, opts.LogPath, "", q.Get("session"), q.Get("min_severity"))
+		var noRules *detect.NoRulesError
+		if errors.As(err, &noRules) && len(noRules.Skipped) > 0 {
+			// Every rule needs a newer Beacon: keep the error status, and carry the
+			// skip list so the UI can say which rules and versions.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": err.Error(), "skipped": detect.SkippedStrings(noRules.Skipped)})
+			return
+		}
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
@@ -336,16 +417,39 @@ func ListenAndServe(opts Options) error {
 	if err := ValidateLoopbackAddr(opts.Addr); err != nil {
 		return err
 	}
-	handler, err := Handler(opts)
+	handler, err := servedHandler(opts)
 	if err != nil {
 		return err
 	}
+	ln, err := net.Listen("tcp", opts.Addr)
+	if err != nil {
+		return err
+	}
+	if opts.Ready != nil {
+		if err := opts.Ready(ln.Addr()); err != nil {
+			ln.Close()
+			return err
+		}
+	}
 	server := &http.Server{
 		Addr:              opts.Addr,
-		Handler:           RequireLoopbackHost(handler),
+		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-	return server.ListenAndServe()
+	return server.Serve(ln)
+}
+
+// servedHandler is the handler ListenAndServe serves: Handler behind the loopback Host check and
+// the launch secret.
+func servedHandler(opts Options) (http.Handler, error) {
+	if opts.Token == "" {
+		return nil, errNoToken
+	}
+	handler, err := Handler(opts)
+	if err != nil {
+		return nil, err
+	}
+	return RequireLoopbackHost(RequireToken(opts.Token, CookieName(opts.Addr), handler)), nil
 }
 
 func ValidateLoopbackAddr(addr string) error {
@@ -368,13 +472,7 @@ func ValidateLoopbackAddr(addr string) error {
 // one place the request can be told apart from a local client.
 func RequireLoopbackHost(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		host := r.Host
-		if h, _, err := net.SplitHostPort(host); err == nil {
-			host = h
-		}
-		host = strings.Trim(host, "[]")
-		ip := net.ParseIP(host)
-		if !strings.EqualFold(host, "localhost") && (ip == nil || !ip.IsLoopback()) {
+		if !asymptoteobserve.IsLoopbackHost(r.Host) {
 			writeError(w, http.StatusForbidden, fmt.Errorf("request host must be a loopback address"))
 			return
 		}
@@ -468,6 +566,10 @@ func hookStatuses(logPath string, userMode bool) []HookStatus {
 	level := endpointhooks.LevelUser
 	antigravity := endpointhooks.AntigravityHookStatus(endpointhooks.AntigravityOptions{Level: level, LogPath: logPath, UserMode: userMode})
 	add("antigravity", antigravity.Installed, antigravity.ConfigPath, antigravity.BinaryPath, antigravity.Message)
+	if antigravity.NeedsReinstall {
+		// Installed, so repair rewrites the block, but Antigravity does not run its legacy schema.
+		out[len(out)-1].Status = "needs_reinstall"
+	}
 	cline := endpointhooks.ClineHookStatus(endpointhooks.ClineOptions{Level: level, LogPath: logPath, UserMode: userMode})
 	add("cline", cline.Installed, cline.PluginPath, cline.BinaryPath, cline.Message)
 	cursor := endpointhooks.CursorHookStatus(endpointhooks.CursorOptions{Level: level, LogPath: logPath, UserMode: userMode})

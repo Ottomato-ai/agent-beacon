@@ -46,7 +46,7 @@ By default, the SDK creates OpenAI and Anthropic OpenLLMetry instrumentations wh
 Pass modules to `instrumentModules` when they may be loaded before auto-instrumentation runs.
 
 ```typescript title="Patch already-loaded modules during initialization" lines
-import Anthropic from "@anthropic-ai/sdk";
+import * as Anthropic from "@anthropic-ai/sdk";
 import OpenAI from "openai";
 import { Observe } from "@asymptote/sdk";
 
@@ -85,6 +85,8 @@ Observe.patch({
 ```
 
 `Observe.patch()` requires at least one module. It applies supported OpenLLMetry instrumentation and wraps Claude Agent SDK query functions when the module object is writable.
+
+Provider selections remain in effect for `instrumentModules` and later `Observe.patch()` calls. Setting both `instrumentationOptions.openAI` and `instrumentationOptions.anthropic` to `false` keeps both providers disabled when modules are supplied manually.
 
 ## Existing OpenTelemetry providers
 

@@ -6,6 +6,7 @@ VECTOR_BIN="${BEACON_VECTOR_BIN:-/opt/beacon/bin/vector}"
 WRAPPER="${BEACON_S3_FORWARDER_WRAPPER:-/opt/beacon/jamf/claude/s3/run-forwarder.sh}"
 BASE_DIR="${BEACON_FORWARDER_BASE_DIR:-/Library/Application Support/Beacon/Forwarders}"
 LAUNCHDAEMONS_DIR="${BEACON_LAUNCHDAEMONS_DIR:-/Library/LaunchDaemons}"
+LOG_DIR="${BEACON_FORWARDER_LOG_DIR:-/Library/Logs/Beacon}"
 CONFIG_PATH="${BEACON_S3_VECTOR_CONFIG:-$BASE_DIR/s3-vector.toml}"
 ENV_PATH="${BEACON_S3_VECTOR_ENV:-$BASE_DIR/s3-vector.env}"
 DATA_DIR="${BEACON_S3_VECTOR_DATA_DIR:-$BASE_DIR/vector-data/s3}"
@@ -96,10 +97,16 @@ include_array() {
       *)
         mkdir -p "$(dirname "$path")"
         # Hooks run as the console user and append to the runtime log, so a missing log is
-        # created 0666, the mode Beacon's own writer uses. An existing log keeps its mode.
+        # created 0666, the mode Beacon's own writer uses. A log in the restricted access mode,
+        # which only the collector writes, is created 0640 instead (its directory's setgid bit
+        # gives it the beacon-log group). An existing log keeps its mode.
         if [ ! -e "$path" ]; then
           touch "$path"
-          chmod 0666 "$path" || true
+          if grep -qx restricted "$(dirname "$path")/.beacon-log-access" 2>/dev/null; then
+            chmod 0640 "$path" || true
+          else
+            chmod 0666 "$path" || true
+          fi
         fi
         ;;
     esac
@@ -126,6 +133,26 @@ inventory_paths() {
 }
 
 mkdir -p "$BASE_DIR" "$DATA_DIR" "$LAUNCHDAEMONS_DIR"
+
+# launchd opens StandardOutPath/StandardErrorPath as root for this daemon. They used to be fixed
+# names in world-writable /tmp, where any local user could pre-create them or plant a symlink for
+# root to append through. Keep them in a root-owned 0755 directory instead, and drop any job log
+# file that is not a plain file owned by root; launchd recreates it on the next start.
+if [ -L "$LOG_DIR" ]; then
+  rm -f "$LOG_DIR"
+fi
+mkdir -p "$LOG_DIR"
+if [ "$(id -u)" = "0" ]; then
+  chown 0:0 "$LOG_DIR"
+fi
+chmod 0755 "$LOG_DIR"
+for log_file in "$LOG_DIR/$LABEL.out" "$LOG_DIR/$LABEL.err"; do
+  if [ -L "$log_file" ] || { [ -e "$log_file" ] && [ ! -f "$log_file" ]; }; then
+    rm -rf "$log_file"
+  elif [ -e "$log_file" ] && [ "$(id -u)" = "0" ] && [ -n "$(find "$log_file" -prune ! -user 0 2>/dev/null)" ]; then
+    rm -f "$log_file"
+  fi
+done
 chmod 0755 "$BASE_DIR" "$DATA_DIR" "$LAUNCHDAEMONS_DIR" 2>/dev/null || true
 
 RUNTIME_INCLUDES="$(include_array "$RUNTIME_LOG_PATHS")"
@@ -255,9 +282,9 @@ cat >"$PLIST_PATH" <<EOF
   <key>KeepAlive</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>/tmp/$LABEL.out</string>
+  <string>$(xml_escape "$LOG_DIR/$LABEL.out")</string>
   <key>StandardErrorPath</key>
-  <string>/tmp/$LABEL.err</string>
+  <string>$(xml_escape "$LOG_DIR/$LABEL.err")</string>
 </dict>
 </plist>
 EOF
@@ -313,7 +340,7 @@ else
   echo "launchctl unavailable; wrote config but did not start $LABEL" >&2
 fi
 
-if [ -f "/tmp/$LABEL.err" ]; then
+if [ -f "$LOG_DIR/$LABEL.err" ]; then
   echo "Last S3 Vector stderr lines:"
-  tail -n 20 "/tmp/$LABEL.err" || true
+  tail -n 20 "$LOG_DIR/$LABEL.err" || true
 fi

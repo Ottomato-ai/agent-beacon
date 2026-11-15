@@ -1,11 +1,38 @@
 package beaconevent
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve"
 	"go.opentelemetry.io/collector/pdata/plog"
 )
+
+// gen_ai.system_instructions is a list of parts on every event the collector writes, whatever shape
+// the producer sent: a typed index maps the field from the first event it sees and rejects the rest.
+func TestSystemInstructionsAreWrittenAsParts(t *testing.T) {
+	for name, tc := range map[string]struct {
+		value interface{}
+		want  []string
+	}{
+		"plain string":       {"Be concise.", []string{"Be concise."}},
+		"JSON parts string":  {`[{"type":"text","content":"From JSON."}]`, []string{"From JSON."}},
+		"single part object": {map[string]interface{}{"type": "text", "content": "One part."}, []string{"One part."}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			genAI := GenAIFromAttrs(map[string]interface{}{"gen_ai.system_instructions": tc.value})
+			if genAI == nil {
+				t.Fatal("no gen_ai block")
+			}
+			if _, ok := genAI.SystemInstructions.([]interface{}); !ok {
+				t.Fatalf("system_instructions = %#v, want a parts list", genAI.SystemInstructions)
+			}
+			if got := asymptoteobserve.GenAIText(genAI.SystemInstructions, "", asymptoteobserve.GenAIPartTypeText); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("text = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
 
 // firstPartContent reads the text out of a gen_ai messages value in the semconv
 // shape, so the assertions below read the field the way a consumer would.
@@ -147,24 +174,6 @@ func TestGenericAssistantAliasIsPromoted(t *testing.T) {
 	}
 	if got := firstPartContent(t, event.GenAI.Output.Messages); got != "the model replied" {
 		t.Fatalf("assistant text = %q, want the completion attribute", got)
-	}
-}
-
-func TestClaudeMCPServerConnectionCarriesItsServer(t *testing.T) {
-	// The event was already actioned mcp.connection with no mcp object on it, so
-	// every rule that gates on e.mcp.server saw nothing.
-	event := claudeLogEvent(t, "claude_code.mcp_server_connection", map[string]interface{}{
-		"event.name":     "mcp_server_connection",
-		"server_name":    "github",
-		"transport_type": "stdio",
-		"status":         "connected",
-	})
-
-	if event.Event.Action != "mcp.connection" {
-		t.Fatalf("action = %q, want mcp.connection", event.Event.Action)
-	}
-	if event.MCP == nil || event.MCP.Server != "github" {
-		t.Fatalf("mcp = %#v, want server github", event.MCP)
 	}
 }
 

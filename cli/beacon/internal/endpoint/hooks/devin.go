@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve/hookcmd"
 )
 
 type DevinOptions struct {
@@ -139,6 +141,8 @@ func installDevinDesktopHooks(path, binaryPath, logPath, configPath string) erro
 		"post_run_command":  {Command: prefix + " post-tool", ShowOutput: &hideOutput},
 		"post_mcp_tool_use": {Command: prefix + " post-tool", ShowOutput: &hideOutput},
 		"post_read_code":    {Command: prefix + " post-tool", ShowOutput: &hideOutput},
+		// The only Cascade hook that carries the agent's reply.
+		"post_cascade_response": {Command: prefix + " cascade-response", ShowOutput: &hideOutput},
 	}
 	for eventName, hook := range endpointHooks {
 		config.hooks[eventName] = mergeWindsurfEndpointHook(config.hooks[eventName], hook, "devin-desktop")
@@ -447,7 +451,7 @@ func isDevinEndpointHookCommand(command string, platforms ...string) bool {
 		platforms = []string{"devin"}
 	}
 	for _, platform := range platforms {
-		if isEndpointHookCommand(command, platform) {
+		if hookcmd.IsEndpointHook(command, platform) {
 			return true
 		}
 	}
@@ -455,7 +459,7 @@ func isDevinEndpointHookCommand(command string, platforms ...string) bool {
 }
 
 func isWindsurfEndpointHookCommand(command, platform string) bool {
-	return isEndpointHookCommand(command, platform)
+	return hookcmd.IsEndpointHook(command, platform)
 }
 
 func devinConfigPath(level Level) (string, error) {

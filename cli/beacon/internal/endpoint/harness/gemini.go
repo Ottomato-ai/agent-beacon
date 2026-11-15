@@ -8,11 +8,21 @@ import (
 	"strings"
 )
 
+// GeminiSettingsPath is the user-scope Gemini CLI settings file. Gemini CLI looks for its
+// `.gemini` directory under GEMINI_CLI_HOME when that is non-empty, used as is, and under the OS
+// home otherwise (homedir in packages/core/src/utils/paths.ts).
+func GeminiSettingsPath(home string) string {
+	if override := os.Getenv("GEMINI_CLI_HOME"); override != "" {
+		home = override
+	}
+	return filepath.Join(home, ".gemini", "settings.json")
+}
+
 func DiscoverGemini() Harness {
 	h := Harness{Name: "gemini_cli", DisplayName: "Gemini CLI", Capability: "otel_config"}
 	detectExecutable(&h, "gemini")
 	home, _ := os.UserHomeDir()
-	h.ConfigPath = filepath.Join(home, ".gemini", "settings.json")
+	h.ConfigPath = GeminiSettingsPath(home)
 	if fileExists(h.ConfigPath) {
 		status, msg := geminiStatus(h.ConfigPath)
 		h.TelemetryStatus = status
@@ -29,15 +39,10 @@ func ConfigureGemini(opts ConfigureOptions) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	path := filepath.Join(home, ".gemini", "settings.json")
-	settings := map[string]interface{}{}
-	if data, err := os.ReadFile(path); err == nil {
-		if err := json.Unmarshal(data, &settings); err != nil {
-			return "", fmt.Errorf("Gemini settings JSON is invalid: %w", err)
-		}
-		if err := backup(path, data); err != nil {
-			return "", err
-		}
+	path := GeminiSettingsPath(home)
+	settings, err := readSettingsForUpdate("Gemini", path)
+	if err != nil {
+		return "", err
 	}
 
 	telemetry, _ := settings["telemetry"].(map[string]interface{})
@@ -69,9 +74,9 @@ func geminiStatus(path string) (TelemetryStatus, string) {
 	if err != nil {
 		return TelemetryMissing, err.Error()
 	}
-	var settings map[string]interface{}
-	if err := json.Unmarshal(data, &settings); err != nil {
-		return TelemetryMisconfigured, "Gemini settings JSON is invalid"
+	settings, err := decodeSettings("Gemini", path, data)
+	if err != nil {
+		return TelemetryMisconfigured, err.Error()
 	}
 	telemetry, _ := settings["telemetry"].(map[string]interface{})
 	if telemetry == nil {

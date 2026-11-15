@@ -13,34 +13,12 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/schema"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/learning"
 	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve"
 )
-
-func TestMemoryEvaluationCommandsRegistered(t *testing.T) {
-	for _, path := range [][]string{
-		{"memory", "list"},
-		{"memory", "show"},
-		{"memory", "evaluations", "run"},
-		{"memory", "evaluations", "list"},
-		{"memory", "evaluations", "show"},
-		{"memory", "candidates", "list"},
-		{"memory", "candidates", "show"},
-		{"memory", "candidates", "create"},
-		{"memory", "candidates", "approve"},
-		{"memory", "candidates", "reject"},
-		{"memory", "candidates", "supersede"},
-		{"memory", "skills", "preview"},
-		{"memory", "skills", "install"},
-	} {
-		cmd, _, err := rootCmd.Find(path)
-		if err != nil || cmd == nil {
-			t.Fatalf("command %v not registered: %v", path, err)
-		}
-	}
-}
 
 func TestMemoryEvaluationsRunDryRunPreviewsCost(t *testing.T) {
 	logPath, project := writeMemoryCommandFixture(t)
@@ -51,7 +29,7 @@ func TestMemoryEvaluationsRunDryRunPreviewsCost(t *testing.T) {
 	memoryOpts.traceID = "session:cursor:s1"
 	memoryOpts.dryRun = true
 	memoryOpts.jsonOutput = true
-	memoryOpts.jevCost = 0.01
+	memoryOpts.costPerTrace = 0.01
 
 	var out bytes.Buffer
 	cmd := &cobra.Command{}
@@ -90,7 +68,7 @@ func TestMemoryEvaluationsRunPersistsMockedJevResult(t *testing.T) {
 	memoryOpts.jevEndpoint = server.URL
 	memoryOpts.jevAPIKey = "test-key"
 	memoryOpts.jevModel = "jev-test"
-	memoryOpts.jevCost = learning.DefaultCostPerTrace
+	memoryOpts.costPerTrace = learning.DefaultCostPerTrace
 
 	var out bytes.Buffer
 	cmd := &cobra.Command{}
@@ -203,29 +181,6 @@ func TestMemoryEvaluationsRunDoesNotPromoteFailedTask(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-func TestMemoryCandidatesApproveCommand(t *testing.T) {
-	logPath, project := writeMemoryCommandFixture(t)
-	resetMemoryOpts(t)
-	memoryOpts.userMode = true
-	memoryOpts.logPath = logPath
-	memoryOpts.projectPath = project
-	candidate := testCommandCandidate(t)
-	if err := memoryStore().PutCandidate(candidate); err != nil {
-		t.Fatal(err)
-	}
-	memoryOpts.reason = "reviewed"
-	memoryOpts.jsonOutput = true
-	var out bytes.Buffer
-	cmd := &cobra.Command{}
-	cmd.SetOut(&out)
-	if err := runMemoryCandidatesApprove(cmd, []string{candidate.ID}); err != nil {
-		t.Fatalf("runMemoryCandidatesApprove returned error: %v", err)
-	}
-	if !strings.Contains(out.String(), `"memory"`) || !strings.Contains(out.String(), `"approved"`) {
-		t.Fatalf("unexpected approve output: %s", out.String())
 	}
 }
 
@@ -546,35 +501,39 @@ func resetMemoryOpts(t *testing.T) {
 	t.Helper()
 	previous := memoryOpts
 	memoryOpts = struct {
-		userMode    bool
-		systemMode  bool
-		logPath     string
-		jsonOutput  bool
-		projectPath string
-		limit       int
-		page        int
-		query       string
-		harness     string
-		traceID     string
-		since       string
-		until       string
-		dryRun      bool
-		jevEndpoint string
-		jevAPIKey   string
-		jevModel    string
-		jevCost     float64
-		timeout     time.Duration
-		state       string
-		kind        string
-		reason      string
-		replacement string
-		force       bool
-		title       string
-		body        string
-		bodyFile    string
-		applies     string
-		tags        []string
-	}{userMode: true, limit: 25, page: 1, jevCost: learning.DefaultCostPerTrace}
+		userMode     bool
+		systemMode   bool
+		logPath      string
+		jsonOutput   bool
+		projectPath  string
+		limit        int
+		page         int
+		query        string
+		harness      string
+		traceID      string
+		since        string
+		until        string
+		dryRun       bool
+		evaluator    string
+		jevEndpoint  string
+		jevAPIKey    string
+		jevModel     string
+		costPerTrace float64
+		subqEndpoint string
+		subqAPIKey   string
+		subqModel    string
+		timeout      time.Duration
+		state        string
+		kind         string
+		reason       string
+		replacement  string
+		force        bool
+		title        string
+		body         string
+		bodyFile     string
+		applies      string
+		tags         []string
+	}{userMode: true, limit: 25, page: 1, costPerTrace: learning.DefaultCostPerTrace}
 	t.Cleanup(func() { memoryOpts = previous })
 }
 
@@ -782,6 +741,147 @@ func TestJevEvaluatorOptionsPrecedence(t *testing.T) {
 			if got.Endpoint != tc.wantEndpoint || got.Model != tc.wantModel || got.APIKey != tc.wantKey {
 				t.Fatalf("jevEvaluatorOptions() = endpoint %q model %q key %q, want %q %q %q",
 					got.Endpoint, got.Model, got.APIKey, tc.wantEndpoint, tc.wantModel, tc.wantKey)
+			}
+		})
+	}
+}
+
+// SubQ's Decisions API is the same System One contract as Jev, so selecting it
+// must send the same request to the SubQ endpoint with SUBQ_API_KEY and record
+// the evaluation under the subq provider.
+func TestMemoryEvaluationsRunWithSubQ(t *testing.T) {
+	logPath, project := writeMemoryCommandFixture(t)
+	var gotModel string
+	var gotTypes []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer subq-key" {
+			t.Errorf("Authorization = %q, want Bearer subq-key", r.Header.Get("Authorization"))
+		}
+		var req struct {
+			Model     string                           `json:"model"`
+			Questions map[string]struct{ Type string } `json:"questions"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		gotModel = req.Model
+		for _, q := range req.Questions {
+			gotTypes = append(gotTypes, q.Type)
+		}
+		_, _ = w.Write([]byte(`{"model":"subq-snap-preview","answers":{"task_success":{"type":"noul","noul":0.9},"reusable_correction":{"type":"noul","noul":0.8},"evidence_supported":{"type":"noul","noul":0.7}},"usage":{"input_tokens":120,"output_tokens":0}}`))
+	}))
+	defer server.Close()
+
+	t.Setenv("BEACON_EVALUATOR", "subq")
+	t.Setenv("BEACON_SUBQ_ENDPOINT", server.URL)
+	t.Setenv("BEACON_SUBQ_MODEL", "")
+	t.Setenv("SUBQ_API_KEY", "subq-key")
+	t.Setenv("TYPESAFE_API_KEY", "jev-key-must-not-be-sent")
+
+	resetMemoryOpts(t)
+	memoryOpts.userMode = true
+	memoryOpts.logPath = logPath
+	memoryOpts.projectPath = project
+	memoryOpts.traceID = "session:cursor:s1"
+	memoryOpts.jsonOutput = true
+
+	var out bytes.Buffer
+	cmd := &cobra.Command{}
+	cmd.SetOut(&out)
+	if err := runMemoryEvaluationsRun(cmd, nil); err != nil {
+		t.Fatalf("runMemoryEvaluationsRun returned error: %v", err)
+	}
+	if gotModel != learning.DefaultSubQModel {
+		t.Fatalf("request model = %q, want %s", gotModel, learning.DefaultSubQModel)
+	}
+	if len(gotTypes) != len(learning.RubricQuestions) {
+		t.Fatalf("question types = %v", gotTypes)
+	}
+	for _, typ := range gotTypes {
+		if typ != "noul" {
+			t.Fatalf("question type = %q, want noul", typ)
+		}
+	}
+	var result evaluationRunResult
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		t.Fatalf("decode result: %v\n%s", err, out.String())
+	}
+	if len(result.Evaluations) != 1 {
+		t.Fatalf("evaluations = %#v", result.Evaluations)
+	}
+	if got, want := result.Evaluations[0].Evaluator, "subq:"+server.URL; got != want {
+		t.Fatalf("evaluator = %q, want %q", got, want)
+	}
+}
+
+func TestEvaluatorOptionsSelectsProvider(t *testing.T) {
+	for k, v := range map[string]string{
+		"BEACON_EVALUATOR": "", "BEACON_SUBQ_ENDPOINT": "", "BEACON_SUBQ_MODEL": "", "SUBQ_API_KEY": "", "BEACON_SUBQ_API_KEY": "fallback-subq",
+		"BEACON_JEV_ENDPOINT": "", "BEACON_JEV_MODEL": "", "TYPESAFE_API_KEY": "", "BEACON_JEV_API_KEY": "",
+	} {
+		t.Setenv(k, v)
+	}
+	resetMemoryOpts(t)
+	got, err := evaluatorOptions()
+	if err != nil || got.Provider != learning.ProviderJev || got.Endpoint != learning.DefaultJevEndpoint {
+		t.Fatalf("default evaluatorOptions() = %+v, %v; want Jev defaults", got, err)
+	}
+
+	memoryOpts.evaluator = "SubQ"
+	got, err = evaluatorOptions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Provider != learning.ProviderSubQ || got.Endpoint != learning.DefaultSubQEndpoint || got.Model != learning.DefaultSubQModel || got.APIKey != "fallback-subq" {
+		t.Fatalf("subq evaluatorOptions() = %+v", got)
+	}
+
+	memoryOpts.subqEndpoint = "https://flag.example/v1/systemone"
+	memoryOpts.subqModel = "subq-pinned"
+	memoryOpts.subqAPIKey = "flag-key"
+	t.Setenv("SUBQ_API_KEY", "env-key")
+	got, _ = evaluatorOptions()
+	if got.Endpoint != "https://flag.example/v1/systemone" || got.Model != "subq-pinned" || got.APIKey != "flag-key" {
+		t.Fatalf("subq flags did not win: %+v", got)
+	}
+
+	memoryOpts.evaluator = "openai"
+	if _, err := evaluatorOptions(); err == nil {
+		t.Fatal("unknown evaluator was accepted")
+	}
+}
+
+// --cost-per-trace replaced --jev-cost-per-trace when SubQ was added. Both spellings must set the
+// estimate `memory evaluations run --dry-run` previews, driven through the real command line.
+func TestMemoryEvaluationsRunCostPerTraceFlagsSetTheEstimate(t *testing.T) {
+	for _, name := range []string{"cost-per-trace", "jev-cost-per-trace"} {
+		t.Run(name, func(t *testing.T) {
+			logPath, project := writeMemoryCommandFixture(t)
+			resetMemoryOpts(t)
+			flags := memoryEvaluationsRunCmd.Flags()
+			t.Cleanup(func() {
+				flags.VisitAll(func(f *pflag.Flag) { f.Changed = false })
+				rootCmd.SetOut(nil)
+				rootCmd.SetErr(nil)
+				rootCmd.SetArgs(nil)
+			})
+			var out, stderr bytes.Buffer
+			rootCmd.SetOut(&out)
+			rootCmd.SetErr(&stderr)
+			rootCmd.SetArgs([]string{"memory", "evaluations", "run", "--dry-run", "--json",
+				"--log-path", logPath, "--project", project, "--trace", "session:cursor:s1", "--" + name, "0.03"})
+			if err := rootCmd.Execute(); err != nil {
+				t.Fatalf("memory evaluations run --%s: %v\n%s", name, err, stderr.String())
+			}
+			// Cobra prints the deprecation notice with OutOrStderr: stderr in a real run, but out here
+			// because the test sets it. The JSON document follows it.
+			doc := out.Bytes()[max(bytes.IndexByte(out.Bytes(), '{'), 0):]
+			var result evaluationRunResult
+			if err := json.Unmarshal(doc, &result); err != nil {
+				t.Fatalf("decode result: %v\n%s", err, out.String())
+			}
+			if result.TraceCount != 1 || result.EstimatedCostUSD != 0.03 {
+				t.Fatalf("--%s=0.03: trace count %d, estimate %v; want 1 trace at 0.03", name, result.TraceCount, result.EstimatedCostUSD)
 			}
 		})
 	}

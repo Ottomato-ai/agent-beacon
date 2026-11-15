@@ -29,6 +29,7 @@ func TestLogPermissionRemediationMatchesThePlatformThatFailed(t *testing.T) {
 	// Every ACL evidence is Windows-only by construction, so none of them may produce POSIX advice.
 	for _, evidence := range []string{
 		"acl_missing_interactive_write",
+		"acl_too_broad",
 		"acl_not_writable_by_user",
 		"acl_unreadable",
 	} {
@@ -42,23 +43,39 @@ func TestLogPermissionRemediationMatchesThePlatformThatFailed(t *testing.T) {
 		}
 	}
 
-	// The system-mode grant is the one that decides whether an endpoint captures anything, so its
-	// advice has to be the actual command, not a gesture at the problem.
-	grant := action("acl_missing_interactive_write")
-	if runtime.GOOS == "windows" {
-		if !strings.Contains(grant, "icacls") || !strings.Contains(grant, "S-1-5-4") {
-			t.Fatalf("the missing-grant remediation is %q; it should be the icacls command that "+
-				"restores the grant, naming the well-known SID rather than a localized account name", grant)
+	// The system-mode ACL is the one that decides whether an endpoint captures anything -- and,
+	// when it is too broad, whether a user can redirect a SYSTEM write -- so its advice has to be
+	// the actual repair, not a gesture at the problem. Both evidences get the same one.
+	for _, evidence := range []string{"acl_missing_interactive_write", "acl_too_broad"} {
+		grant := action(evidence)
+		if runtime.GOOS == "windows" {
+			if !strings.Contains(grant, "doctor") || !strings.Contains(grant, "--fix") || !strings.Contains(grant, "--system") {
+				t.Fatalf("the %s remediation is %q; it should be the elevated doctor --system --fix "+
+					"repair, which applies the same ACL install does", evidence, grant)
+			}
+		} else if grant != "beacon endpoint doctor --fix" {
+			// No such ACL exists here, so the hint is empty and the advice falls back to the
+			// command that does apply. Printing a Windows command on a Mac would be worse than
+			// saying nothing.
+			t.Fatalf("off Windows the %s remediation is %q, want the doctor --fix fallback", evidence, grant)
 		}
-	} else if grant != "beacon endpoint doctor --fix" {
-		// No such grant exists here, so the hint is empty and the advice falls back to the command
-		// that does apply. Printing an icacls line on a Mac would be worse than saying nothing.
-		t.Fatalf("off Windows the missing-grant remediation is %q, want the doctor --fix fallback", grant)
 	}
 
 	if runtime.GOOS != "windows" {
 		if got := action("not_writable"); got != `chmod 666 C:\ProgramData\Beacon\Endpoint\logs` {
 			t.Fatalf("the POSIX mode remediation changed: %q", got)
+		}
+	}
+
+	// A user-mode log is private; the mode remediation must never advise making it world-writable.
+	if runtime.GOOS != "windows" {
+		userAction := actionForCheck(diagnostics.Check{
+			Name:     "runtime_log_permissions",
+			Target:   "/home/someone/.beacon/endpoint/logs/runtime.jsonl",
+			Evidence: "not_writable",
+		}, lifecycle.RuntimeLogSource{EffectiveUserMode: true})
+		if userAction != "chmod 600 /home/someone/.beacon/endpoint/logs/runtime.jsonl" {
+			t.Fatalf("the user-mode remediation is %q; want owner-only chmod 600", userAction)
 		}
 	}
 

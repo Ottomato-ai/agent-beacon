@@ -1,4 +1,5 @@
 import * as esbuild from 'esbuild';
+import { watch as watchFiles } from 'node:fs';
 import { cp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -51,10 +52,13 @@ async function writeManifest() {
 /** Copy static assets (manifest, html, icons) into the output directory. */
 async function copyStatic() {
   await writeManifest();
+  // Named by the manifest's storage.managed_schema: the settings an admin can lock through policy.
+  await cp(path.join(src, 'managed_schema.json'), path.join(dist, 'managed_schema.json'));
   for (const surface of ['popup', 'options']) {
     await cp(path.join(src, surface, `${surface}.html`), path.join(dist, `${surface}.html`));
   }
-  // icons/ is optional; copy if present.
+  // icons/ is optional; remove stale output when a watched asset disappears.
+  await rm(path.join(dist, 'icons'), { recursive: true, force: true });
   await cp(path.join(src, 'icons'), path.join(dist, 'icons'), { recursive: true }).catch(() => {});
 }
 
@@ -78,6 +82,18 @@ async function run() {
     const ctx = await esbuild.context(buildOptions);
     await copyStatic();
     await ctx.watch();
+    // esbuild watches its module graph, not the files copied into the bundle.
+    // Keep static refreshes serialized so a burst of edits cannot race writes.
+    let staticRefresh = Promise.resolve();
+    watchFiles(src, { recursive: true }, (_event, filename) => {
+      const name = filename?.replaceAll('\\', '/');
+      if (name && name !== 'manifest.json' && name !== 'managed_schema.json' && name !== 'popup/popup.html' &&
+          name !== 'options/options.html' && name !== 'icons' && !name.startsWith('icons/')) return;
+      staticRefresh = staticRefresh.then(async () => {
+        await copyStatic();
+        console.log('[esbuild] static assets refreshed');
+      }).catch((err) => console.error(err));
+    });
     console.log('[esbuild] watching…');
   } else {
     await esbuild.build(buildOptions);

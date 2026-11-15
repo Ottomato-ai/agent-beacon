@@ -3,6 +3,8 @@ package asymptoteobserve
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"strings"
 )
 
 // Roles and part types Beacon writes into gen_ai.input.messages and
@@ -12,6 +14,7 @@ import (
 const (
 	RoleUser      = "user"
 	RoleAssistant = "assistant"
+	RoleSystem    = "system"
 
 	GenAIPartTypeText      = "text"
 	GenAIPartTypeReasoning = "reasoning"
@@ -36,6 +39,105 @@ func GenAIMessages(role, partType, text string) []interface{} {
 	}
 }
 
+// SystemInstructionParts is text in the gen_ai.system_instructions shape. The
+// semconv defines that attribute as a bare list of message parts -- no role and
+// no message wrapper, unlike gen_ai.input.messages -- so a Beacon-written value
+// and one an OTLP producer sends are read the same way.
+func SystemInstructionParts(text string) []interface{} {
+	return []interface{}{
+		map[string]interface{}{"type": GenAIPartTypeText, "content": text},
+	}
+}
+
+// GenAIText returns the content of every part of partType in a GenAI messages or
+// parts value, in order, each trimmed, blanks dropped. It is the one reader for
+// gen_ai.input.messages, gen_ai.output.messages and gen_ai.system_instructions,
+// and it accepts every shape the capture paths write or receive:
+//
+//   - the semconv message list, [{"role", "parts": [{"type", "content"}]}];
+//   - a bare parts list, the gen_ai.system_instructions shape;
+//   - a message whose body is "content" rather than "parts", as a string or a
+//     block list, and a part whose text is under "text" rather than "content",
+//     the shapes several session mappers and providers write;
+//   - a legacy browser message {"role", "text"}, only when both "parts" and
+//     "content" are absent; this body is text, never reasoning;
+//   - a {"messages": [...]} wrapper;
+//   - a bare string, as the whole value, a message body or a list element,
+//     which is text and never reasoning;
+//   - a typed value from an in-process caller, normalized through JSON.
+//
+// A map with a role, a parts list or type "message" is a message, any other map
+// with a type is a part, and a map with neither is a message. role, when not
+// empty, keeps only messages from that role or naming none; a part outside any
+// message is kept.
+//
+// It does no redaction or truncation; callers apply the limit that governs
+// where the text goes.
+func GenAIText(value interface{}, role, partType string) []string {
+	var out []string
+	collectGenAIText(value, role, partType, &out)
+	return out
+}
+
+func collectGenAIText(v interface{}, role, partType string, out *[]string) {
+	switch typed := v.(type) {
+	case string:
+		if text := strings.TrimSpace(typed); text != "" && partType == GenAIPartTypeText {
+			*out = append(*out, text)
+		}
+	case []interface{}:
+		for _, item := range typed {
+			collectGenAIText(item, role, partType, out)
+		}
+	case map[string]interface{}:
+		if messages, ok := typed["messages"]; ok {
+			collectGenAIText(messages, role, partType, out)
+			return
+		}
+		kind, _ := typed["type"].(string)
+		_, hasRole := typed["role"]
+		body, hasParts := typed["parts"]
+		if kind != "" && kind != "message" && !hasRole && !hasParts {
+			if kind != partType {
+				return
+			}
+			text, _ := typed["content"].(string)
+			if strings.TrimSpace(text) == "" {
+				text, _ = typed["text"].(string)
+			}
+			if text = strings.TrimSpace(text); text != "" {
+				*out = append(*out, text)
+			}
+			return
+		}
+		if messageRole, _ := typed["role"].(string); role != "" && messageRole != "" && messageRole != role {
+			return
+		}
+		if !hasParts {
+			var hasContent bool
+			body, hasContent = typed["content"]
+			if !hasContent && hasRole && (kind == "" || kind == "message") {
+				// Older browser captures wrote their internal role/text message
+				// directly. Never override an explicit (even empty) typed body.
+				body, _ = typed["text"].(string)
+			}
+		}
+		collectGenAIText(body, role, partType, out)
+	case nil, bool, float64, float32, int, int64, int32, json.Number:
+	default:
+		// A typed value from an in-process caller rather than the generic shape a log
+		// line decodes to. Normalized through JSON once; the result is handled above.
+		data, err := json.Marshal(typed)
+		if err != nil {
+			return
+		}
+		var generic interface{}
+		if json.Unmarshal(data, &generic) == nil {
+			collectGenAIText(generic, role, partType, out)
+		}
+	}
+}
+
 // TextOutputMessages is the assistant's own text -- what it said, as opposed to
 // what it thought (ReasoningOutputMessages) -- in the gen_ai.output.messages shape.
 func TextOutputMessages(text string) []interface{} {
@@ -57,12 +159,19 @@ func ReasoningOutputMessages(text string) []interface{} {
 // RetainedContent builds the content marker for an event that keeps text
 // verbatim -- a prompt, an assistant response, command output, a diff.
 //
-// Hash and Bytes are computed over the original text, before the writer's
-// redaction and truncation touch the stored copy, so an event keeps a stable
-// identifier and a true size even when what is stored is shorter. That is the
-// point of the marker: without it a reader cannot tell a short response from a
-// truncated long one, and cannot tell that two truncated copies of the same
-// response are the same response.
+// Hash is computed over the whole text after secret redaction (RedactString)
+// and before the writer's truncation; Bytes is the size of the original text.
+// So an event keeps a stable identifier and a true size even when what is
+// stored is shorter. That is the point of the marker: without it a reader
+// cannot tell a short response from a truncated long one, and cannot tell that
+// two truncated copies of the same response are the same response.
+//
+// The hash is of the redacted text because it leaves the machine wherever the
+// text does not (a Metadata-only forward keeps it and drops the text). A hash of
+// the text before redaction would let anyone holding the event confirm a guess
+// at the secret the stored copy shows as [REDACTED]; a hash of the redacted text
+// says nothing the stored text does not. Text with nothing to redact hashes
+// exactly as it is.
 //
 // storeLimit is the per-string truncation limit the writer emitting this event
 // will apply to the text, and it is a parameter rather than a constant because
@@ -78,7 +187,8 @@ func RetainedContent(text string, storeLimit int) *ContentInfo {
 	if text == "" {
 		return nil
 	}
-	sum := sha256.Sum256([]byte(text))
+	redacted := RedactString(text)
+	sum := sha256.Sum256([]byte(redacted))
 	info := &ContentInfo{
 		Retention: ContentRetentionFull,
 		Included:  true,
@@ -88,10 +198,29 @@ func RetainedContent(text string, storeLimit int) *ContentInfo {
 	if storeLimit > 0 && len(text) > storeLimit {
 		info.Truncated = true
 	}
-	if RedactString(text) != text {
+	if redacted != text {
 		info.Redacted = true
 	}
 	return info
+}
+
+// RetainedDiff is RetainedContent for a retained diff, together with the
+// file.diff_hash and file.diff_bytes that sit beside it. All three come from one
+// redaction of diff, so diff_hash is the marker's hash of the redacted diff,
+// diff_bytes its original size, and every capture path computes them the same
+// way. An empty diff returns nil, "" and 0.
+func RetainedDiff(diff string, storeLimit int) (content *ContentInfo, diffHash string, diffBytes int) {
+	content = RetainedContent(diff, storeLimit)
+	if content == nil {
+		return nil, "", 0
+	}
+	return content, content.Hash, content.Bytes
+}
+
+// RetainedDiffFields is RetainedDiff in the map form used by the hook adapter.
+func RetainedDiffFields(diff string, storeLimit int) (content map[string]interface{}, diffHash string, diffBytes int) {
+	info, diffHash, diffBytes := RetainedDiff(diff, storeLimit)
+	return contentFields(info), diffHash, diffBytes
 }
 
 // RetainedContentFields is RetainedContent in the map form used by the hook
@@ -104,7 +233,10 @@ func RetainedContent(text string, storeLimit int) *ContentInfo {
 // integers: a float64 byte count would serialize the same but sit next to
 // file.diff_bytes, an int, in the same fields map.
 func RetainedContentFields(text string, storeLimit int) map[string]interface{} {
-	info := RetainedContent(text, storeLimit)
+	return contentFields(RetainedContent(text, storeLimit))
+}
+
+func contentFields(info *ContentInfo) map[string]interface{} {
 	if info == nil {
 		return nil
 	}

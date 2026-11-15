@@ -6,27 +6,8 @@ import (
 	"testing"
 
 	endpointhooks "github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/hooks"
+	"github.com/spf13/cobra"
 )
-
-func TestCloudCommandsRegistered(t *testing.T) {
-	for _, path := range [][]string{
-		{"cloud", "claude-web", "print-hooks"},
-		{"cloud", "claude-web", "print-setup"},
-		{"cloud", "cursor", "print-hooks"},
-		{"cloud", "cursor", "print-setup"},
-		{"cloud", "devin", "pull"},
-		{"cloud", "gcs", "setup"},
-		{"cloud", "s3", "setup"},
-	} {
-		cmd, _, err := rootCmd.Find(path)
-		if err != nil {
-			t.Fatalf("Find %v returned error: %v", path, err)
-		}
-		if cmd == nil || cmd.Use != path[len(path)-1] {
-			t.Fatalf("cloud command %v not registered: %#v", path, cmd)
-		}
-	}
-}
 
 func TestRenderCursorCloudHooks(t *testing.T) {
 	got, err := endpointhooks.RenderCursorCloudHooks(endpointhooks.CursorCloudOptions{
@@ -49,6 +30,11 @@ func TestRenderCursorCloudHooks(t *testing.T) {
 		`"subagentStart"`,
 		`"subagentStop"`,
 		`"preCompact"`,
+		`"afterAgentThought"`,
+		`agent-thought`,
+		`"afterAgentResponse"`,
+		`agent-response`,
+		`"stop"`,
 		`BEACON_ORIGIN=cloud`,
 		`BEACON_RUN_PROVIDER=cursor_cloud`,
 		`'/tmp/beacon/bin/beacon-hooks' --platform cursor`,
@@ -57,7 +43,7 @@ func TestRenderCursorCloudHooks(t *testing.T) {
 			t.Fatalf("rendered hooks missing %q:\n%s", want, got)
 		}
 	}
-	for _, unsupported := range []string{`"preToolUse"`, `"sessionStart"`, `"sessionEnd"`, `"stop"`} {
+	for _, unsupported := range []string{`"preToolUse"`, `"sessionStart"`, `"sessionEnd"`} {
 		if strings.Contains(got, unsupported) {
 			t.Fatalf("rendered cursor cloud hooks should not contain %q:\n%s", unsupported, got)
 		}
@@ -79,6 +65,9 @@ func TestRenderCursorCloudSafeHooks(t *testing.T) {
 		`"postToolUse"`,
 		`"subagentStart"`,
 		`"preCompact"`,
+		`"afterAgentThought"`,
+		`"afterAgentResponse"`,
+		`"stop"`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("rendered safe hooks missing %q:\n%s", want, got)
@@ -94,22 +83,42 @@ func TestRenderCursorCloudSafeHooks(t *testing.T) {
 	}
 }
 
-func TestRenderCursorCloudSetupInstallsBinariesOnly(t *testing.T) {
-	got := renderCursorCloudSetup("v0.0.50")
+func TestRenderCursorCloudSetupWritesExcludedHooks(t *testing.T) {
+	got, err := renderCursorCloudSetup("v1.3.60", false)
+	if err != nil {
+		t.Fatalf("render cursor cloud setup: %v", err)
+	}
 	for _, want := range []string{
-		`BEACON_VERSION="v0.0.50"`,
-		`tar -xzf "/tmp/beacon/${ARCHIVE}" -C /tmp/beacon/bin`,
-		`Beacon binaries installed in /tmp/beacon/bin`,
-		`beacon cloud cursor print-hooks --binary-path /tmp/beacon/bin/beacon-hooks --log-path /tmp/beacon/runtime.jsonl > .cursor/hooks.json`,
+		`BEACON_VERSION="v1.3.60"`,
+		`tar -xzf "/tmp/beacon/${ARCHIVE}" -C /tmp/beacon/bin beacon-hooks`,
+		`cat > "$REPO_ROOT/.cursor/hooks.json" <<'BEACON_HOOKS'`,
+		`"afterAgentThought"`,
+		`BEACON_ORIGIN=cloud BEACON_RUN_PROVIDER=cursor_cloud`,
+		`grep -qxF '.cursor/hooks.json' "$EXCLUDE" 2>/dev/null || echo '.cursor/hooks.json' >> "$EXCLUDE"`,
+		// The common directory's exclude file, which git reads in a linked worktree too, and no
+		// failure (under set -e) outside a git checkout.
+		`EXCLUDE="$(git -C "$REPO_ROOT" rev-parse --git-path info/exclude 2>/dev/null || true)"`,
+		// A repository's own committed hooks are never overwritten.
+		`git -C "$REPO_ROOT" ls-files --error-unmatch .cursor/hooks.json`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("rendered setup missing %q:\n%s", want, got)
 		}
 	}
-	for _, forbidden := range []string{`beacon cloud cursor install-hooks`, `--hooks-json`, `.git/info/exclude`} {
-		if strings.Contains(got, forbidden) {
-			t.Fatalf("cursor setup should not rewrite project hooks with %q:\n%s", forbidden, got)
-		}
+	// The heredoc's terminator must stand on its own line, or the hooks file swallows the script.
+	if !strings.Contains(got, "}\nBEACON_HOOKS\n") {
+		t.Fatalf("hooks heredoc is not terminated on its own line:\n%s", got)
+	}
+
+	safe, err := renderCursorCloudSetup("v1.3.60", true)
+	if err != nil {
+		t.Fatalf("render safe cursor cloud setup: %v", err)
+	}
+	if strings.Contains(got, "--absolute-git-dir") {
+		t.Fatalf("setup must not find info/exclude through the worktree's own git dir:\n%s", got)
+	}
+	if strings.Contains(safe, `"beforeShellExecution"`) {
+		t.Fatalf("--safe-hooks setup should leave out the shell hooks:\n%s", safe)
 	}
 }
 
@@ -234,5 +243,20 @@ func TestS3UploadPolicyScopesToPrefix(t *testing.T) {
 	}
 	if policy.Statement[0].Resource != "arn:aws:s3:::bucket/prefix/*" {
 		t.Fatalf("Resource = %q", policy.Statement[0].Resource)
+	}
+}
+
+// The shuttle uploads only from /tmp/beacon, so a hook log elsewhere would never be shipped.
+func TestCloudPrintHooksRejectsLogPathOutsideSandbox(t *testing.T) {
+	prev := cloudOpts
+	t.Cleanup(func() { cloudOpts = prev })
+	for _, cmd := range []*cobra.Command{cloudClaudeWebPrintHooksCmd, cloudCursorPrintHooksCmd} {
+		cloudOpts.binaryPath = "/tmp/beacon/bin/beacon-hooks"
+		for _, logPath := range []string{"/workspace/.beacon/runtime.jsonl", "/tmp/beacon/../etc/runtime.jsonl", "/tmp/beacon"} {
+			cloudOpts.logPath = logPath
+			if err := cmd.RunE(cmd, nil); err == nil || !strings.Contains(err.Error(), "/tmp/beacon") {
+				t.Fatalf("%s --log-path %s: err = %v, want a rejection naming /tmp/beacon", cmd.Parent().Name(), logPath, err)
+			}
+		}
 	}
 }

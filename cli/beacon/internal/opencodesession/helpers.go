@@ -1,8 +1,6 @@
 package opencodesession
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -147,6 +145,7 @@ func tokenUsageFromAny(value interface{}) TokenUsage {
 		Reasoning:  intFromAny(m["reasoning"]),
 		CacheRead:  intFromAny(cache["read"]),
 		CacheWrite: intFromAny(cache["write"]),
+		Total:      intFromAny(m["total"]),
 	}
 }
 
@@ -174,9 +173,4 @@ func opencodeModel(raw map[string]interface{}) string {
 		return provider + "/" + name
 	}
 	return name
-}
-
-func sha256Hex(value string) string {
-	sum := sha256.Sum256([]byte(value))
-	return hex.EncodeToString(sum[:])
 }

@@ -1,21 +1,26 @@
 package cmd
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"strings"
 
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/auth"
+	endpointconfig "github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/config"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/dashboard"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/harness"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/lifecycle"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/schema"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/service"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/writer"
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/onboarding"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/version"
+	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve"
 	"github.com/spf13/cobra"
 )
 
@@ -63,6 +68,9 @@ var endpointDashboardCmd = &cobra.Command{
 
 var dashboardListenAndServe = dashboard.ListenAndServe
 
+// openDashboardBrowser is dashboard.OpenBrowser. Tests replace it to see whether a launch opened one.
+var openDashboardBrowser = dashboard.OpenBrowser
+
 func runEndpointDashboard(cmd *cobra.Command, args []string) error {
 	cfg := loadOrDefaultConfig()
 	userMode := endpointUserMode()
@@ -75,26 +83,40 @@ func runEndpointDashboard(cmd *cobra.Command, args []string) error {
 	if err := dashboard.ValidateLoopbackAddr(endpointOpts.dashboardAddr); err != nil {
 		return err
 	}
-	url := dashboard.URL(endpointOpts.dashboardAddr)
-	fmt.Printf("Beacon endpoint dashboard: %s\n", url)
-	fmt.Printf("Runtime log: %s\n", cfg.LogPath)
-	if runtimeLog.Warning != "" {
-		fmt.Printf("Runtime log source: %s\n", runtimeLog.Warning)
+	if err := refuseDisabledDashboard(); err != nil {
+		return err
 	}
-	if endpointOpts.dashboardOpen {
-		if err := dashboard.OpenBrowser(url); err != nil {
-			// Over SSH the dashboard is still worth serving: forward its port and open it on
-			// the client.
-			if !errors.Is(err, auth.ErrNoDisplay) {
-				return err
-			}
-			fmt.Printf("Not opening a browser (%v).\n", err)
-		}
+	// The launch secret lives only in memory and in the URL printed after the port binds, which is
+	// the one way in: another account that reaches the loopback port without it is refused.
+	token, err := dashboard.NewToken()
+	if err != nil {
+		return fmt.Errorf("create the dashboard launch secret: %w", err)
 	}
 	return dashboardListenAndServe(dashboard.Options{
 		Addr:     endpointOpts.dashboardAddr,
 		LogPath:  endpointOpts.logPath,
 		UserMode: userMode,
+		Token:    token,
+		Ready: func(addr net.Addr) error {
+			url := dashboard.LaunchURL(addr.String(), token, "/")
+			fmt.Printf("Beacon endpoint dashboard: %s\n", url)
+			fmt.Printf("Runtime log: %s\n", cfg.LogPath)
+			if runtimeLog.Warning != "" {
+				fmt.Printf("Runtime log source: %s\n", runtimeLog.Warning)
+			}
+			if !endpointOpts.dashboardOpen {
+				return nil
+			}
+			if err := openDashboardBrowser(url); err != nil {
+				// Over SSH the dashboard is still worth serving: forward its port and open it on
+				// the client.
+				if !errors.Is(err, auth.ErrNoDisplay) {
+					return err
+				}
+				fmt.Printf("Not opening a browser (%v).\n", err)
+			}
+			return nil
+		},
 	})
 }
 
@@ -115,22 +137,81 @@ var (
 // install and repair (#640). So the list is always handed over non-nil.
 func endpointInstallOptions(selection endpointTargetSelection, serviceKind service.Kind) lifecycle.InstallOptions {
 	harnesses := append([]string{}, selection.OTLP...)
+	// Install and repair validate the forward flags before anything is written.
+	otlpForward, _ := otlpForwardOptions()
+	sessionSync, _ := sessionSyncOption()
+	dashboardSwitch, _ := dashboardSwitchOption()
 	return lifecycle.InstallOptions{
-		UserMode:              endpointUserMode(),
-		LogPath:               endpointOpts.logPath,
-		Harnesses:             harnesses,
-		GRPCPort:              endpointOpts.grpcPort,
-		HTTPPort:              endpointOpts.httpPort,
-		HealthPort:            endpointOpts.healthPort,
-		CollectorPath:         endpointOpts.collectorPath,
-		StartService:          !endpointOpts.noStart,
-		IncludeRuntimeMetrics: endpointOpts.includeRuntimeMetrics,
-		IncludeCodexSpans:     endpointOpts.includeCodexSpans,
-		SplunkHEC:             splunkHECOptions(),
-		FalconHEC:             falconHECOptions(),
-		ServiceKind:           serviceKind,
+		UserMode:                  endpointUserMode(),
+		LogPath:                   endpointOpts.logPath,
+		Harnesses:                 harnesses,
+		GRPCPort:                  endpointOpts.grpcPort,
+		HTTPPort:                  endpointOpts.httpPort,
+		HealthPort:                endpointOpts.healthPort,
+		CollectorPath:             endpointOpts.collectorPath,
+		StartService:              !endpointOpts.noStart,
+		IncludeRuntimeMetrics:     endpointOpts.includeRuntimeMetrics,
+		IncludeCodexSpans:         endpointOpts.includeCodexSpans,
+		ClaudeCaptureModelContext: endpointOpts.claudeCaptureModelContext,
+		SplunkHEC:                 splunkHECOptions(),
+		FalconHEC:                 falconHECOptions(),
+		OTLPForward:               otlpForward,
+		SessionSync:               sessionSync,
+		ServiceKind:               serviceKind,
+		LogAccess:                 strings.ToLower(strings.TrimSpace(endpointOpts.logAccess)),
+		LogReaders:                endpointOpts.logReaders,
+		Dashboard:                 dashboardSwitch,
 	}
 }
+
+// warnMissingOTLPForwardHeaders says when the configured OTLP forward names headers whose values
+// are gone -- a package removal or cleanup took otlp-forward-headers.json -- and this run does not
+// set them again. The forward keeps running, so without this the backend would just start
+// refusing it.
+func warnMissingOTLPForwardHeaders(out io.Writer) {
+	if forward, _ := otlpForwardOptions(); forward != nil {
+		return
+	}
+	cfg, err := endpointconfig.Load(endpointUserMode())
+	if err != nil || cfg.Destinations == nil || cfg.Destinations.OTLPForward == nil {
+		return
+	}
+	if forward := cfg.Destinations.OTLPForward; forward.Enabled && forward.HeadersMissing {
+		fmt.Fprintf(out, "Warning: the OTLP forward to %s names headers (%s) whose values are missing (%s was removed), so it sends without them. Set the forward again with all its flags:\n  %s\n",
+			forward.Endpoint, strings.Join(forward.HeaderNames, ", "), endpointconfig.OTLPForwardSecretsPath(endpointUserMode()), otlpForwardFlags(forward))
+	}
+}
+
+// otlpForwardFlags spells the flags that set forward again as it is configured, with a placeholder
+// for each header value. Passing --otlp-forward-endpoint replaces the whole forward, so every
+// setting is restated, not only the headers.
+func otlpForwardFlags(forward *endpointconfig.OTLPForward) string {
+	flags := []string{"--otlp-forward-endpoint " + shellQuote(forward.Endpoint)}
+	if forward.Protocol != "" && forward.Protocol != endpointconfig.OTLPForwardProtocolGRPC {
+		flags = append(flags, "--otlp-forward-protocol "+forward.Protocol)
+	}
+	if len(forward.Harnesses) > 0 && strings.Join(forward.Harnesses, ",") != strings.Join(endpointconfig.DefaultOTLPForwardHarnesses, ",") {
+		flags = append(flags, "--otlp-forward-harness "+shellQuote(strings.Join(forward.Harnesses, ",")))
+	}
+	if forward.Insecure {
+		flags = append(flags, "--otlp-forward-insecure")
+	}
+	if forward.InsecureSkipVerify {
+		flags = append(flags, "--otlp-forward-insecure-skip-verify")
+	}
+	if forward.CAFile != "" {
+		flags = append(flags, "--otlp-forward-ca-file "+shellQuote(forward.CAFile))
+	}
+	for _, name := range forward.HeaderNames {
+		flags = append(flags, "--otlp-forward-header "+shellQuote(name+"=<value>"))
+	}
+	return strings.Join(flags, " ")
+}
+
+// errSetupCancelled replaces the wizard's own "onboarding cancelled", which read as a failure
+// and left the person to guess what state the machine was in. The wizard runs before anything is
+// written, so the answer is always the same: nothing changed, and here is how to start again.
+var errSetupCancelled = fmt.Errorf("setup cancelled; nothing was installed. Run `beacon endpoint install` again when you are ready, or set %s=0 to install without the guided setup", onboardingEnvEnabled)
 
 func runEndpointInstall(cmd *cobra.Command, args []string) error {
 	selection, err := resolveEndpointTargets(endpointOpts.harnesses, harness.DiscoverAll())
@@ -142,6 +223,16 @@ func runEndpointInstall(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	if _, err := otlpForwardOptions(); err != nil {
+		return err
+	}
+	if _, err := sessionSyncOption(); err != nil {
+		return err
+	}
+	if _, err := dashboardSwitchOption(); err != nil {
+		return err
+	}
+	warnMissingOTLPForwardHeaders(cmd.ErrOrStderr())
 	if endpointOpts.dryRun {
 		return printPlannedActions(plannedInstallActions(false, serviceKind, selection.OTLP, selection.Hooks))
 	}
@@ -149,11 +240,25 @@ func runEndpointInstall(cmd *cobra.Command, args []string) error {
 	// non-interactive path (package postinstall, MDM, CI) is gated out inside.
 	onboarded, err := maybeRunOnboarding(cmd)
 	if err != nil {
+		if errors.Is(err, onboarding.ErrWizardCancelled) {
+			return errSetupCancelled
+		}
 		return err
 	}
 	// Confirming Beacon Cloud connects this endpoint; --connect does the same for
 	// the paths the wizard did not own.
 	connectAfterInstall := onboarded.Connect || endpointOpts.connect
+	// A wizard install that connects to Beacon Cloud closes on a short summary (cloudSummary)
+	// instead of the paths and per-runtime lines below, which are for operators and scripts.
+	// Warnings still go to stderr. With nothing else said, the install, the backfill and the
+	// connect would pass in silence, so one line says what is happening first.
+	var summary *cloudSummary
+	details := io.Writer(os.Stdout)
+	if onboarded.briefClose() {
+		summary = &cloudSummary{}
+		details = io.Discard
+		fmt.Fprintln(cmd.OutOrStdout(), "Installing Beacon and connecting to Beacon Cloud...")
+	}
 	result, err := endpointLifecycleInstall(endpointInstallOptions(selection, serviceKind))
 	if err != nil {
 		return err
@@ -166,36 +271,137 @@ func runEndpointInstall(cmd *cobra.Command, args []string) error {
 			fmt.Fprintf(cmd.ErrOrStderr(), "beacon: %v\n", err)
 		}
 	}
-	fmt.Printf("Endpoint config written to %s\n", result.ConfigPath)
-	fmt.Printf("Collector config written to %s\n", result.CollectorConfigPath)
-	fmt.Printf("Service definition written to %s\n", result.PlistPath)
-	fmt.Printf("Install manifest written to %s\n", result.ManifestPath)
-	fmt.Printf("Runtime log: %s\n", result.LogPath)
+	fmt.Fprintf(details, "Endpoint config written to %s\n", result.ConfigPath)
+	fmt.Fprintf(details, "Collector config written to %s\n", result.CollectorConfigPath)
+	fmt.Fprintf(details, "Service definition written to %s\n", result.PlistPath)
+	fmt.Fprintf(details, "Install manifest written to %s\n", result.ManifestPath)
+	fmt.Fprintf(details, "Runtime log: %s\n", result.LogPath)
 	switch {
 	case result.InventoryJobPath != "":
-		fmt.Printf("Scheduled inventory job: %s\n", result.InventoryJobPath)
+		fmt.Fprintf(details, "Scheduled inventory job: %s\n", result.InventoryJobPath)
 	case result.InventoryJobDetail != "":
-		fmt.Printf("Scheduled inventory job not installed: %s\n", result.InventoryJobDetail)
+		fmt.Fprintf(details, "Scheduled inventory job not installed: %s\n", result.InventoryJobDetail)
 	}
+	reportSessionSyncJob(details, result)
+	reportLogAccess(details, result)
+	reportManagedForwarder(details, cmd.ErrOrStderr(), result.ManagedForwarder)
+	reportSentinelForwarder(details, cmd.ErrOrStderr(), result.SentinelForwarder)
 	printLingerGap(cmd.ErrOrStderr(), result)
-	installHookTargetsFromEndpointInstall(cmd.ErrOrStderr(), selection.Hooks)
-	if connectAfterInstall {
-		// The install is complete and stands on its own; a failed connect is reported
-		// with the retry command rather than turning a working install into an error.
-		fmt.Fprintln(cmd.OutOrStdout())
-		if err := connectEndpoint(cmd, endpointUserMode(), result.LogPath); err != nil {
-			fmt.Fprintf(cmd.ErrOrStderr(), "beacon: managed ingest was not connected (%v). Run `beacon endpoint connect` to try again.\n", err)
-		} else {
-			recordDestinationAsymptote(cmd)
-			suggestMCPConnect(cmd.OutOrStdout(), onboarded.Connect)
+	installHookTargetsFromEndpointInstall(details, cmd.ErrOrStderr(), selection.Hooks)
+	refreshAgentSkills(cmd.ErrOrStderr())
+	installAgentSkillsFromOnboarding(cmd, onboarded)
+	// Read recent history from the agents' own session stores so the dashboard has sessions
+	// in it before any agent runs again. Local only, bounded, and never a reason to fail the
+	// install; a connect below ships what it wrote rather than sweeping again.
+	backfilled := false
+	if endpointBackfillEnabled() {
+		backfillOut := cmd.OutOrStdout()
+		if summary != nil {
+			backfillOut = &summary.backfill
 		}
+		reportEndpointBackfill(backfillOut, runEndpointBackfill(result.LogPath, endpointUserMode()))
+		backfilled = true
+	} else {
+		recordSkippedBackfill(cmd.ErrOrStderr(), endpointUserMode())
 	}
+	finishCloudSetup(cmd, onboarded, connectAfterInstall, summary, func() error {
+		return connectEndpointFor(cmd, endpointUserMode(), result.LogPath, backfilled, summary)
+	})
 	return nil
 }
 
-// suggestMCPConnect points a person who just chose Beacon Cloud in the wizard at
-// `beacon mcp connect`. It only prints: registering the MCP server stays a separate,
-// explicit command, and the unattended install paths never reach the wizard at all.
+// cloudSummary is the closing of a wizard install that connects to Beacon Cloud, said in place of
+// the full install, connect and Beacon Cloud MCP reports. Those are written for an operator reading
+// a log. Someone who has just confirmed the wizard needs to know that it worked, what history is on
+// its way, where to look, and what is left to do in their agents, in that order:
+//
+//	Beacon is installed and connected to Beacon Cloud as <account> (device <id>, <mode> privacy).
+//	Session backfill: <n> events from the last 30 days (<runtime> <n>, ...).
+//	Dashboard: <url> (...)
+//	Beacon Cloud MCP added to <apps>; sign in to beacon-managed once in each app (...).
+//
+// Warnings, and the retry commands they name, still go to stderr. `beacon endpoint connect`,
+// `beacon mcp connect` and `install --connect` without the wizard keep their full output.
+type cloudSummary struct {
+	// backfill holds the install's session backfill report until the connected line is said.
+	backfill bytes.Buffer
+	// dashboardURL is the hosted dashboard, set by a successful connect.
+	dashboardURL string
+	// uploading is how many events of session history the connect staged for upload.
+	uploading int
+}
+
+// onboardingOpenDashboard is a seam for tests, which must never open a real browser.
+var onboardingOpenDashboard = auth.OpenBrowser
+
+// finishCloudSetup connects the endpoint when the wizard or --connect asked for it, and then
+// registers Beacon Cloud MCP when the wizard kept it selected. MCP is registered only once the
+// endpoint forwards to Beacon Cloud, since there is nothing for it to search otherwise. summary is
+// non-nil when the install closes on the wizard's short summary; connect fills it in.
+func finishCloudSetup(cmd *cobra.Command, onboarded onboardingOutcome, connectAfterInstall bool, summary *cloudSummary, connect func() error) {
+	if !connectAfterInstall {
+		if onboarded.ConnectCloudMCP {
+			// An endpoint that was already connected keeps its device key and is not
+			// re-enrolled, but the person still asked for Beacon Cloud MCP.
+			connectCloudMCPFromOnboarding(cmd, false)
+		}
+		return
+	}
+	// The install is complete and stands on its own; a failed connect is reported with the
+	// retry command rather than turning a working install into an error.
+	out := cmd.OutOrStdout()
+	fmt.Fprintln(out)
+	if err := connect(); err != nil {
+		if summary != nil {
+			fmt.Fprintln(out, "Beacon is installed on this machine, but it is not connected to Beacon Cloud yet.")
+			_, _ = summary.backfill.WriteTo(out)
+		}
+		fmt.Fprintf(cmd.ErrOrStderr(), "beacon: managed ingest was not connected (%v). Run `beacon endpoint connect` to try again.\n", err)
+		if onboarded.ConnectCloudMCP {
+			fmt.Fprintln(cmd.ErrOrStderr(), "beacon: Beacon Cloud MCP was not registered either; run `beacon mcp connect` once the endpoint is connected.")
+		}
+		return
+	}
+	recordDestinationAsymptote(cmd)
+	if summary != nil {
+		showDashboard(cmd, summary)
+	}
+	if onboarded.ConnectCloudMCP {
+		connectCloudMCPFromOnboarding(cmd, summary != nil)
+		return
+	}
+	suggestMCPConnect(out, onboarded.Connect)
+}
+
+// showDashboard names the hosted dashboard and opens it, since that is where someone who just
+// finished the wizard goes next. The browser is opened only where the person can see it: not with
+// --no-browser, not over SSH (a browser there would open on the remote machine's screen, if
+// anywhere), and not on a Linux machine without a display. A browser that fails to open is not
+// worth a warning, because the URL is on screen either way.
+func showDashboard(cmd *cobra.Command, summary *cloudSummary) {
+	url := summary.dashboardURL
+	if url == "" {
+		url = dashboardHomeURL("")
+	}
+	line := "Dashboard: " + url
+	if summary.uploading > 0 {
+		line += " (your recent sessions appear within a minute)"
+	} else {
+		line += " (sessions appear within about 15 seconds of agent activity)"
+	}
+	fmt.Fprintln(cmd.OutOrStdout(), line)
+	if endpointOpts.noBrowser || os.Getenv("SSH_CONNECTION") != "" || os.Getenv("SSH_TTY") != "" {
+		return
+	}
+	if onboardingDisplayCheck() != nil {
+		return
+	}
+	_ = onboardingOpenDashboard(url)
+}
+
+// suggestMCPConnect points a person who chose Beacon Cloud in the wizard, but turned Beacon
+// Cloud MCP off, at `beacon mcp connect`. It only prints, and the unattended install paths never
+// reach the wizard at all.
 func suggestMCPConnect(out io.Writer, chosenInWizard bool) {
 	if !chosenInWizard {
 		return
@@ -234,13 +440,32 @@ func runEndpointStatus(cmd *cobra.Command, args []string) error {
 			fmt.Printf("Diagnostic: %s %s (%s)\n", check.Name, check.Status, check.Message)
 		}
 	}
-	if status.LastEvent == "" {
-		fmt.Println("Last event: none")
-	} else {
-		fmt.Println("Last event: present")
+	if status.LogAccess != "" {
+		fmt.Printf("Runtime log access: %s\n", status.LogAccess)
 	}
-	fmt.Println(managedIngestStatusLine(status.ManagedIngest))
+	fmt.Println(dashboardStatusLine(status))
+	switch {
+	case status.LastEvent != "":
+		fmt.Println("Last event: present")
+	case status.LogAccess == asymptoteobserve.LogAccessRestricted && !readable(status.LogPath):
+		// A restricted log is unreadable to an account outside its readers group, which is not the
+		// same as empty.
+		fmt.Printf("Last event: unknown (this account cannot read the restricted log; run %s)\n", elevatedRunHint())
+	default:
+		fmt.Println("Last event: none")
+	}
+	for _, forwarder := range status.ScriptForwarders {
+		fmt.Println(scriptForwarderStatusLine(forwarder))
+	}
+	if status.SentinelForwarder != nil {
+		fmt.Println(sentinelForwarderStatusLine(*status.SentinelForwarder))
+	}
+	otherForwarders := len(status.ScriptForwarders) > 0 || status.SentinelForwarder != nil
+	if line := cloudStatusLine(status.ManagedIngest, endpointUserMode(), otherForwarders); line != "" {
+		fmt.Println(line)
+	}
 	fmt.Println(inventoryHeartbeatStatusLine(status.InventoryHeartbeat))
+	fmt.Println(sessionSyncStatusLine(status.SessionSync))
 	return nil
 }
 
@@ -317,6 +542,16 @@ func runEndpointRepair(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	if _, err := otlpForwardOptions(); err != nil {
+		return err
+	}
+	if _, err := sessionSyncOption(); err != nil {
+		return err
+	}
+	if _, err := dashboardSwitchOption(); err != nil {
+		return err
+	}
+	warnMissingOTLPForwardHeaders(cmd.ErrOrStderr())
 	if endpointOpts.dryRun {
 		return printPlannedActions(plannedInstallActions(true, serviceKind, selection.OTLP, selection.Hooks))
 	}
@@ -328,9 +563,25 @@ func runEndpointRepair(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	fmt.Printf("Endpoint repaired. Manifest: %s\n", result.ManifestPath)
+	reportSessionSyncJob(os.Stdout, result)
+	reportLogAccess(os.Stdout, result)
+	reportManagedForwarder(os.Stdout, cmd.ErrOrStderr(), result.ManagedForwarder)
+	reportSentinelForwarder(os.Stdout, cmd.ErrOrStderr(), result.SentinelForwarder)
 	printLingerGap(cmd.ErrOrStderr(), result)
-	installHookTargetsFromEndpointInstall(cmd.ErrOrStderr(), selection.Hooks)
+	installHookTargetsFromEndpointInstall(os.Stdout, cmd.ErrOrStderr(), selection.Hooks)
+	refreshAgentSkills(cmd.ErrOrStderr())
 	return nil
+}
+
+// reportSessionSyncJob says where the scheduled session sync job was installed, or why it was not,
+// when the setting is on; with it off (the default) install and repair say nothing about it.
+func reportSessionSyncJob(out io.Writer, result lifecycle.InstallResult) {
+	switch {
+	case result.SessionSyncJobPath != "":
+		fmt.Fprintf(out, "Scheduled session sync job: %s\n", result.SessionSyncJobPath)
+	case result.SessionSyncJobDetail != "":
+		fmt.Fprintf(out, "Scheduled session sync job not installed: %s\n", result.SessionSyncJobDetail)
+	}
 }
 
 func reportEndpointTargetSelection(cmd *cobra.Command, selection endpointTargetSelection) {
@@ -381,7 +632,9 @@ func printLingerGap(out io.Writer, result lifecycle.InstallResult) {
 }
 
 // installHookTargetsFromEndpointInstall installs the hook targets that ride an endpoint
-// install or repair, and reports the ones it could not write as warnings on out.
+// install or repair, says what it wrote on report, and reports the ones it could not write as
+// warnings on out. What a runtime still needs from the person (a restart, a trust prompt) goes to
+// stdout whatever report is, because that runtime collects nothing until it is done.
 //
 // By the time this runs the collector, its config, the service unit, and the OTLP settings
 // are all in place, so the endpoint works. A hook that could not be written, most often a
@@ -389,7 +642,7 @@ func printLingerGap(out io.Writer, result lifecycle.InstallResult) {
 // from being retried, and it used to turn that complete install into a non-zero exit that
 // read as a broken endpoint. Every target is still attempted, so one runtime's settings
 // file cannot stop another runtime's hooks from being installed.
-func installHookTargetsFromEndpointInstall(out io.Writer, targets []string) {
+func installHookTargetsFromEndpointInstall(report, out io.Writer, targets []string) {
 	if len(targets) == 0 {
 		return
 	}
@@ -399,7 +652,7 @@ func installHookTargetsFromEndpointInstall(out io.Writer, targets []string) {
 	}
 	var failed []string
 	for _, target := range targets {
-		if err := installEndpointHookTarget(target, cfg); err != nil {
+		if err := installEndpointHookTargetTo(report, os.Stdout, target, cfg); err != nil {
 			failed = append(failed, target)
 			fmt.Fprintf(out, "Warning: %s hooks were not installed: %v\n", target, err)
 		}

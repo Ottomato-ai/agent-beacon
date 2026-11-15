@@ -18,11 +18,19 @@ type MappedEvent struct {
 	DedupID    string
 	SourceLine int
 	Event      schema.Event
+	// RetryFrom, when set, is the earliest source line this event accounts for. A sweep that
+	// stops before writing it must not leave its cursor at or past that line, or the next sweep
+	// would treat what the event counts as already counted. Only token.usage events set it: one
+	// response's usage event can account for block lines before its own (see usage.go).
+	RetryFrom int
 }
 
 type MapOptions struct {
 	MinLine            int
 	SkipSessionStarted bool
+	// responses is what this sweep has already counted for each API response across the files
+	// it read before this one. Nil maps the file on its own.
+	responses responseLedger
 }
 
 type toolCall struct {
@@ -36,10 +44,20 @@ type mapper struct {
 	opts  MapOptions
 	out   []MappedEvent
 	tools map[string]toolCall
+	usage map[int]usagePlan
+	// promptID is the prompt the records being read belong to. Claude Code stamps promptId on a
+	// prompt and on every tool result that follows it, but not on assistant entries, which belong
+	// to the same prompt by their place in the file. The whole file is read on every sync, so the
+	// value is right even for the first record past the cursor.
+	promptID string
+	// fallbackTimestamp stamps records that carry no timestamp of their own (see fallbackTimestamp).
+	fallbackTimestamp string
 }
 
 func MapSession(ref SessionRef, records []Record, opts MapOptions) []MappedEvent {
 	m := &mapper{ref: ref, opts: opts, tools: map[string]toolCall{}}
+	m.fallbackTimestamp = fallbackTimestamp(ref, records, opts.MinLine)
+	m.usage = planUsage(ref, records, opts.MinLine, opts.responses)
 	for i := range records {
 		m.consume(records[i])
 	}
@@ -52,12 +70,19 @@ func (m *mapper) consume(record Record) {
 	if emit && !m.opts.SkipSessionStarted && len(m.out) == 0 && entry.SessionID != "" {
 		m.emitSessionStarted(record)
 	}
+	if id := strings.TrimSpace(entry.PromptID); id != "" {
+		m.promptID = id
+	}
 
 	switch entry.Type {
 	case "user":
 		m.consumeUser(record, emit)
 	case "assistant":
 		m.consumeAssistant(record, emit)
+	case "attachment":
+		if emit && stringValue(entry.Attachment["type"]) == "skill_listing" {
+			m.emitSkillListing(record, entry.Attachment)
+		}
 	case "summary":
 		if emit {
 			m.emitSummary(record)
@@ -146,8 +171,8 @@ func (m *mapper) consumeAssistant(record Record, emit bool) {
 		if text := strings.TrimSpace(strings.Join(reasoningParts, "\n")); text != "" {
 			m.emitAgentReasoning(record, text)
 		}
-		if usage := usageFromMessage(entry.Message); usage != nil {
-			m.emitUsage(record, usage)
+		if plan, ok := m.usage[record.Line]; ok {
+			m.emitUsage(record, plan)
 		}
 	}
 }
@@ -158,9 +183,35 @@ func (m *mapper) emitSessionStarted(record Record) {
 	m.append(record, "session.started", ev)
 }
 
+// emitSkillListing records the skill index Claude Code showed the model. The attachment's names are
+// the skills it listed, which is what splits the index into one entry per skill. isInitial and
+// skillCount are kept as provenance: an attachment that is not the initial one may list only the
+// skills added since, which the index text alone does not say.
+func (m *mapper) emitSkillListing(record Record, attachment map[string]interface{}) {
+	var names []string
+	listed, _ := attachment["names"].([]interface{})
+	for _, name := range listed {
+		names = append(names, stringValue(name))
+	}
+	listing := asymptoteobserve.ParseSkillListing(asymptoteobserve.SystemContextSourceTranscript, toolResultText(attachment["content"]), names)
+	if len(listing.Entries) == 0 {
+		return
+	}
+	ev := m.base(record, "session.context", "session", schema.SeverityInfo, schema.FidelityObserved, "Claude Code skill listing exposed to the model")
+	listing.Apply(&ev, asymptoteobserve.DefaultRawStringLimit)
+	provenance := map[string]interface{}{"type": "skill_listing"}
+	for key, field := range map[string]string{"isInitial": "is_initial", "skillCount": "skill_count"} {
+		if value, ok := attachment[key]; ok {
+			provenance[field] = value
+		}
+	}
+	ev.Raw = map[string]interface{}{"claude_session": m.raw(record), "claude_attachment": provenance}
+	m.append(record, "session.context:skill_listing", ev)
+}
+
 func (m *mapper) emitPrompt(record Record, text string) {
 	ev := m.base(record, "prompt.submitted", "prompt", schema.SeverityInfo, schema.FidelityObserved, "Prompt submitted to Claude Code")
-	ev.Prompt = &schema.PromptInfo{Text: text}
+	ev.Prompt = &schema.PromptInfo{ID: m.promptID, Text: text}
 	ev.Content = contentMarker(text)
 	ev.GenAI = mergeGenAI(ev.GenAI, &schema.GenAIInfo{Input: &schema.GenAIInputInfo{Messages: asymptoteobserve.TextInputMessages(text)}})
 	m.append(record, "prompt", ev)
@@ -195,7 +246,7 @@ func (m *mapper) emitToolInvoked(record Record, block int, call toolCall) {
 	ev := m.base(record, action, category, schema.SeverityInfo, schema.FidelityObserved, "Claude Code tool invocation observed")
 	ev.Tool = &schema.ToolInfo{Name: call.Name}
 	ev.GenAI = mergeGenAI(ev.GenAI, &schema.GenAIInfo{Tool: &schema.GenAIToolInfo{Name: call.Name, Call: &schema.GenAIToolCallInfo{ID: call.ID, Arguments: call.Input}}})
-	if command := commandFromTool(call); command != "" {
+	if command := asymptoteobserve.ToolCommandLine(call.Name, call.Input); command != "" {
 		ev.Tool.Command = command
 	}
 	if path := pathFromTool(call); path != "" {
@@ -218,10 +269,11 @@ func (m *mapper) emitToolResult(record Record, block int, result map[string]inte
 	content := toolResultText(result["content"])
 	isError, _ := result["is_error"].(bool)
 	switch {
-	case isCommandTool(call):
+	case asymptoteobserve.IsShellCommandTool(call.Name):
+		command := asymptoteobserve.ToolCommandLine(call.Name, call.Input)
 		ev := m.base(record, "command.executed", "command", severityForError(isError), schema.FidelityObserved, "Claude Code command completed")
-		ev.Command = &schema.CommandInfo{Command: commandFromTool(call), Output: content}
-		ev.Tool = &schema.ToolInfo{Name: call.Name, Command: commandFromTool(call)}
+		ev.Command = &schema.CommandInfo{Command: command, Output: content}
+		ev.Tool = &schema.ToolInfo{Name: call.Name, Command: command}
 		ev.GenAI = toolResultGenAI(call, content)
 		m.append(record, "tool.result."+itoa(block), ev)
 	case isFileTool(call):
@@ -242,11 +294,12 @@ func (m *mapper) emitToolResult(record Record, block int, result map[string]inte
 	}
 }
 
-func (m *mapper) emitUsage(record Record, usage *schema.GenAIUsageInfo) {
+func (m *mapper) emitUsage(record Record, plan usagePlan) {
 	ev := m.base(record, "token.usage", "metric", schema.SeverityInfo, schema.FidelityObserved, "Claude Code token usage observed")
-	ev.GenAI = mergeGenAI(ev.GenAI, &schema.GenAIInfo{Usage: usage})
+	ev.GenAI = mergeGenAI(ev.GenAI, &schema.GenAIInfo{Usage: plan.usage})
 	m.applyResponse(&ev, record.Entry)
-	m.append(record, "usage", ev)
+	ev.Event.ID = claudeEventID(plan.coordinate)
+	m.out = append(m.out, MappedEvent{DedupID: ev.Event.ID, SourceLine: record.Line, Event: ev, RetryFrom: plan.retryFrom})
 }
 
 func (m *mapper) emitSummary(record Record) {
@@ -273,6 +326,8 @@ func (m *mapper) base(record Record, action, category string, severity schema.Se
 	})
 	if ts := parseTimestamp(entry.Timestamp); ts != "" {
 		ev.Timestamp = ts
+	} else if m.fallbackTimestamp != "" {
+		ev.Timestamp = m.fallbackTimestamp
 	}
 	sessionID := entry.SessionID
 	if sessionID == "" {
@@ -295,11 +350,12 @@ func (m *mapper) base(record Record, action, category string, severity schema.Se
 	if entry.IsSidechain || m.ref.IsSidechain {
 		ev.GenAI = mergeGenAI(ev.GenAI, &schema.GenAIInfo{Agent: m.agentInfo(entry)})
 	}
+	asymptoteobserve.SetPromptID(&ev, m.promptID)
 	return ev
 }
 
 func (m *mapper) append(record Record, suffix string, ev schema.Event) {
-	coordinate := firstNonEmpty(record.Entry.UUID, m.ref.Path+":"+itoa(record.Line)) + ":" + suffix
+	coordinate := recordCoordinate(m.ref, record) + ":" + suffix
 	ev.Event.ID = claudeEventID(coordinate)
 	m.out = append(m.out, MappedEvent{DedupID: ev.Event.ID, SourceLine: record.Line, Event: ev})
 }
@@ -357,7 +413,15 @@ func usageFromMessage(message map[string]interface{}) *schema.GenAIUsageInfo {
 		usage.OutputTokens = &v
 	}
 	if v, ok := int64Value(firstValue(raw, "cache_creation_input_tokens", "cache_creation_tokens")); ok {
-		usage.CacheCreation = &schema.GenAIUsageCacheCreationInfo{InputTokens: &v}
+		// The API response breaks cache writes down by TTL under cache_creation. Only the
+		// one-hour part is kept: it is billed at 2x input against 1.25x for five-minute writes,
+		// and the five-minute part is the remainder. Builds that write no breakdown leave the
+		// split absent rather than zero.
+		var oneHour *int64
+		if h, ok := int64Value(mapValue(raw["cache_creation"])["ephemeral_1h_input_tokens"]); ok {
+			oneHour = &h
+		}
+		usage.CacheCreation = asymptoteobserve.NewCacheCreationUsage(v, oneHour)
 	}
 	if v, ok := int64Value(firstValue(raw, "cache_read_input_tokens", "cache_read_tokens")); ok {
 		usage.CacheRead = &schema.GenAIUsageCacheReadInfo{InputTokens: &v}
@@ -404,11 +468,51 @@ func mergeGenAI(base, next *schema.GenAIInfo) *schema.GenAIInfo {
 }
 
 func parseTimestamp(value string) string {
-	if strings.TrimSpace(value) == "" {
-		return ""
+	if ts, ok := recordTime(value); ok {
+		return schema.FormatTimestamp(ts)
 	}
-	if ts, err := time.Parse(time.RFC3339Nano, value); err == nil {
-		return schema.FormatTimestamp(ts.UTC())
+	return ""
+}
+
+func recordTime(value string) (time.Time, bool) {
+	if strings.TrimSpace(value) == "" {
+		return time.Time{}, false
+	}
+	ts, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return ts.UTC(), true
+}
+
+// fallbackTimestamp is the time given to a record that has none of its own. Claude Code writes
+// bookkeeping records (permission-mode, mode, last-prompt, ai-title, agent-name, summary) that
+// carry a sessionId but no timestamp, and the first of them is often the record session.started
+// is emitted for. Stamping those with the time of the sync made every backfilled session look as
+// if it ran until the backfill. The earliest timestamp past the cursor is used, then the earliest
+// in the file, then the file's modification time; only a file with none of these is left with
+// the time of the sync.
+func fallbackTimestamp(ref SessionRef, records []Record, minLine int) string {
+	var earliest, earliestPastCursor time.Time
+	for _, record := range records {
+		ts, ok := recordTime(record.Entry.Timestamp)
+		if !ok {
+			continue
+		}
+		if earliest.IsZero() || ts.Before(earliest) {
+			earliest = ts
+		}
+		if record.Line > minLine && (earliestPastCursor.IsZero() || ts.Before(earliestPastCursor)) {
+			earliestPastCursor = ts
+		}
+	}
+	switch {
+	case !earliestPastCursor.IsZero():
+		return schema.FormatTimestamp(earliestPastCursor)
+	case !earliest.IsZero():
+		return schema.FormatTimestamp(earliest)
+	case ref.ModTimeUnixMS > 0:
+		return schema.FormatTimestamp(time.UnixMilli(ref.ModTimeUnixMS).UTC())
 	}
 	return ""
 }
@@ -446,15 +550,6 @@ func toolResultText(value interface{}) string {
 	}
 }
 
-func isCommandTool(call toolCall) bool {
-	switch strings.ToLower(call.Name) {
-	case "bash", "shell", "terminal":
-		return true
-	default:
-		return false
-	}
-}
-
 func isFileTool(call toolCall) bool {
 	switch strings.ToLower(call.Name) {
 	case "read", "write", "edit", "multiedit", "notebookread", "notebookedit":
@@ -462,10 +557,6 @@ func isFileTool(call toolCall) bool {
 	default:
 		return false
 	}
-}
-
-func commandFromTool(call toolCall) string {
-	return firstString(call.Input, "command", "cmd", "shell_command")
 }
 
 func pathFromTool(call toolCall) string {

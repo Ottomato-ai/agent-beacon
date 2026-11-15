@@ -4,25 +4,42 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"testing"
 
 	"github.com/asymptote-labs/agent-beacon/cli/beacon-hooks/internal/policy"
+	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve/activesession"
 )
 
-// writeProvider writes an executable shell script that ignores stdin and prints a
-// fixed JSON response, then points BEACON_POLICY_PROVIDER at it. Skips on Windows,
-// which has no /bin/sh.
+// The provider script is written once per test binary and reused: on macOS the first exec of a
+// freshly written executable costs ~55ms in system policy checks, which a per-test script paid on
+// every policy test. It lives in TestMain's temp directory, which TestMain removes.
+var policyProviderScript struct {
+	once sync.Once
+	path string
+	err  error
+}
+
+// policyTestResponseEnv carries the response the shared provider script prints.
+const policyTestResponseEnv = "BEACON_TEST_POLICY_RESPONSE"
+
+// writeProvider points BEACON_POLICY_PROVIDER at a shell script that ignores stdin and prints
+// responseJSON. Skips on Windows, which has no /bin/sh.
 func writeProvider(t *testing.T, responseJSON string) {
 	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("provider script requires a POSIX shell")
 	}
-	path := filepath.Join(t.TempDir(), "provider.sh")
-	script := "#!/bin/sh\ncat >/dev/null\nprintf '%s' '" + responseJSON + "'\n"
-	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
-		t.Fatalf("write provider: %v", err)
+	policyProviderScript.once.Do(func() {
+		path := filepath.Join(filepath.Dir(os.Getenv(activesession.PathEnv)), "policy-provider.sh")
+		script := "#!/bin/sh\ncat >/dev/null\nprintf '%s' \"$" + policyTestResponseEnv + "\"\n"
+		policyProviderScript.path, policyProviderScript.err = path, os.WriteFile(path, []byte(script), 0o755)
+	})
+	if policyProviderScript.err != nil {
+		t.Fatalf("write provider: %v", policyProviderScript.err)
 	}
-	t.Setenv(policy.ProviderEnv, path)
+	t.Setenv(policyTestResponseEnv, responseJSON)
+	t.Setenv(policy.ProviderEnv, policyProviderScript.path)
 }
 
 func setupPolicyTest(t *testing.T, platform, responseJSON string) string {
@@ -71,6 +88,8 @@ func TestPreToolPolicyDenyCursor(t *testing.T) {
 	assertDenialEvent(t, logPath)
 }
 
+// Claude Code's PreToolUse reads permissionDecision and ignores a decision object, so the
+// permission-phase shape must not leak into pre-tool.
 func TestPreToolPolicyDenyClaude(t *testing.T) {
 	logPath := setupPolicyTest(t, "claude", denyResponse)
 	out := runHookWithInput(t, runPreTool, map[string]interface{}{
@@ -84,6 +103,12 @@ func TestPreToolPolicyDenyClaude(t *testing.T) {
 	}
 	if hso["permissionDecision"] != "deny" || hso["permissionDecisionReason"] != "blocked by test" {
 		t.Fatalf("hookSpecificOutput = %#v, want deny + reason", hso)
+	}
+	if hso["hookEventName"] != "PreToolUse" {
+		t.Fatalf("hookEventName = %v, want PreToolUse", hso["hookEventName"])
+	}
+	if _, ok := hso["decision"]; ok {
+		t.Fatalf("hookSpecificOutput = %#v carries the PermissionRequest decision object", hso)
 	}
 	assertDenialEvent(t, logPath)
 }
@@ -99,6 +124,33 @@ func TestPreToolPolicyDenyDevin(t *testing.T) {
 		t.Fatalf("devin deny response = %#v, want decision=reject", out)
 	}
 	assertDenialEvent(t, logPath)
+}
+
+// Qwen Code, Muse Code and OpenHands read a provider deny from the hook's stdout object, so the
+// deny has to reach stdout end to end, not just be shaped right. Kiro and Kimi Code suppress
+// stdout because they read it as model context; extending that suppression to one of these
+// runtimes would drop the deny and the tool would run while the log recorded it as enforced.
+func TestPreToolPolicyDenyReachesStdoutOnObjectShapedRuntimes(t *testing.T) {
+	for _, tc := range []struct{ platform, wantKey string }{
+		{"qwen", "hookSpecificOutput"},
+		{"muse", "hookSpecificOutput"},
+		{openHandsPlatform, "decision"},
+	} {
+		t.Run(tc.platform, func(t *testing.T) {
+			logPath := setupPolicyTest(t, tc.platform, denyResponse)
+			out := runHookWithInput(t, runPreTool, map[string]interface{}{
+				"hook_event_name": "PreToolUse",
+				"session_id":      "s-deny-" + tc.platform,
+				"cwd":             "/repo",
+				"tool_name":       "bash",
+				"tool_input":      map[string]interface{}{"command": "codex --full-auto"},
+			})
+			if _, ok := out[tc.wantKey]; !ok {
+				t.Fatalf("%s deny response = %#v, want a %q object on stdout", tc.platform, out, tc.wantKey)
+			}
+			assertDenialEvent(t, logPath)
+		})
+	}
 }
 
 func TestPreToolPolicyAllowProceedsNormally(t *testing.T) {
@@ -119,19 +171,31 @@ func TestPreToolPolicyAllowProceedsNormally(t *testing.T) {
 func TestPermissionRequestPolicyDenyClaude(t *testing.T) {
 	// Regression: Claude is a confirmed-deny platform, so a provider deny on the
 	// permission-request hook must be honored (not silently allowed) just like on
-	// pre-tool.
+	// pre-tool. Claude Code's PermissionRequest reads only
+	// hookSpecificOutput.decision.behavior, so the PreToolUse permissionDecision
+	// object would be ignored there while the event still claimed enforcement.
 	logPath := setupPolicyTest(t, "claude", denyResponse)
 	out := runHookWithInput(t, runPermissionRequest, map[string]interface{}{
 		"session_id": "s-claude-perm",
-		"tool_name":  "Bash",
-		"tool_input": map[string]interface{}{"command": "claude --dangerously-skip-permissions"},
+		"tool_name":  "NotebookEdit",
+		"tool_input": map[string]interface{}{"notebook_path": "/tmp/n.ipynb"},
 	})
 	hso, ok := out["hookSpecificOutput"].(map[string]interface{})
 	if !ok {
 		t.Fatalf("claude permission-request deny = %#v, want hookSpecificOutput", out)
 	}
-	if hso["permissionDecision"] != "deny" {
-		t.Fatalf("hookSpecificOutput = %#v, want permissionDecision=deny", hso)
+	if hso["hookEventName"] != "PermissionRequest" {
+		t.Fatalf("hookEventName = %v, want PermissionRequest", hso["hookEventName"])
+	}
+	if _, ok := hso["permissionDecision"]; ok {
+		t.Fatalf("hookSpecificOutput = %#v carries the PreToolUse permissionDecision", hso)
+	}
+	decision, ok := hso["decision"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("hookSpecificOutput = %#v, want a decision object", hso)
+	}
+	if decision["behavior"] != "deny" || decision["message"] != "blocked by test" {
+		t.Fatalf("decision = %#v, want behavior=deny message=blocked by test", decision)
 	}
 	assertDenialEvent(t, logPath)
 }

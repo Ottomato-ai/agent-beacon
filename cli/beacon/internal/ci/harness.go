@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/claudeotel"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/schema"
 )
 
@@ -25,22 +26,25 @@ type HarnessConfig struct {
 	Paths     map[string]string `json:"paths,omitempty"`
 }
 
-func ClaudeEnv(base []string, endpoint string) []string {
-	env := envMap(base)
-	env["CLAUDE_CODE_ENABLE_TELEMETRY"] = "1"
-	env["OTEL_LOGS_EXPORTER"] = "otlp"
-	env["OTEL_METRICS_EXPORTER"] = "otlp"
-	// Delta temporality keeps token usage counters per-interval so downstream
-	// aggregation can sum datapoints without deduping cumulative series.
-	env["OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE"] = "delta"
-	env["OTEL_EXPORTER_OTLP_PROTOCOL"] = "grpc"
-	env["OTEL_EXPORTER_OTLP_ENDPOINT"] = endpoint
-	delete(env, "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT")
-	delete(env, "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")
-	delete(env, "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
-	env["OTEL_LOG_TOOL_DETAILS"] = "1"
-	env["OTEL_LOG_USER_PROMPTS"] = "1"
+// claudeEnv adds Claude Code's telemetry variables to env, the overlay laid over caller, which is
+// the environment the session runs under and where a deliberately tuned export timing is read from.
+func claudeEnv(env, caller map[string]string, endpoint string) map[string]string {
+	for key, value := range claudeotel.OTLPEnv(endpoint, caller) {
+		env[key] = value
+	}
+	for key, value := range claudeEnvDefaults {
+		if strings.TrimSpace(caller[key]) != "" {
+			value = caller[key]
+		}
+		env[key] = value
+	}
+	return env
+}
 
+// claudeEnvDefaults are set only when the caller has not set them. Someone who has deliberately
+// tuned these has a reason, and this is a wrapper around their session rather than an owner of
+// their telemetry configuration.
+var claudeEnvDefaults = map[string]string{
 	// Export on a timer that fits the session, instead of relying on the flush at shutdown.
 	//
 	// The OpenTelemetry default metric interval is 60 seconds, and `ci exec` wraps sessions that
@@ -52,22 +56,12 @@ func ClaudeEnv(base []string, endpoint string) []string {
 	//
 	// A shutdown flush is still the backstop and still has to work. This just stops it being the only
 	// thing between a captured session and an empty log.
-	//
-	// Set only when the caller has not. Someone who has deliberately tuned these has a reason, and
-	// this is a wrapper around their session rather than an owner of their telemetry configuration.
-	for key, value := range map[string]string{
-		"OTEL_METRIC_EXPORT_INTERVAL": "5000",
-		// The batch processors default to 1s and 5s respectively, which is already inside a short
-		// session -- pinned anyway so the whole pipeline's timing is stated in one place rather than
-		// inherited from three different SDK defaults.
-		"OTEL_BLRP_SCHEDULE_DELAY": "1000",
-		"OTEL_BSP_SCHEDULE_DELAY":  "1000",
-	} {
-		if strings.TrimSpace(env[key]) == "" {
-			env[key] = value
-		}
-	}
-	return flattenEnv(env)
+	"OTEL_METRIC_EXPORT_INTERVAL": "5000",
+	// The batch processors default to 1s and 5s respectively, which is already inside a short
+	// session -- pinned anyway so the whole pipeline's timing is stated in one place rather than
+	// inherited from three different SDK defaults.
+	"OTEL_BLRP_SCHEDULE_DELAY": "1000",
+	"OTEL_BSP_SCHEDULE_DELAY":  "1000",
 }
 
 func BuildHarnessConfig(base []string, harnessList, grpcEndpoint, baseDir string, run *schema.RunInfo) (HarnessConfig, error) {
@@ -84,7 +78,9 @@ func BuildHarnessConfig(base []string, harnessList, grpcEndpoint, baseDir string
 	for _, harness := range harnesses {
 		switch harness {
 		case HarnessClaude:
-			env = envMap(ClaudeEnv(flattenEnv(env), grpcEndpoint))
+			// RunChild lays env over the caller's own environment, so the defaults have to be
+			// decided against that environment, not against the handful of keys env holds.
+			env = claudeEnv(env, baseEnv, grpcEndpoint)
 		case HarnessCodex:
 			codexHome := filepath.Join(baseDir, "codex-home")
 			if err := writeCodexConfig(codexHome, grpcEndpoint); err != nil {

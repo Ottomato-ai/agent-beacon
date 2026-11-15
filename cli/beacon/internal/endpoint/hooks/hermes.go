@@ -6,6 +6,9 @@ import (
 	"path/filepath"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/hermessession"
+	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve/hookcmd"
 )
 
 type HermesOptions struct {
@@ -161,7 +164,7 @@ func writeHermesConfig(path string, config hermesConfig) error {
 func mergeHermesEndpointHook(existing []hermesHookRef, ref hermesHookRef) []hermesHookRef {
 	out := make([]hermesHookRef, 0, len(existing)+1)
 	for _, item := range existing {
-		if !isEndpointHookCommand(item.Command, "hermes") {
+		if !hookcmd.IsEndpointHook(item.Command, "hermes") {
 			out = append(out, item)
 		}
 	}
@@ -180,7 +183,7 @@ func removeHermesEndpointHooks(path string) (bool, error) {
 	for eventName, refs := range config.hooks {
 		filtered := refs[:0]
 		for _, ref := range refs {
-			if isEndpointHookCommand(ref.Command, "hermes") {
+			if hookcmd.IsEndpointHook(ref.Command, "hermes") {
 				changed = true
 				continue
 			}
@@ -211,7 +214,7 @@ func isHermesInstalledAt(path string) bool {
 	}
 	for _, refs := range config.hooks {
 		for _, ref := range refs {
-			if isEndpointHookCommand(ref.Command, "hermes") {
+			if hookcmd.IsEndpointHook(ref.Command, "hermes") {
 				return true
 			}
 		}
@@ -219,6 +222,8 @@ func isHermesInstalledAt(path string) bool {
 	return false
 }
 
+// hermesConfigPath is the config.yaml a plain `hermes` reads: HERMES_HOME or the native root, then
+// the active profile, as hermessession.HomeDir resolves it.
 func hermesConfigPath(level Level) (string, error) {
 	switch level {
 	case "", LevelUser:
@@ -226,7 +231,11 @@ func hermesConfigPath(level Level) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		return filepath.Join(home, ".hermes", "config.yaml"), nil
+		dir, err := hermessession.HomeDir(home)
+		if err != nil {
+			return "", err
+		}
+		return filepath.Join(dir, "config.yaml"), nil
 	case LevelProject:
 		return "", fmt.Errorf("Hermes Agent endpoint hooks support user-level config only")
 	default:

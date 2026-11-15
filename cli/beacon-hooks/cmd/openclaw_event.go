@@ -1,13 +1,10 @@
 package cmd
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"path/filepath"
 	"strings"
 
 	hookdiff "github.com/asymptote-labs/agent-beacon/cli/beacon-hooks/internal/diff"
-	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve"
 	"github.com/spf13/cobra"
 )
 
@@ -338,11 +335,7 @@ func openClawPromptEvents(input, event, fields map[string]interface{}) []normali
 	if prompt == "" {
 		return nil
 	}
-	fields["prompt"] = map[string]interface{}{"text": prompt}
-	fields["gen_ai"] = mergeNested(fields["gen_ai"], map[string]interface{}{
-		"input": map[string]interface{}{"messages": asymptoteobserve.TextInputMessages(prompt)},
-	})
-	fields["content"] = retainedContentFields(prompt)
+	setPromptFields(fields, prompt)
 
 	// Who sent it, and over which chat app. On a single-user coding CLI this is implied; on a
 	// gateway that fans several people's chat accounts into one agent it is the difference between
@@ -632,16 +625,11 @@ func openClawToolFields(event map[string]interface{}, result map[string]interfac
 				file["language"] = language
 			}
 			if diff := openClawFileDiff(name, path, params); diff != "" {
-				// The diff text itself, alongside the hash and byte count taken before the writer
-				// redacts or truncates the stored copy. The `content` marker beside it says
-				// whether what landed in the log is the whole diff; the hash and size say what the
-				// original was. diffFields builds the same three keys for the shared hook path, so
-				// a Beacon consumer reads one shape whichever runtime produced the row.
-				sum := sha256.Sum256([]byte(diff))
-				file["diff"] = diff
-				file["diff_hash"] = hex.EncodeToString(sum[:])
-				file["diff_bytes"] = len(diff)
-				fields["content"] = retainedContentFields(diff)
+				// The diff text itself, alongside the hash of the whole redacted diff and the original's
+				// byte count. The `content` marker beside it says whether what landed in the log is the
+				// whole diff. diffFields builds the same three keys for the shared hook path, so a
+				// Beacon consumer reads one shape whichever runtime produced the row.
+				fields["content"] = retainedDiffFields(file, diff)
 			}
 			fields["file"] = file
 		}

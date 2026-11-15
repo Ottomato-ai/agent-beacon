@@ -6,6 +6,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -54,17 +55,15 @@ func runStop(cmd *cobra.Command, args []string) {
 	logger := newHookLogger("stop", platformFlag, sessionID)
 
 	logger.Debug("Stop hook called", "session_id", sessionID, "has_transcript", transcriptPath != "", "platform", platformFlag)
-	// Kiro puts the agent's final reply on this payload and nowhere else. Recorded before the
+	// Kiro and Claude Code put the agent's final reply on this payload. Recorded before the
 	// completion event below and before the sessionID guard, because the reply happened before the
 	// turn ended and because a payload with no session id still carries real model output --
 	// dropping it there would lose the message to protect a field it does not need.
-	if platformFlag == kiroPlatform {
-		emitKiroAssistantResponse(logger, input, sessionID)
-	}
+	emitStopAssistantResponse(logger, input, sessionID)
 	if sessionID == "" {
 		if isDevinLikePlatform(platformFlag) {
 			logger.Info("stop completed")
-			emitHookEvent(logger, "tool.completed", "tool", "info", "Agent response completed", input, sessionFields("", input))
+			emitHookEvent(logger, "tool.completed", "tool", "info", "Agent response completed", input, stopFields("", input))
 			uploadCloudTelemetry(logger, true)
 			outputJSON(stopResponse())
 			return
@@ -76,23 +75,41 @@ func runStop(cmd *cobra.Command, args []string) {
 
 	config.RotateLogIfNeededForPlatform(platformFlag)
 	st := state.NewSessionState(sessionID, platformFlag)
-
-	// The public Beacon build is local-only. Clear any pending remote evaluations
-	// left over from older hook versions instead of polling a hosted service.
-	pendingEvals := st.GetPendingEvaluations()
-	if len(pendingEvals) > 0 {
-		if err := st.ClearEvaluations(); err != nil {
-			logger.Warn("Failed to clear stale remote evaluations in local-only build", "count", len(pendingEvals), "error", err.Error())
-		} else {
-			logger.Warn("Cleared stale remote evaluations in local-only build", "count", len(pendingEvals))
-		}
+	// Factory Droid's Stop payload carries no reply; its transcript does.
+	if platformFlag == "factory" {
+		emitFactoryTranscriptReply(logger, input, sessionID, transcriptPath, st)
 	}
 
 	elapsed := time.Since(start)
 	logger.Info("stop completed", "duration_ms", elapsed.Milliseconds())
-	emitHookEvent(logger, "tool.completed", "tool", "info", "Agent response completed", input, sessionFields(sessionID, input))
+	emitHookEvent(logger, "tool.completed", "tool", "info", "Agent response completed", input, stopFields(sessionID, input))
 	uploadCloudTelemetry(logger, true)
 	outputJSONAndExit(stopResponse())
+}
+
+// stopFields is the turn-end event's fields: the session, plus how the turn ended when the runtime
+// says so.
+//
+// The action and message stay tool.completed / "Agent response completed" on every runtime, because
+// the dashboard and TraceMessages recognize the turn end by that shape. What changes is that Cursor,
+// whose stop hook sends status completed, aborted or error, now has that status recorded verbatim
+// as turn.status, so in the event log and to threat rules a stopped or failed turn no longer reads
+// exactly like a finished one.
+//
+// Read on Cursor only, as subagent.go reads Cursor's subagentStop status. As of each runtime's hook
+// reference, no other runtime that reaches this hook sends a top-level status on Stop (Claude Code
+// and Qwen nest one per background task, which is not the turn's outcome), so a status key showing
+// up elsewhere is not known to mean how the turn ended. A payload with no status gets no turn block
+// at all rather than a default.
+func stopFields(sessionID string, input map[string]interface{}) map[string]interface{} {
+	fields := sessionFields(sessionID, input)
+	if platformFlag != "cursor" {
+		return fields
+	}
+	if status := strings.TrimSpace(getFirstStr(input, "status")); status != "" {
+		fields["turn"] = map[string]interface{}{"status": status}
+	}
+	return fields
 }
 
 // platformToTranscriptName maps the platform flag to the transcript platform identifier.
@@ -292,11 +309,13 @@ func extractMessagesFromCursorTranscript(transcriptPath string) []map[string]int
 // These tags are added by Cursor to wrap user input and context — they are not part
 // of the actual conversation content.
 // Known tags: <user_query>, <attached_files>, <git_diff_from_branch_to_main>
-var cursorXMLTagPattern = regexp.MustCompile(`</?(?:user_query|attached_files|git_diff_from_branch_to_main)>`)
+var cursorXMLTagPattern = sync.OnceValue(func() *regexp.Regexp {
+	return regexp.MustCompile(`</?(?:user_query|attached_files|git_diff_from_branch_to_main)>`)
+})
 
 // stripCursorXMLTags removes Cursor's wrapper tags from transcript text.
 func stripCursorXMLTags(text string) string {
-	text = cursorXMLTagPattern.ReplaceAllString(text, "")
+	text = cursorXMLTagPattern().ReplaceAllString(text, "")
 	return strings.TrimSpace(text)
 }
 
@@ -431,9 +450,11 @@ func isLocalCommandBlock(text string) bool {
 
 // systemInstructionPattern matches <system_instruction>...</system_instruction> and
 // <system-instruction>...</system-instruction> blocks including their content.
-var systemInstructionPattern = regexp.MustCompile(`(?s)<system[_-]instruction>.*?</system[_-]instruction>\s*`)
+var systemInstructionPattern = sync.OnceValue(func() *regexp.Regexp {
+	return regexp.MustCompile(`(?s)<system[_-]instruction>.*?</system[_-]instruction>\s*`)
+})
 
 // stripSystemInstructions removes system instruction blocks from user message text.
 func stripSystemInstructions(text string) string {
-	return strings.TrimSpace(systemInstructionPattern.ReplaceAllString(text, ""))
+	return strings.TrimSpace(systemInstructionPattern().ReplaceAllString(text, ""))
 }

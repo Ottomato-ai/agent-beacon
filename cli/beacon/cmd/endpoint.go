@@ -15,78 +15,97 @@ import (
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/integrations/openclaw"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/integrations/vscode"
 	"github.com/asymptote-labs/agent-beacon/cli/beacon/internal/endpoint/writer"
+	"github.com/asymptote-labs/agent-beacon/pkg/asymptoteobserve"
 )
 
 var endpointOpts struct {
-	userMode                 bool
-	systemMode               bool
-	logPath                  string
-	harnesses                string
-	hookHarnesses            string
-	outputDir                string
-	jsonOutput               bool
-	grpcPort                 int
-	httpPort                 int
-	healthPort               int
-	collectorPath            string
-	includeRuntimeMetrics    bool
-	includeCodexSpans        bool
-	keepLogs                 bool
-	keepConfig               bool
-	noStart                  bool
-	serviceKind              string
-	dryRun                   bool
-	onboardingReset          bool
-	onboardingResend         bool
-	connect                  bool
-	noBrowser                bool
-	fix                      bool
-	allTargets               bool
-	coworkHeaders            string
-	coworkEndpoint           string
-	coworkResourceAttributes string
-	coworkNgrok              bool
-	coworkOpen               bool
-	coworkSince              string
-	openClawEndpoint         string
-	openClawSince            string
-	vscodeEndpoint           string
-	vscodeSince              string
-	vscodeWorkspace          string
-	vscodeCaptureContent     bool
-	elasticPackDir           string
-	hookLevel                string
-	contentRetention         string
-	splunkHECEndpoint        string
-	splunkHECToken           string
-	splunkIndex              string
-	splunkSource             string
-	splunkSourcetype         string
-	splunkInsecureSkipVerify bool
-	splunkCAFile             string
-	falconHECEndpoint        string
-	falconHECToken           string
-	falconIndex              string
-	falconSource             string
-	falconSourcetype         string
-	falconInsecureSkipVerify bool
-	falconCAFile             string
-	dashboardAddr            string
-	dashboardOpen            bool
-	includeEventSummaries    bool
-	includeRawEvents         bool
-	writeInventoryEvent      bool
-	inventoryMCP             bool
-	inventorySkills          bool
-	inventoryHooks           bool
-	inventoryContents        bool
-	inventoryHeartbeatForce  bool
-	inventoryScheduled       bool
-	inventoryHeartbeatConfig string
-	inventoryWorkingDir      string
-	inventoryTrigger         string
-	inventoryTriggerHarness  string
+	userMode                  bool
+	systemMode                bool
+	logPath                   string
+	harnesses                 string
+	hookHarnesses             string
+	outputDir                 string
+	jsonOutput                bool
+	grpcPort                  int
+	httpPort                  int
+	healthPort                int
+	collectorPath             string
+	includeRuntimeMetrics     bool
+	includeCodexSpans         bool
+	claudeCaptureModelContext bool
+	keepLogs                  bool
+	keepConfig                bool
+	noStart                   bool
+	serviceKind               string
+	dryRun                    bool
+	onboardingReset           bool
+	onboardingResend          bool
+	connect                   bool
+	noBackfill                bool
+	sessionSync               bool
+	noSessionSync             bool
+	noBrowser                 bool
+	fix                       bool
+	allTargets                bool
+	coworkHeaders             string
+	coworkEndpoint            string
+	coworkResourceAttributes  string
+	coworkNgrok               bool
+	coworkOpen                bool
+	coworkSince               string
+	openClawEndpoint          string
+	openClawSince             string
+	vscodeEndpoint            string
+	vscodeSince               string
+	vscodeWorkspace           string
+	vscodeCaptureContent      bool
+	elasticPackDir            string
+	hookLevel                 string
+	logAccess                 string
+	logReaders                []string
+	dashboardSwitch           string
+	contentRetention          string
+	splunkHECEndpoint         string
+	splunkHECToken            string
+	splunkIndex               string
+	splunkSource              string
+	splunkSourcetype          string
+	splunkInsecureSkipVerify  bool
+	splunkCAFile              string
+	falconHECEndpoint         string
+	falconHECToken            string
+	falconIndex               string
+	falconSource              string
+	falconSourcetype          string
+	falconInsecureSkipVerify  bool
+	falconCAFile              string
+	otlpForwardEndpoint       string
+	otlpForwardProtocol       string
+	otlpForwardHeaders        []string
+	otlpForwardHarnesses      string
+	otlpForwardInsecure       bool
+	otlpForwardSkipVerify     bool
+	otlpForwardCAFile         string
+	noOTLPForward             bool
+	dashboardAddr             string
+	dashboardOpen             bool
+	includeEventSummaries     bool
+	includeRawEvents          bool
+	writeInventoryEvent       bool
+	inventoryMCP              bool
+	inventorySkills           bool
+	inventoryHooks            bool
+	inventoryContents         bool
+	inventoryHeartbeatForce   bool
+	inventoryScheduled        bool
+	inventoryHeartbeatConfig  string
+	inventoryWorkingDir       string
+	inventoryTrigger          string
+	inventoryTriggerHarness   string
 }
+
+const claudeCaptureModelContextUsage = "Record context Claude Code gives the model that no other event reports: the pages its WebFetch tool fetches and the MCP tool descriptions it shows the model. " +
+	"Turns on Claude Code's API body logs; the collector keeps only that context and drops every body"
 
 var endpointCmd = &cobra.Command{
 	Use:   "endpoint",
@@ -390,6 +409,7 @@ func init() {
 	endpointHooksCmd.AddCommand(endpointHooksStatusCmd)
 	endpointHooksCmd.AddCommand(endpointHooksRepairInstalledCmd)
 	endpointUserConfigCmd.AddCommand(endpointUserConfigRepairInstalledCmd)
+	endpointUserConfigCmd.AddCommand(endpointUserConfigApplyNativeCmd)
 	endpointTracesCmd.AddCommand(endpointTracesStatusCmd)
 	endpointTracesCmd.AddCommand(endpointTracesReindexCmd)
 	endpointTracesCmd.AddCommand(endpointTracesListCmd)
@@ -424,10 +444,12 @@ func init() {
 	endpointInstallCmd.Flags().StringVar(&endpointOpts.collectorPath, "collector", "", "Path to a beacon-otelcol binary")
 	endpointInstallCmd.Flags().BoolVar(&endpointOpts.includeRuntimeMetrics, "include-runtime-metrics", false, "Include generic process/runtime OTLP metrics and harness operational metrics (OpenClaw, Copilot CLI) in the runtime JSONL log")
 	endpointInstallCmd.Flags().BoolVar(&endpointOpts.includeCodexSpans, "include-codex-spans", false, "Include high-volume Codex OTLP spans for troubleshooting")
+	endpointInstallCmd.Flags().BoolVar(&endpointOpts.claudeCaptureModelContext, "claude-capture-model-context", false, claudeCaptureModelContextUsage)
 	endpointInstallCmd.Flags().BoolVar(&endpointOpts.noStart, "no-start", false, "Write files without starting the collector service")
-	endpointInstallCmd.Flags().BoolVar(&endpointOpts.noBrowser, "no-browser", false, "During interactive setup, print the sign-in URL instead of opening a browser")
+	endpointInstallCmd.Flags().BoolVar(&endpointOpts.noBrowser, "no-browser", false, "During interactive setup, print the sign-in and dashboard URLs instead of opening a browser")
 	endpointInstallCmd.Flags().StringVar(&endpointOpts.serviceKind, "service", "", "Service manager to use: auto (default), launchd, systemd, or none for a supervised collector process")
 	endpointInstallCmd.Flags().BoolVar(&endpointOpts.dryRun, "dry-run", false, "Print planned actions without changing endpoint files or services")
+	endpointInstallCmd.Flags().BoolVar(&endpointOpts.noBackfill, "no-backfill", false, "Skip reading the last 30 days of agent sessions from their local session stores into the runtime log (also "+endpointBackfillEnv+"=0)")
 	endpointInstallCmd.Flags().BoolVar(&endpointOpts.connect, "connect", false, "After installing, attempt to connect this endpoint to Beacon Cloud (user mode uses the signed-in account; system mode opens browser approval)")
 	endpointOnboardingCmd.Flags().BoolVar(&endpointOpts.onboardingReset, "reset", false, "Clear the onboarding record so the question is asked again")
 	endpointOnboardingCmd.Flags().BoolVar(&endpointOpts.onboardingResend, "resend", false, "Retry a signup that could not be delivered")
@@ -437,8 +459,13 @@ func init() {
 	endpointInstallCmd.Flags().StringVar(&endpointOpts.contentRetention, "content-retention", "", "Deprecated no-op; Beacon always captures full content subject to redaction and size limits")
 	_ = endpointInstallCmd.Flags().MarkHidden("content-retention")
 	_ = endpointInstallCmd.Flags().MarkDeprecated("content-retention", "Beacon now always captures full content; this flag is ignored")
+	endpointInstallCmd.Flags().StringVar(&endpointOpts.logAccess, "log-access", "", logAccessUsage)
+	endpointInstallCmd.Flags().StringSliceVar(&endpointOpts.logReaders, "log-readers", nil, logReadersUsage)
+	registerDashboardSwitchFlag(endpointInstallCmd)
 	registerSplunkFlags(endpointInstallCmd)
 	registerFalconFlags(endpointInstallCmd)
+	registerOTLPForwardFlags(endpointInstallCmd)
+	registerSessionSyncFlags(endpointInstallCmd)
 	endpointRepairCmd.Flags().StringVar(&endpointOpts.harnesses, "harness", endpointHarnessAuto, "Harnesses to configure: auto (detected runtimes), all, or a comma-separated list")
 	endpointRepairCmd.Flags().IntVar(&endpointOpts.grpcPort, "otlp-grpc-port", endpointconfig.DefaultGRPCPort, "Local OTLP gRPC port")
 	endpointRepairCmd.Flags().IntVar(&endpointOpts.httpPort, "otlp-http-port", endpointconfig.DefaultHTTPPort, "Local OTLP HTTP port")
@@ -446,14 +473,20 @@ func init() {
 	endpointRepairCmd.Flags().StringVar(&endpointOpts.collectorPath, "collector", "", "Path to a beacon-otelcol binary")
 	endpointRepairCmd.Flags().BoolVar(&endpointOpts.includeRuntimeMetrics, "include-runtime-metrics", false, "Include generic process/runtime OTLP metrics and harness operational metrics (OpenClaw, Copilot CLI) in the runtime JSONL log")
 	endpointRepairCmd.Flags().BoolVar(&endpointOpts.includeCodexSpans, "include-codex-spans", false, "Include high-volume Codex OTLP spans for troubleshooting")
+	endpointRepairCmd.Flags().BoolVar(&endpointOpts.claudeCaptureModelContext, "claude-capture-model-context", false, claudeCaptureModelContextUsage)
 	endpointRepairCmd.Flags().BoolVar(&endpointOpts.noStart, "no-start", false, "Write files without starting the collector service")
 	endpointRepairCmd.Flags().StringVar(&endpointOpts.serviceKind, "service", "", "Service manager to use: auto (default), launchd, systemd, or none for a supervised collector process")
 	endpointRepairCmd.Flags().BoolVar(&endpointOpts.dryRun, "dry-run", false, "Print planned actions without changing endpoint files or services")
 	endpointRepairCmd.Flags().StringVar(&endpointOpts.contentRetention, "content-retention", "", "Deprecated no-op; Beacon always captures full content subject to redaction and size limits")
 	_ = endpointRepairCmd.Flags().MarkHidden("content-retention")
 	_ = endpointRepairCmd.Flags().MarkDeprecated("content-retention", "Beacon now always captures full content; this flag is ignored")
+	endpointRepairCmd.Flags().StringVar(&endpointOpts.logAccess, "log-access", "", logAccessUsage)
+	endpointRepairCmd.Flags().StringSliceVar(&endpointOpts.logReaders, "log-readers", nil, logReadersUsage)
+	registerDashboardSwitchFlag(endpointRepairCmd)
 	registerSplunkFlags(endpointRepairCmd)
 	registerFalconFlags(endpointRepairCmd)
+	registerOTLPForwardFlags(endpointRepairCmd)
+	registerSessionSyncFlags(endpointRepairCmd)
 	endpointDashboardCmd.Flags().BoolVar(&endpointOpts.userMode, "user", true, "Use per-user endpoint paths")
 	endpointDashboardCmd.Flags().BoolVar(&endpointOpts.systemMode, "system", false, "Use system endpoint paths and the system collector service")
 	endpointDashboardCmd.Flags().StringVar(&endpointOpts.logPath, "log-path", "", "Runtime JSONL log path")
@@ -473,10 +506,10 @@ func init() {
 	endpointTracesResetCmd.Flags().BoolVar(&endpointTraceHistoryOpts.yes, "yes", false, "Delete without asking")
 	endpointTracesListCmd.Flags().StringVarP(&endpointTraceOpts.query, "query", "q", "", "Filter traces by text")
 	endpointTracesListCmd.Flags().IntVar(&endpointTraceOpts.page, "page", 1, "Page number for trace listing")
-	endpointTracesListCmd.Flags().StringVar(&endpointTraceOpts.state, "state", "", "Filter by sharing state")
+	endpointTracesListCmd.Flags().StringVar(&endpointTraceOpts.state, "state", "", "Filter by sharing state: local_only, shared (including stale) or stale")
 	endpointTracesListCmd.Flags().StringVar(&endpointTraceOpts.visibility, "visibility", "", "Filter by sharing visibility")
 	endpointTracesSearchCmd.Flags().StringVar(&endpointTraceOpts.resultLevel, "result-level", "trace", "Return trace or event results")
-	endpointTracesShowCmd.Flags().IntVar(&endpointTraceOpts.offset, "offset", 1, "Start at this event number")
+	endpointTracesShowCmd.Flags().IntVar(&endpointTraceOpts.offset, "offset", 1, "Start at this position in the filtered events")
 	endpointTracesShowCmd.Flags().IntVar(&endpointTraceOpts.aroundEvent, "around-event", 0, "Center output on this event number")
 	endpointTracesShowCmd.Flags().IntVar(&endpointTraceOpts.before, "before", 3, "Events before --around-event")
 	endpointTracesShowCmd.Flags().IntVar(&endpointTraceOpts.after, "after", 3, "Events after --around-event")
@@ -577,6 +610,9 @@ func init() {
 	endpointUserConfigRepairInstalledCmd.Flags().StringVar(&endpointOpts.hookHarnesses, "harness", "claude,codex,cursor", "Comma-separated user runtime configs to repair")
 	endpointUserConfigRepairInstalledCmd.Flags().StringVar(&endpointOpts.hookLevel, "level", "user", "Hook install level: user or project")
 	endpointUserConfigRepairInstalledCmd.Flags().BoolVar(&endpointOpts.jsonOutput, "json", false, "Print repair result as JSON")
+	endpointUserConfigApplyNativeCmd.Flags().StringVar(&applyNativeOpts.harnesses, "harness", "claude,codex", "Comma-separated native runtime configs to write: claude, codex, gemini")
+	endpointUserConfigApplyNativeCmd.Flags().IntVar(&applyNativeOpts.grpcPort, "grpc-port", 4317, "Local collector OTLP gRPC port")
+	endpointUserConfigApplyNativeCmd.Flags().BoolVar(&applyNativeOpts.captureModelContext, "claude-capture-model-context", false, "Ask Claude Code for inline API bodies")
 	endpointHooksInstallCmd.Flags().BoolVar(&endpointOpts.allTargets, "all", false, "Target all supported hook harnesses")
 	endpointHooksInstallCmd.Flags().BoolVar(&endpointOpts.dryRun, "dry-run", false, "Print planned hook actions without changing files")
 	endpointHooksUninstallCmd.Flags().BoolVar(&endpointOpts.allTargets, "all", false, "Target all supported hook harnesses")
@@ -696,7 +732,7 @@ func runEndpointVSCodeValidate() error {
 }
 
 func writeValidationEvent(cfg endpointconfig.Config, destination string) (string, error) {
-	return writer.AppendEvent(syntheticEvent(destination), writer.Options{Path: cfg.LogPath, UserMode: cfg.UserMode})
+	return writer.AppendEvent(syntheticEvent(destination), writer.Options{Path: cfg.LogPath, UserMode: cfg.UserMode, RequireWritten: true})
 }
 
 func loadOrDefaultConfig() endpointconfig.Config {
@@ -768,6 +804,96 @@ func registerFalconFlags(cmd *cobra.Command) {
 	cmd.Flags().StringVar(&endpointOpts.falconSourcetype, "falcon-sourcetype", endpointconfig.DefaultFalconSourcetype, "Optional Falcon LogScale parser or sourcetype")
 	cmd.Flags().BoolVar(&endpointOpts.falconInsecureSkipVerify, "falcon-insecure-skip-verify", false, "Skip Falcon LogScale HEC TLS certificate verification")
 	cmd.Flags().StringVar(&endpointOpts.falconCAFile, "falcon-ca-file", "", "Optional CA certificate path for Falcon LogScale HEC TLS verification")
+}
+
+func registerSessionSyncFlags(cmd *cobra.Command) {
+	cmd.Flags().BoolVar(&endpointOpts.sessionSync, "session-sync", false, "Turn on the scheduled session sync: every 15 minutes, read new records from the agent runtimes' local session stores into the runtime log (kept by repair and upgrades)")
+	cmd.Flags().BoolVar(&endpointOpts.noSessionSync, "no-session-sync", false, "Turn off the scheduled session sync")
+}
+
+func registerOTLPForwardFlags(cmd *cobra.Command) {
+	cmd.Flags().StringVar(&endpointOpts.otlpForwardEndpoint, "otlp-forward-endpoint", "", "Also forward Claude Code and Codex OTLP the local collector receives, with secrets redacted, to this OTLP endpoint (host:port or URL for grpc, base URL for http/protobuf)")
+	cmd.Flags().StringVar(&endpointOpts.otlpForwardProtocol, "otlp-forward-protocol", endpointconfig.OTLPForwardProtocolGRPC, "OTLP forward protocol: grpc or http/protobuf")
+	cmd.Flags().StringVar(&endpointOpts.otlpForwardHarnesses, "otlp-forward-harness", "", "Runtimes whose OTLP the forward carries, comma-separated (default claude,codex); other sources, such as the browser extension, stay local")
+	cmd.Flags().StringArrayVar(&endpointOpts.otlpForwardHeaders, "otlp-forward-header", nil, "Header sent with every OTLP forward export, as name=value (repeatable)")
+	cmd.Flags().BoolVar(&endpointOpts.otlpForwardInsecure, "otlp-forward-insecure", false, "Send the OTLP forward without TLS (gRPC plaintext)")
+	cmd.Flags().BoolVar(&endpointOpts.otlpForwardSkipVerify, "otlp-forward-insecure-skip-verify", false, "Skip TLS certificate verification for the OTLP forward")
+	cmd.Flags().StringVar(&endpointOpts.otlpForwardCAFile, "otlp-forward-ca-file", "", "Optional CA certificate path for OTLP forward TLS verification")
+	cmd.Flags().BoolVar(&endpointOpts.noOTLPForward, "no-otlp-forward", false, "Remove a configured OTLP forward")
+}
+
+// otlpForwardOptions returns nil when no OTLP forward flag was given, so install and repair keep
+// what the existing config has; --no-otlp-forward returns an empty forward, which removes it.
+func otlpForwardOptions() (*endpointconfig.OTLPForward, error) {
+	if endpointOpts.noOTLPForward {
+		if endpointOpts.otlpForwardEndpoint != "" {
+			return nil, fmt.Errorf("--no-otlp-forward cannot be combined with --otlp-forward-endpoint")
+		}
+		return &endpointconfig.OTLPForward{}, nil
+	}
+	if endpointOpts.otlpForwardEndpoint == "" &&
+		len(endpointOpts.otlpForwardHeaders) == 0 &&
+		endpointOpts.otlpForwardHarnesses == "" &&
+		(endpointOpts.otlpForwardProtocol == "" || endpointOpts.otlpForwardProtocol == endpointconfig.OTLPForwardProtocolGRPC) &&
+		!endpointOpts.otlpForwardInsecure &&
+		!endpointOpts.otlpForwardSkipVerify &&
+		endpointOpts.otlpForwardCAFile == "" {
+		return nil, nil
+	}
+	if strings.TrimSpace(endpointOpts.otlpForwardEndpoint) == "" {
+		return nil, fmt.Errorf("--otlp-forward-endpoint is required with the other --otlp-forward flags")
+	}
+	headers := map[string]string{}
+	for _, header := range endpointOpts.otlpForwardHeaders {
+		name, value, ok := strings.Cut(header, "=")
+		name = strings.TrimSpace(name)
+		if !ok || name == "" {
+			return nil, fmt.Errorf("--otlp-forward-header %q must be name=value", header)
+		}
+		headers[name] = value
+	}
+	if len(headers) == 0 {
+		headers = nil
+	}
+	harnesses, err := otlpForwardHarnesses(endpointOpts.otlpForwardHarnesses)
+	if err != nil {
+		return nil, err
+	}
+	return &endpointconfig.OTLPForward{
+		Harnesses:          harnesses,
+		Endpoint:           endpointOpts.otlpForwardEndpoint,
+		Protocol:           endpointOpts.otlpForwardProtocol,
+		Headers:            headers,
+		Insecure:           endpointOpts.otlpForwardInsecure,
+		InsecureSkipVerify: endpointOpts.otlpForwardSkipVerify,
+		CAFile:             endpointOpts.otlpForwardCAFile,
+	}, nil
+}
+
+// otlpForwardHarnesses turns --otlp-forward-harness into canonical harness names; empty keeps the
+// default (Claude Code and Codex). Codex CLI and the desktop app export under one name, so
+// naming either forwards both.
+func otlpForwardHarnesses(value string) ([]string, error) {
+	var names []string
+	seen := map[string]bool{}
+	add := func(name string) {
+		if !seen[name] {
+			seen[name] = true
+			names = append(names, name)
+		}
+	}
+	for _, raw := range splitHarnessCSV(value) {
+		name := asymptoteobserve.NormalizeHarnessName(strings.TrimSpace(raw))
+		if name == "" {
+			return nil, fmt.Errorf("--otlp-forward-harness: unknown runtime %q", raw)
+		}
+		add(name)
+		if name == "codex_cli" || name == "codex_desktop" {
+			add("codex_cli")
+			add("codex_desktop")
+		}
+	}
+	return names, nil
 }
 
 func splunkHECOptions() *endpointconfig.SplunkHEC {

@@ -22,7 +22,7 @@ const MaxEventBytes = 64 * 1024
 // unrecognized action is reported rather than ignored.
 var KnownActions = map[string]bool{
 	// agent runtime activity
-	"session.started": true, "session.ended": true, "session.activity": true,
+	"session.started": true, "session.ended": true, "session.activity": true, "session.context": true,
 	"session.compacting": true, "session.event": true, "session.created": true,
 	"session.deleted": true, "session.idle": true, "session.error": true,
 	"session.compacted": true,
@@ -30,7 +30,7 @@ var KnownActions = map[string]bool{
 	"tool.invoked":      true, "tool.completed": true, "tool.failed": true,
 	"command.executed": true, "command.invoked": true,
 	"file.read": true, "file.modified": true, "file.created": true,
-	"mcp.tool_invoked":   true,
+	"mcp.tool_invoked": true, "mcp.tool_listed": true,
 	"approval.requested": true, "approval.allowed": true, "approval.denied": true,
 	"policy.blocked":   true,
 	"subagent.started": true, "subagent.stopped": true,

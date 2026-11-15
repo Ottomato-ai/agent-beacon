@@ -87,10 +87,11 @@ For Cursor Cloud Agents, keep the repository-owned setup in `.cursor/`:
 ```
 
 The install script builds the current branch by default, or downloads a release
-when `BEACON_VERSION` is set. Generate `.cursor/hooks.json` with
-`beacon cloud cursor print-hooks`, then commit it before starting a cloud agent;
-the environment update script must not create hooks after Cursor has already
-loaded the project configuration.
+when `BEACON_VERSION` is set. This repository commits its `.cursor/hooks.json`
+(generated with `beacon cloud cursor print-hooks`) so cloud agents on any branch
+test that branch's hooks. Other repositories don't need to commit anything: the
+install script from `beacon cloud cursor print-setup` writes the hooks at Build
+time and excludes them from git.
 
 For Claude Code on the web, generate the setup script for a Beacon release and
 paste it into the provider's cloud setup field:
@@ -223,7 +224,7 @@ Upload the log from GitHub Actions for customer-controlled retention:
   if: always()
   uses: actions/upload-artifact@v4
   with:
-    name: beacon-runtime-log
+    name: beacon-runtime-log-${{ github.job }}-${{ strategy.job-index }}
     path: ${{ runner.temp }}/beacon/runtime.jsonl
 ```
 
@@ -297,9 +298,12 @@ beacon ci exec --upload gcs -- claude --print "Summarize this repository"
 - GCS upload uses `gcloud storage cp` when available, falling back to `gsutil cp`.
 - Beacon strips common AWS and Google credential environment variables from the
   child agent process, while keeping them available to the post-run uploader.
-- Object keys default to
-  `<prefix>/<repository>/<run_id>/<run_attempt>/runtime.jsonl` in GitHub Actions,
-  with a timestamp fallback outside GitHub Actions.
+- Each session uploads under its own folder, `<start time in Unix nanoseconds>-<8 random
+  hex characters>`, chosen when the session starts and reused by `ci finish`. Keys are
+  `<prefix>/<repository>/<run_id>/<run_attempt>/<job>/<session>/runtime.jsonl` in
+  GitHub Actions and `<prefix>/ci/<session>/runtime.jsonl` elsewhere, so jobs, matrix
+  legs and repeated sessions in one run never overwrite each other. Earlier versions
+  wrote every session in a run to `<prefix>/<repository>/<run_id>/<run_attempt>/runtime.jsonl`.
 
 By default `ci exec` fails the step when no Beacon events reach the runtime log,
 which surfaces a broken telemetry pipeline. Pass `--require-telemetry=false` to
@@ -674,10 +678,14 @@ the model. The one exception is the optional policy seam, whose deny is exit cod
 The DeepSeek Harness integration is the one install that takes two files,
 because `dsh` reads no hooks file until something mounts a reader at it: the
 harness composes itself from a plugin tree, and `@deepseek-ai/dsh-hooks-claude-code`
--- the Claude Code hook bridge DeepSeek ships as a dependency of the CLI -- is not
+-- the Claude Code hook bridge DeepSeek publishes for every dsh release -- is not
 in the default tree. So Beacon writes `$DSH_HOME/beacon-endpoint-hooks.json`, a
 hooks file it owns outright, and adds one row to `$DSH_HOME/cordis.patch.yml`
-mounting the bridge at it. `$DSH_HOME` defaults to `~/.dsh`. The home-level patch
+mounting the bridge at it. `$DSH_HOME` defaults to `~/.dsh`. The bridge does not
+ship with the CLI, so it must be installed into each profile at exactly the dsh
+version (`dsh plugin --profile <name> add @deepseek-ai/dsh-hooks-claude-code@<v>
+@deepseek-ai/dsh-hook-protocol@<v>`), and install refuses when nothing can load
+it. The home-level patch
 layer applies over every profile, so one install covers the CLI, Web, ACP and SDK
 surfaces; there is no project scope, because the bridge's `configPath` is
 process-level and a repository has nowhere to mount from, so `--level project` is
